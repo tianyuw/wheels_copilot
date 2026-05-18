@@ -1280,3 +1280,102 @@ Council 都给了 provisional answer，但在 kickoff 前值得你明确表态�
 ---
 
 **Plan v1.0 完。** 下一步：处理 §7 的开放问题，然后开始 M0 工程。
+
+
+---
+
+## GPT-5.4 Review Summary
+
+1. **真钱隐藏风险**  
+- §2.5/§5.4：assignment 只靠 morning reconcile 不够。美式期权可被**提前行权**（尤其 ex-div 前 deep ITM CC），且 Alpaca 事件/持仓更新可能延迟；需加 **broker activity stream + EOD/开盘前双重 reconcile**，否则会在已被 call away 后继续挂 CC/CSP。  
+- §3.5：`K ≥ cost_basis` 过于理想化。真钱里长期套牢会导致**永远卖不出 CC**，机会成本巨大；应允许 **受控 basis-below call**，但仅限 T3/T4、需 realized loss budget。  
+- §2.7/§3.6：未覆盖 **partial fill / cancel-replace / duplicate submit / stale order ack**。$500K 下一个幂等缺陷就能多卖一倍合约。OMS 上层必须有 **idempotency key + open-order inventory lock**。  
+- §2.6：SQLite+WAL 跑真钱 daemon 有风险，遇到进程崩溃/文件锁/磁盘满恢复脆弱；至少 live 前换 **Postgres**。  
+
+2. **过度/欠工程**  
+- §4.1.2/§4.3：5 模型 council 用于周 watchlist，对单一 Wheel 偏**过度工程**；先 2-model + deterministic screener 足够。  
+- §2.1 vendor-copy 15 文件可以，但到 live-1.0 仍 vendor-copy 偏**欠工程**：shared bugfix 漏同步是真风险。建议 kickoff 就定义 **upstream sync SLA + contract tests**。  
+- §5.5 不做 dashboard 可接受，但 §5.7 仍靠人工看日报发现异常，对真钱偏**欠工程**；至少要有 **real-time exception panel**（open risk、stale reconcile、CB 状态）。  
+
+3. **不切实际假设**  
+- §0/§3.7：$500K Wheel 年化净 6–9%、max DD 6–10% 对含单股池子略乐观；若遇 2022/2020 类 regime shift，DD 可显著超过 10%。  
+- §5.1/§5.3：10 周 paper 得出“LLM watchlist 有效”样本太短，且 paper fill/slippage 与 live options 差异很大。  
+- §3.1：SPY/QQQ 放宽到 12% 尚可，但组合里 QQQ+AAPL+MSFT+GOOGL 相关性极高，§3.1 的 sector cap 不能替代 **factor/correlation cap**。  
+
+4. **Forward test 盲点**  
+- §5.4 缺少 **early assignment on CC before ex-div**、**halt/LUDP**、**option chain missing Greeks**、**corporate action（special dividend / spin-off / merger adjustment）**、**market half-day cutoff**。  
+- §5.3 用 “paper premium yield vs baseline” 评估 LLM 有数据污染；应做 **shadow watchlist A/B**：同日同 gate，比候选质量，不比 fill 后 PnL。  
+- §5.6 Live 阶梯太快；每档 2 周不足以覆盖一次完整 assign→CC→called away。建议每档至少 **1 个完整 cycle 或 20 交易日**。  
+
+5. **参数修改建议**  
+- §3.2：CSP delta 调成 **0.16–0.22，target 0.18**；CC delta **0.15–0.25，target 0.20**。  
+- §3.2：DTE 调成 **35–50，target 42**；time-stop **21 DTE 固定**，不要随 IVR 漂移。  
+- §3.2/§3.4：IV rank 入场改 **30–55**；>55 仅 ETF/Tier1，单股禁开。  
+- §3.1：per-ticker 上限从 **8% 降到 6%**；SPY/QQQ 上限 **10%**。  
+- §3.6：日亏 CB 从 **-1.5% 收紧到 -1.0%**；DD CB 从 **8% 收紧到 6%**；新增 **single-name gap CB：单票日跌>12% 禁该 ticker 新动作 5 天**。  
+- §3.4：earnings blackout 从 **±7 扩到 entry/expiry 任一落在 ±10 日拒绝**。  
+- §3.2：max_roll_count 从 2 降到 **1**，第二次直接 assignment/close/rescue。
+
+---
+
+## Gemini-3.1-Pro Review Summary
+
+这是一份非常扎实的系统设计文档，架构清晰且对风险有敬畏之心。但作为 $500K 真钱生产系统，仍有几个关键的量化与工程盲点需要修正：
+
+**1. 隐藏风险与边缘场景（真钱场景）**
+*   **Wash Sale（洗售）税务灾难（§1, §3.5）：** 在 Taxable 账户跑高频 Wheel，亏损 Roll 或平仓极易触发 Wash Sale，导致 Cost Basis 计算极其复杂，甚至引发年底巨额税务拖累。**Action:** `cost_basis_repo.py` 必须引入 Wash Sale 追踪逻辑（30天规则），或者在 §3.3 标的池中强制轮换 Ticker 避免连续交易同一标的。
+*   **分红提前行权（Early Assignment）与公司行动（§2.7, §5.4）：** 文档假设 Assignment 都在到期或深度 ITM 发生。实际中，除息日（Ex-dividend date）前夕的 Short Call 极易被提前行权。**Action:** FSM 需增加 `CORPORATE_ACTION` 冻结状态；§5.4 压测必须注入“除息日前 1 天的 ITM Short Call 被提前行权”场景。
+*   **Roll 订单的 Partial Fill（§2.4, §2.7）：** Roll 是 MLEGs（多腿订单），流动性差时极易出现 Partial Fill。**Action:** FSM 缺少 `PENDING_ROLL` 状态。不能仅靠 OMS，FSM 必须知道当前仓位处于“部分平仓/部分开仓”的薛定谔状态，并暂停其他并发决策。
+
+**2. 过度工程化与欠工程化**
+*   **过度工程化（§4.1.2, §4.1.5）：** 5 模型 Council 用于每周 Watchlist 和 Rescue 过于冗余，增加了解析失败率和延迟。**Action:** 降级为 3 模型（如 Opus + GPT-4o + Sonnet），采用 2/3 多数决即可。
+*   **欠工程化（§3.5）：** Cost Basis 的计算过于理想化。如果发生 Roll-down（支付 Debit），Cost Basis 会上升。**Action:** 明确公式：`Adjusted Basis = Strike + Roll Debits - All Credits`。代码中必须硬性防范“为了赚 Premium 而无限 Roll-down 导致 Basis 远高于现价”的死亡螺旋。
+
+**3. $500K 真钱部署的不切实际假设**
+*   **Paper 账户的 Fill 幻觉（§5.1）：** Alpaca Paper 账户的期权 Fill 极其不真实（通常瞬间在 Mid-price 成交）。Phase 2 设定的 `slippage < 5%` 在 Paper 中毫无意义。**Action:** 必须在 Phase 3 引入 $5K-$10K 的 Live Micro-test 专门校准 Slippage 和 Bid-Ask 行为，否则 Live-α 会遭遇严重的执行损耗。
+
+**4. Forward Test 计划盲点**
+*   **流动性枯竭压测（§5.4）：** 缺少对 Bid-Ask Spread 突然扩大的测试。**Action:** 注入场景：标的暴跌时，期权 Spread 扩大到 20%，触发 §3.2 的硬约束，系统应正确挂单等待或暂停 Roll，而不是以 Market Order 跨越 Spread 强平。
+
+**5. 关键参数修改建议**
+*   **Roll 触发条件（§3.2）：** `delta >= 0.50 AND <=21 DTE` **太迟了**。Delta 0.50 意味着已经 ITM，此时 Roll 的 Spread 极宽，极难获得 Net Credit。**建议：** 改为 `delta >= 0.40 OR (DTE <= 14 AND ATM)`，在尚未深度 ITM 时提前防守。
+*   **IV Rank 上限（§3.2, §3.4）：** 限制 `IVR <= 65` 会砍掉 Wheel 策略最赚钱的肥尾机会（如大盘恐慌但公司基本面无虞时）。**建议：** 移除 65 的硬上限，改为 `IVR > 20`，依靠 §4.1.4 的 LLM Outlook 来过滤真正的破产风险（Idiosyncratic risk）。
+*   **日亏 CB 阈值（§3.6）：** `-1.5% ($7.5K)` **太紧**。在 70% 仓位利用率下，大
+
+---
+
+## Three-Model Consensus
+
+**Final consensus**
+
+**1. 强一致观点**
+- **Wheel 必须 FSM + deterministic-first**：LLM 只做 watchlist/基本面/前景/救援，不进 strike、DTE、仓位 sizing 的 critical path。  
+- **Broker 为真相源，reconcile/审计必不可少**：需完整 workspace、job_runs、成本与决策留痕。  
+- **先 paper 再 live，且资金阶梯上线**：不能直接 $500K 全开。  
+- **早指派/公司行动/异常流动性是核心生产风险**：必须专项处理，不可只靠到期逻辑。  
+- **vendor-copy 可接受，但必须有同步纪律**：shared 复用要配 provenance、sync 与 contract tests。
+
+**2. 分歧与解决**
+- **CC 是否允许低于 cost basis**：Claude 禁止；GPT/Gemini认为极端套牢会僵死。**折中：**默认仍 `K>=basis`；仅 **T3/T4 + 人工批准 + realized loss budget ≤账户净值1%/季** 时允许 basis-below call。  
+- **LLM council 规模**：Claude 5 模型；两家 review 认为过重。**改为** watchlist/rescue 用 **3 模型**，新入 core 仍需 **3/3**。  
+- **风险参数松紧**：GPT 主张更保守，Gemini认为部分阈值过紧/过迟。**折中：**收紧仓位与 DD，但放宽“日亏 CB”。  
+- **SQLite vs Postgres**：Claude 用 SQLite；GPT 认为真钱不够稳。**结论：**paper 可 SQLite，**live 前强制切 Postgres**。  
+- **10 周 paper 是否足够验证 LLM**：不足。**改为** LLM 只做 **shadow A/B watchlist** 评估，不用 paper PnL 证明“有效”。
+
+**3. Kickoff 前必改清单**
+- **§2.5**：仅 morning reconcile → **加 08:00/09:20/16:15 三次 reconcile + broker activity stream**。  
+- **§2.7**：补 **idempotency_key、open-order inventory lock、duplicate submit 防护**。  
+- **§2.4/§2.7**：FSM 新增 `PENDING_ROLL`,`CORPORATE_ACTION`。  
+- **§2.6**：`wheels_copilot.db(SQLite)` → **paper=SQLite；live=Postgres 15+**。  
+- **§3.1**：`per_ticker_max_pct 8%→6%`；`SPY/QQQ 12%→10%`。  
+- **§3.2**：`put target 0.22→0.18`；`call target 0.25→0.20`；`DTE 28-45/35→35-50/42`；`max_roll_count 2→1`。  
+- **§3.4**：earnings blackout `±7→±10`；新增 **single-name gap CB：单票日跌>12%，冻结5交易日**。  
+- **§3.6**：`drawdown_cb 8%→6%`；`daily_loss_cb -1.5% 保持`。  
+- **§4.1.2/4.1.5**：5 模型 council → **3 模型**。  
+- **§5.3**：删 “LLM watchlist premium yield ≥5%” → **shadow A/B：候选质量、命中率、后续风险事件率**。  
+- **§5.4**：新增压测：**ex-div 提前行权、partial fill roll、halt/LUDP、missing Greeks、special dividend/spin-off/merger、half-day cutoff、spread 扩至20%**。  
+- **§5.6**：每档 live `2周` → **至少20交易日或1个完整 cycle（二者取长）**；并新增 **$5K–$10K live micro-test**。
+
+---
+
+*Council review 由 [`~/.claude/skills/council-review.md`](file:///Users/tianyuwang/.claude/skills/council-review.md) 触发执行于 2026-05-18 11:08:07。模型：`openai/gpt-5.4` + `google/gemini-3.1-pro-preview`，consensus 由 `openai/gpt-5.4` 综合。审计 JSON：`/tmp/council_review_audit_20260518_110724.json`。*
