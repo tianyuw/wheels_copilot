@@ -1,9 +1,12 @@
 # Wheels Copilot — 项目方案
 
-**版本：** v1.0
+**版本：** v1.1（2026-05-18 应用 council-review consensus 后的修订）
 **日期：** 2026-05-18
-**状态：** 草稿，等用户 review → kickoff
-**输入：** [`docs/RESEARCH.md`](RESEARCH.md)、用户已锁定的 4 条决策、4 人 specialist council
+**状态：** 已通过 2 道 council（specialist 起草 + 外部 LLM review），等用户 review → kickoff
+**输入：** [`docs/RESEARCH.md`](RESEARCH.md)、用户已锁定的 4 条决策、4 人 specialist council、外部 council-review（GPT-5.4 + Gemini-3.1-Pro）
+
+**Changelog：**
+- **v1.0 → v1.1**（2026-05-18）应用 `~/.claude/skills/council-review.md` 的 consensus 修订：FSM 加 `PENDING_ROLL` / `CORPORATE_ACTION`；多次 daily reconcile + broker activity stream；live 切 Postgres；per-ticker 8%→6%、SPY/QQQ 12%→10%；put delta 0.22→0.18、call 0.25→0.20、DTE target 35→42；max_roll_count 2→1；earnings blackout ±7→±10；新增 single-name gap CB；drawdown CB 8%→6%；5-model council 缩为 3-model；LLM 评估改 shadow A/B；live 阶梯每档延长至 ≥20 交易日或 1 个完整 cycle；加 Live-μ micro-test；wash sale 追踪、ex-div 提前行权处理、MLEG partial fill 处理纳入正文。原始 GPT-5.4 + Gemini review 见末尾附录。
 
 ---
 
@@ -17,9 +20,9 @@
 2. **Validator-first，默认 mechanical。** 行权价、DTE、profit-take、roll、stop-loss、sizing —— 全部 deterministic、code-enforced。LLM 只做 *定性* 决策（watchlist 维护、基本面深读、救援决策）。LLM 层断了交易也继续。
 3. **Watchlist 是 policy；每日交易是 policy 的执行。** Watchlist 每周日晚上 18:00 通过 5 模型 LLM council 重做一次；每日 cycle 机械地按这个 frozen watchlist 执行。
 4. **Forward test 是硬 gate，不是走过场。** 10 周 Alpaca paper、4 个 phase。所有 go-live gate 全绿才上 live。资金分 4 步上：$50K → $150K → $300K → $500K。
-5. **从第 1 天就按 $500K 真钱设计。** 保守的默认值（per-ticker 上限 8%、日亏 CB -1.5%、drawdown CB 8%）。合理回报预期：**年化净 6–9%**，Sharpe 0.8–1.2，max DD 大约 6–10%。**不追求**在 bull market beat SPY —— 追求的是可生存性 + 稳定现金流。
+5. **从第 1 天就按 $500K 真钱设计。** 保守的默认值（per-ticker 上限 **6%**、SPY/QQQ **10%**、日亏 CB -1.5%、drawdown CB **6%**、max_roll_count **1**）。合理回报预期：**年化净 5–8%**，Sharpe 0.8–1.2，max DD 大约 6–10%。**不追求**在 bull market beat SPY —— 追求的是可生存性 + 稳定现金流。
 
-**Council 成员（本 plan 是 4 个 specialist subagent 输出的综合）：**
+**Council 成员（本 plan 是两道 council 联合产出）：**
 
 | 角色 | 负责 | 章节 |
 |------|------|------|
@@ -27,15 +30,19 @@
 | Quant / Risk | 参数、标的池、风险预算、circuit breaker | §3 |
 | AI/LLM Integration | LLM 接入点、prompt、成本、降级 | §4 |
 | Forward Test Strategist | 10 周 test 方案、go-live gate、资金阶梯 | §5 |
+| **External council-review**（GPT-5.4 + Gemini-3.1-Pro） | v1.0 → v1.1 修订点（在本文档各章节标记） | 全文 |
 
 **跨章节冲突的 reconcile：**
 - Watchlist 刷新：**周日 18:00 ET**（LLM agent 的方案——数据更全、避开工作日波动）
 - VIX gating：分级（≤22 两个 tier 都开 / 22–28 仅 Tier 1 / >28 全冻），而不是单一阈值
 - 日亏 circuit breaker：**-1.5% equity（约 $7.5K）**——两个方案中更保守的那个
 - Watchlist 权威源：**DB**，`tickers.yaml` 仅做一次性 seed
-- LLM 模型分配：5 模型 council 用于 watchlist + rescue；单 Opus 用于 fundamentals；单 Sonnet 用于 outlook + regime
+- LLM 模型分配：**3 模型 council**（v1.1 从 5 减为 3）用于 watchlist + rescue；单 Opus 用于 fundamentals；单 Sonnet 用于 outlook + regime
+- DB 存储：**paper 用 SQLite；live 切 Postgres 15+**（v1.1，外部 council 提出真钱场景下 SQLite 的崩溃/磁盘恢复脆弱）
+- Reconcile 频率：**每日 3 次**（08:00 / 09:20 / 16:15 ET）+ broker activity stream（v1.1）
+- max_roll_count：**1**（v1.1 从 2 减为 1，防止 roll-down 死亡螺旋）
 
-**时间表（从 2026-05-19 kickoff 起算）：**
+**时间表（从 2026-05-19 kickoff 起算，v1.1 应用 council 建议后延长）：**
 
 | 窗口 | 周次 | 阶段 |
 |------|------|------|
@@ -44,12 +51,13 @@
 | 2026-06-30 → 2026-07-13 | 3-4 | Paper Phase 2：5 个 ticker，mechanical |
 | 2026-07-14 → 2026-08-10 | 5-8 | Paper Phase 3：完整 watchlist + LLM 接入 |
 | 2026-08-11 → 2026-08-24 | 9-10 | Paper Phase 4：压测 + 边缘场景 |
-| 2026-08-25 → 2026-09-07 | 11-12 | Live-α：$50K，2 个 ticker |
-| 2026-09-08 → 2026-09-21 | 13-14 | Live-β：$150K，4 个 ticker |
-| 2026-09-22 → 2026-10-05 | 15-16 | Live-γ：$300K，6-8 个 ticker |
-| 2026-10-06 起 | 17+ | Live-1.0：$500K，完整 watchlist |
+| 2026-08-25 → 2026-09-21 | 11-14 | 🆕 **Live-μ micro-test**：$5-10K，SPY 1 个，≥20 交易日 / 1 完整 cycle |
+| 2026-09-22 → 2026-10-19 | 15-18 | Live-α：$50K，2 个 ticker，≥20 交易日 / 1 完整 cycle |
+| 2026-10-20 → 2026-11-16 | 19-22 | Live-β：$150K，4 个 ticker，≥20 交易日 / 1 完整 cycle |
+| 2026-11-17 → 2026-12-14 | 23-26 | Live-γ：$300K，6-8 个 ticker，≥20 交易日 / 1 完整 cycle |
+| 2026-12-15 起 | 27+ | Live-1.0：$500K，完整 watchlist |
 
-**总计：kickoff 到 $500K 满仓 live 大约 5 个月。**
+**总计：kickoff 到 $500K 满仓 live 大约 7 个月**（v1.1 比 v1.0 延长 2 个月，主要是 Live-μ 加入 + 每个 live stage 从 2 周延至 ≥4 周或 1 个完整 cycle —— 外部 council 一致认为 v1.0 上线节奏太快，单 cycle 都跑不完就升档）。
 
 ---
 
@@ -230,38 +238,60 @@ class WheelPosition(BaseModel):
 
 ```
        ┌────────────────────┐
-       │       CASH         │◄─────────────────────┐
-       │  (无仓位)          │                       │
+       │       CASH         │◄──────────────────────┐
+       │  (无仓位)          │                        │
+       └──────────┬─────────┘                        │
+                  │ sell_csp (gate.csp_open_ok)      │ csp_expired_otm
+                  ▼                                  │ 或 csp_closed_50%tp
+       ┌────────────────────┐    submit_roll         │
+       │     CSP_OPEN       │──────────────┐         │
+       │  (short put 在手)  │              ▼         │
+       └──────────┬─────────┘   ┌─────────────────┐  │
+                  │             │  PENDING_ROLL   │──┤ roll filled completely
+                  │             │ (MLEG 部分成交) │  │ → 回 CSP_OPEN / CC_OPEN
+                  │ csp_assigned└─────────────────┘  │
+                  │ (broker 事件)        │           │
+                  │                      │ partial   │
+                  ▼                      ▼ unwind    │
+       ┌────────────────────┐    ┌───────────────┐  │
+       │      ASSIGNED      │    │ MANUAL_REVIEW │  │
+       │ (100×N 股)         │    └───────────────┘  │
        └──────────┬─────────┘                       │
-                  │ sell_csp (gate.csp_open_ok)     │ csp_expired_otm
-                  ▼                                 │ 或 csp_closed_50%tp
-       ┌────────────────────┐                       │
-       │     CSP_OPEN       │───────────────────────┘
-       │  (short put 在手)  │
-       └──────────┬─────────┘
-                  │ csp_assigned (broker 事件)
-                  ▼
-       ┌────────────────────┐  rescue_freeze     ┌──────────────────┐
-       │      ASSIGNED      │───────────────────►│  ASSIGNED_HELD   │
-       │ (100×N 股，        │                    │  (停止自动 CC，  │
-       │  无 option)        │◄───────────────────│   人工 review)   │
-       └──────────┬─────────┘   operator_resume  └──────────────────┘
-                  │ sell_cc (gate.cc_strike_floor_ok)
-                  ▼
-       ┌────────────────────┐
-       │      CC_OPEN       │──── cc_expired_otm ──┐
-       │ (short call 在手， │                       │ (回到 ASSIGNED)
-       │  100×N 股)         │                       ▼
-       └──────────┬─────────┘              ┌────────────────────┐
-                  │ cc_called_away         │      ASSIGNED      │
-                  │ (broker 事件)          └────────────────────┘
-                  ▼
-       ┌────────────────────┐
-       │  CYCLE_COMPLETE    │── 写入 cycle_log → CASH
+                  │ sell_cc (gate.cc_strike_floor_ok)│
+                  ▼                                  │
+       ┌────────────────────┐    submit_roll         │
+       │      CC_OPEN       │──────────────┐         │
+       │ (short call 在手) │              │         │
+       └──────────┬─────────┘             ▼         │
+                  │              ┌─────────────────┐│
+                  │              │  PENDING_ROLL   ││
+                  │ cc_called    └─────────────────┘│
+                  │ _away                            │
+                  ▼                                  │
+       ┌────────────────────┐                        │
+       │  CYCLE_COMPLETE    │── 写入 cycle_log ─────┘
        └────────────────────┘
+
+       ┌────────────────────────┐
+       │   CORPORATE_ACTION     │  ◄── 任何状态都可转入此
+       │  (split / spin-off /   │      由公司行动监控触发
+       │   special div / M&A)   │      暂停所有自动操作
+       └────────┬───────────────┘      → 操作员 review 后明确转回
+                │ 人工 unfreeze
+                ▼  回到上一状态或 CASH
+
+       ┌────────────────────────┐
+       │    ASSIGNED_HELD       │  ◄── ASSIGNED 状态下股价 < cost_basis × 0.85
+       │  (停止自动 CC)         │      由 rescue 引擎接管
+       └────────────────────────┘
 ```
 
-`ASSIGNED_HELD` 是 bag-holder 子状态（股价 < cost_basis × 0.85）：停止自动 CC，由 rescue 引擎接管。`CYCLE_COMPLETE` 是瞬时状态——原子写入 `cycle_log` 后回到 `CASH`。
+**子状态说明：**
+- **`PENDING_ROLL`**（v1.1 新增）—— MLEG roll 订单提交后到完全成交之间的过渡态。Partial fill 在 `options_chain` 流动性差时真实发生（Gemini 提出）；此状态下：(a) 该 ticker 上不允许其他并发决策，(b) 5 分钟内未完全成交触发 cancel-and-rebuild，(c) 完全成交后回到目标新状态（CSP_OPEN 或 CC_OPEN）。
+- **`CORPORATE_ACTION`**（v1.1 新增）—— 检测到底层股票发生 split、spin-off、special dividend、M&A 等公司行动时，**任何**当前状态都可转入此 freeze 态。期权合约会被 OCC 调整，自动操作此时会出错。EDGAR + corporate action API 监控触发；操作员手动 `unfreeze` 后转回上一状态或 CASH。
+- **`ASSIGNED_HELD`** —— bag-holder 子状态（股价 < cost_basis × 0.85）：停止自动 CC，由 rescue 引擎接管。
+- **`CYCLE_COMPLETE`** —— 瞬时状态，原子写入 `cycle_log` 后回到 `CASH`。
+- **`MANUAL_REVIEW`** —— `PENDING_ROLL` 5 分钟未完成或 cancel 失败时的兜底状态，等待操作员明确处置。
 
 **Watchlist 持久化：** 详见下面的 DB schema。**DB 是权威源**。`tickers.yaml` 只用于一次性 bootstrap，之后所有变更都通过 `skills/watchlist-curate/` → `db/watchlist_repo.py` 走。
 
@@ -269,32 +299,59 @@ class WheelPosition(BaseModel):
 
 ### 2.5 Daemon 调度
 
-**单一 APScheduler `BlockingScheduler` daemon。** 三个 cycle，都按 wheel 的节奏量身设计：
+**单一 APScheduler `BlockingScheduler` daemon。** 三个调度 cycle + 三次每日对账 + 长连 broker activity stream，都按 wheel 的节奏量身设计。
+
+**🆕 v1.1：三次 reconcile + broker activity stream**
+
+只在 morning 对账（v1.0）在真钱场景下不够：early assignment（特别是 ex-div CC）、partial fill、cancel-replace ack 延迟都需要快速捕获。v1.1 引入：
+
+- **每日 3 次 reconcile**：08:00（盘前；捕获隔夜 assignment / exercise）/ 09:20（开盘前最后校验）/ 16:15（EOD）
+- **Broker activity stream**（Alpaca trade events websocket）：长连，捕获 `fill`、`partial_fill`、`canceled`、`expired`、`assigned`、`exercised` 事件 → 实时驱动 OMS 状态转换 + FSM 转移
+- 任何 reconcile 发现 broker ≠ DB → 进入 CB7（仓位漂移）+ push 告警
+
+**Pre-market reconcile —— 08:00 ET（周一至周五）：**
+1. 与 Alpaca 全量对账（positions / orders / activities since last close）。
+2. 处理隔夜事件：assignment、exercise、expiration、corporate action（split / dividend / spin-off）→ FSM 转移。
+3. 公司行动监控：若任一 ticker 有 corporate action announcement，进入 `CORPORATE_ACTION` 状态。
+4. 不交易。
+
+**Open-validate reconcile —— 09:20 ET（盘前 10 分钟）：**
+1. 二次 reconcile + 检查 Alpaca health + 检查数据新鲜度。
+2. 计算今日 risk-off 评估（VIX、宏观、`market-outlook` LLM）。
+3. 不交易，准备 morning cycle。
 
 **Morning cycle —— 09:45 ET（周一至周五）：**
-1. 与 Alpaca 对账（仓位、订单、账户）。Broker = source of truth。
-2. 处理隔夜 assignment 通知 → 状态切到 `ASSIGNED`，写入 cost basis。
-3. Risk-off 检查（VIX、宏观日历、日亏 CB）。如果 risk-off，跳过第 5 步。
-4. 遍历每一行 `wheel_state`，跑 gate：`CSP_OPEN`/`CC_OPEN` → 检查 50%TP / 21DTE / delta breach。`ASSIGNED` → 提出 CC。`CASH` → 如果 watchlist 有效且 gate 通过，提出 CSP。
-5. 通过 OMS 提交订单。
+1. 第三次 reconcile（防止 09:20 之后的 ack 延迟）。
+2. 处理 risk-off：如果 risk-off，跳过第 4 步。
+3. 遍历每一行 `wheel_state`，跑 gate：`CSP_OPEN`/`CC_OPEN` → 检查 50%TP / 21DTE / delta breach。`ASSIGNED` → 提出 CC（强制 ex-div 检查，详见 §2.7）。`CASH` → 如果 watchlist 有效且 gate 通过，提出 CSP。
+4. 通过 OMS 提交订单（idempotency key + open-order inventory lock，详见 §2.7）。
 
 09:45 比 `options-copilot` 的 14:30 早，是因为 wheel 不需要 intraday flow 数据 —— 我们要早点拿到 fill 以获得更好流动性。
 
 **Intraday cycle —— 每 15 分钟，10:00-15:45 ET：**
-1. 只对账订单（fill、partial、cancel）。
+1. 主要靠 broker activity stream 驱动，调度只是兜底。
 2. 跑机械退出规则：short option delta > 0.65 → 把 roll 决策入队等 EOD 处理。underlying 盘中跌穿 strike 超过 10% → 立即触发 rescue 评估。
-3. 无 LLM call，无新仓位。
+3. 检查 `PENDING_ROLL` 状态：超过 5 分钟未完全成交 → cancel-and-rebuild。
+4. 无 LLM call，无新仓位。
 
 **EOD cycle —— 16:15 ET（周一至周五）：**
-1. 最终对账。捕获 `account_snapshot`。检测 expiry。
-2. 处理 expiry：short option OTM 失效 → premium 落袋、状态切换。ITM → assignment 已 posted，明早再 reconcile。
+1. 第三次每日 reconcile（pre-market 之外的最后一次）。捕获 `account_snapshot`。检测 expiry。
+2. 处理 expiry：short option OTM 失效 → premium 落袋、状态切换。ITM → assignment 已 posted，明早 pre-market reconcile 处理。
 3. 跑 intraday 入队的 roll 决策。
-4. 如果今天是周日 EOD → 触发 `skills/watchlist-curate/`（周日特殊，跑在 18:00 ET 而不是 16:15）。
-5. 计算每日指标、生成日报。
+4. **Ex-div 预检：** 找出明日 ex-div 且有 short call 的 ticker，若 short call deep ITM 且 extrinsic < dividend → 强制 close（详见 §2.7 ex-div 处理）。
+5. 如果今天是周日 EOD → 触发 `skills/watchlist-curate/`（周日特殊，跑在 18:00 ET 而不是 16:15）。
+6. 计算每日指标、生成日报。
 
 **Heartbeat —— 每 30 分钟。** 与 `options-copilot` 完全一致。
 
 ### 2.6 DB Schema —— 仅列新增表
+
+**🆕 v1.1：存储后端按环境分层**
+
+- **Paper：** SQLite（WAL 模式）—— 与 `options-copilot` 一致，开发迭代快、易于本地审计
+- **Live：** Postgres 15+ —— 真钱场景下，SQLite 在进程崩溃 / 磁盘满 / 文件锁场景下的恢复脆弱性是不可接受的（外部 council 提出）
+- DB 访问通过抽象层（SQLAlchemy core 或薄 DAO），M0 阶段就要按"抽象 + 双 backend"设计，paper-to-live 切换时只换 connection string + 跑一次 schema migration
+- Live 切换前要做：一次 paper → Postgres 的全量数据迁移演练（M6 阶段）
 
 直接复用 `options-copilot` 的表（schema 不动）：`account_snapshots`、`positions`、`orders`、`fills`、`signals`、`model_outputs`、`job_runs`、`daemon_status`、`daily_metrics`。
 
@@ -394,11 +451,68 @@ CREATE INDEX idx_wheel_states_state ON wheel_states(state);
 CREATE INDEX idx_watchlist_status ON watchlist(status);
 CREATE INDEX idx_cost_basis_ticker ON cost_basis_history(ticker, event_date);
 CREATE INDEX idx_cycle_log_ticker ON cycle_log(ticker, started_at);
+
+-- v1.1 新增：Wash Sale 追踪表（taxable 账户必备）
+-- IRS rule: 30 天内同一 "substantially identical" 标的的损失不能立即抵税，
+-- 而是延迟到新仓位 cost basis 里。Wheel 高频换手 + 同标的反复交易 = 高发场景
+CREATE TABLE wash_sale_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker              TEXT NOT NULL,
+    closing_position_id INTEGER REFERENCES positions(id),  -- 触发亏损的平仓
+    closing_loss        REAL NOT NULL,                     -- 该笔亏损金额（负）
+    closing_date        TEXT NOT NULL,
+    opening_position_id INTEGER REFERENCES positions(id),  -- 30 天窗口内的"替代"仓位
+    opening_date        TEXT,
+    disallowed_loss     REAL,                              -- 被推迟的亏损金额
+    adjusted_basis      REAL,                              -- 调整后的新仓位 cost basis
+    status              TEXT NOT NULL DEFAULT 'PENDING',   -- 'PENDING','APPLIED','EXPIRED'
+    notes               TEXT,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- v1.1 新增：公司行动监控
+CREATE TABLE corporate_actions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker              TEXT NOT NULL,
+    action_type         TEXT NOT NULL,    -- 'split','reverse_split','spinoff','special_div','merger','tender_offer'
+    announced_at        TEXT NOT NULL,
+    effective_date      TEXT NOT NULL,
+    detail_json         TEXT,
+    handled             INTEGER NOT NULL DEFAULT 0,
+    freeze_set_at       TEXT,
+    freeze_lifted_at    TEXT,
+    operator_notes      TEXT
+);
+
+CREATE INDEX idx_wash_sale_ticker ON wash_sale_events(ticker, closing_date);
+CREATE INDEX idx_corp_action_ticker ON corporate_actions(ticker, effective_date);
 ```
 
 ### 2.7 订单在 OMS 中的流转
 
 **共享 OMS 直接复用，不改。** 它的状态机是 broker-generic（PENDING → SUBMITTED → FILLED/CANCELED/REJECTED）。Wheels 特有的 lifecycle 住在更上一层的 `wheel_state_machine.py` 里，它观察 OMS 状态变化并做出反应。
+
+**🆕 v1.1：真钱必备的三个 OMS 加固**（外部 council 提出）
+
+1. **Idempotency key**：每个提交订单都必须带 `idempotency_key = sha256(account_id + ticker + legs + side + intent + timestamp_minute)`。OMS 拒绝重复 key 的提交。防止网络重试、daemon 重启、并发 cycle 重复下单。
+2. **Open-order inventory lock**（per-ticker mutex）：一个 ticker 上同时只允许一个未完成订单。新订单提交前检查 `pending_orders[ticker]`，存在则跳过 + log。这就是 $500K 上"多卖一倍合约"的最终防线。
+3. **Duplicate-submit 防护**：OMS 在提交前查询 broker 现有 open orders（按 `client_order_id` 匹配）。已存在 → 同步 broker → 不再提交。重启后第一次提交时这个检查尤其关键。
+
+**🆕 v1.1：Ex-div 提前行权处理**（外部 council 双方都点名）
+
+ITM 的 short call 在 ex-dividend 日**前一天**经常被对手方提前 exercise（exerciser 抢分红）。会导致：你以为还有 CC 在手，实际已经被 called away，账户多了 cash 少了 shares。
+
+- **检测：** EOD cycle 跑 ex-div 预检 —— 列出明日 ex-div 且 wheels 持有 short CC 的 ticker
+- **判断 ITM 提前行权风险：** 如果 `(stock_price - strike) > (extrinsic_value + dividend)`，则提前行权对对手方有利，**强制 close CC** 或 buy-back-and-rewrite
+- **检测漏掉的情况：** 第二天 pre-market reconcile（08:00 ET）发现 shares 消失 + CC 消失 + cash 多了 → 由 `assignment_lifecycle.process_called_away` 处理，但要 flag 为"ex-div 提前行权"，因为这种 case 收到的是 strike 而不是 strike + dividend（dividend 归对手方）
+
+**🆕 v1.1：MLEG Roll Partial Fill 处理**（Gemini 提出）
+
+Roll 是 close + open 的 MLEG（multi-leg）原子订单。在流动性差的合约上**可能只成交一条腿**，留下"裸"敞口。
+
+- **FSM 子状态 `PENDING_ROLL`**：roll 提交时进入；该 ticker 锁定（不允许其他决策）
+- **5 分钟超时**：未完全成交 → cancel-and-rebuild（取消未成交那条腿，单独发新单完成）
+- **如果 cancel 也失败**（broker 已部分 fill）→ 进入 `MANUAL_REVIEW` + critical 告警，操作员手动决定如何 unwind
 
 **Flow A —— CSP 提交 → fill → OTM 到期 → 回到 cash：**
 1. Morning cycle：`csp_selector.propose(ticker)` 返回 leg + limit price。`wheel_gates.csp_open_ok()` 校验。
@@ -439,36 +553,47 @@ account:
   total_capital_usd: 500000
   cash_reservation_pct: 0.70    # CSP 抵押用的 cash 上限占比
 
-schedule:
+storage:                        # v1.1 新增
+  paper_backend: sqlite         # WAL 模式
+  live_backend: postgres        # 切 live 前强制
+  postgres_url_env: WHEELS_PG_URL
+
+schedule:                       # v1.1：3 次 reconcile + activity stream
+  premarket_reconcile_et: "08:00"
+  open_validate_reconcile_et: "09:20"
   morning_cycle_et: "09:45"
   intraday_interval_min: 15
   eod_cycle_et: "16:15"
   watchlist_refresh_day: sunday
   watchlist_refresh_time_et: "18:00"
+  broker_activity_stream: true  # Alpaca trade events websocket
 
 risk:
-  per_ticker_max_pct: 0.08              # 详见 §3
+  per_ticker_max_pct: 0.06              # v1.1: 0.08 → 0.06
+  per_ticker_etf_max_pct: 0.10          # v1.1: 0.12 → 0.10 (SPY/QQQ)
   sector_max_pct: 0.25                  # Tier 1 可放宽到 0.35
-  daily_loss_cb_pct: 0.015              # -1.5%
+  daily_loss_cb_pct: 0.015              # -1.5%（保持）
   weekly_loss_cb_pct: 0.04
-  drawdown_cb_pct: 0.08
+  drawdown_cb_pct: 0.06                 # v1.1: 0.08 → 0.06
   catastrophic_drawdown_pct: 0.15
   per_position_stop_loss_delta: 0.65
   rescue_trigger_drawdown_pct: 0.15
-  max_roll_count: 2
+  max_roll_count: 1                     # v1.1: 2 → 1
+  single_name_gap_freeze_pct: 0.12      # v1.1 新增
+  single_name_gap_freeze_days: 5        # v1.1 新增
 
 defaults:
-  put_delta: [0.20, 0.30]
-  put_delta_target: 0.22
-  call_delta: [0.20, 0.35]
-  call_delta_target: 0.25
-  dte: [28, 45]
-  dte_target: 35
+  put_delta: [0.15, 0.22]               # v1.1: [0.20, 0.30] → [0.15, 0.22]
+  put_delta_target: 0.18                # v1.1: 0.22 → 0.18
+  call_delta: [0.15, 0.25]              # v1.1: [0.20, 0.35] → [0.15, 0.25]
+  call_delta_target: 0.20               # v1.1: 0.25 → 0.20
+  dte: [35, 50]                         # v1.1: [28, 45] → [35, 50]
+  dte_target: 42                        # v1.1: 35 → 42
   iv_rank_range: [0.25, 0.65]
-  earnings_blackout_days: 7
+  earnings_blackout_days: 10            # v1.1: 7 → 10
   macro_blackout_days: 2
   profit_take_pct: 0.50
-  time_stop_dte: 21
+  time_stop_dte: 21                     # 固定不随 IVR 漂移（外部 council 修正）
 
 gates:
   vix_freeze_above: 28
@@ -479,18 +604,19 @@ gates:
   min_credit_pct_of_strike_csp: 0.005
   min_credit_pct_of_strike_cc: 0.004
   max_daily_new_entries: 3
+  pending_roll_timeout_sec: 300         # v1.1 新增
+  ex_div_cc_close_extrinsic_lt_div: true  # v1.1：extrinsic < dividend 时强 close
 
 llm:
   watchlist_curate:
     enabled: true
-    pattern: council                     # 5 模型 propose + blind-score
-    models:
+    pattern: council                     # v1.1：3 模型 propose + blind-score
+    models:                              # 3 模型组合
       - "anthropic/claude-opus-4-7"
       - "openai/gpt-5.4"
-      - "x-ai/grok-4.20"
       - "google/gemini-3.1-pro-preview"
-      - "deepseek/deepseek-v3.2"
     frequency: weekly
+    promote_to_core_threshold: 3         # 3/3 一致才进 core
   fundamentals_deepdive:
     enabled: true
     pattern: single
@@ -506,8 +632,9 @@ llm:
     model: "anthropic/claude-sonnet-4-7"
   rescue_decide:
     enabled: true
-    pattern: council_vote                # 5 模型 propose + vote（无 blind-score）
-    models: [...]                        # 同上 5 个
+    pattern: council_vote                # v1.1：3 模型 vote
+    models: [...]                        # 同 watchlist 的 3 个
+    tie_default: "escalate_to_human"
   code_screener:
     enabled: true                        # 纯代码，无 LLM call
   # 显式 NO-LLM 列表：strike/DTE/delta、order quantity、profit-take、stop-loss
@@ -562,10 +689,10 @@ Seed 完之后，**DB 中的 watchlist 表是权威源**。YAML 仅作为 bootst
 | **工作 buffer** | 10% | $50,000 | 结算中现金、premium float、在途订单、手续费 |
 | **总计** | 100% | $500,000 | |
 
-**单 ticker 最大敞口：8% 账户 = $40,000** 名义值（所有未平 CSP + 已 assigned shares 按 strike 计）。$40K 上限意味着即使某只单股 50% 跳空跌停，账户也只损失 4%。可生存。**例外：SPY/QQQ 上限 $60K (12%)**，因为它们无 idiosyncratic risk。
+**单 ticker 最大敞口：6% 账户 = $30,000** 名义值（v1.1 从 8% 收紧；所有未平 CSP + 已 assigned shares 按 strike 计）。$30K 上限意味着即使某只单股 50% 跳空跌停，账户也只损失 3%。**例外：SPY/QQQ 上限 $50K (10%)**（v1.1 从 12% 收紧），因为它们无 idiosyncratic risk。
 
 **目标并行仓位数：10**（research 给的 8-10 范围的上限）：
-- 10 × $35K 平均 = $350K = 正好顶到 CSP cash 上限
+- 10 × $28K 平均 = $280K，留 $70K 给 ETF 高溢价和后续加仓
 - 10 个名字比 8 个分散得更好
 - 少于 10 → 单仓敞口爬太高；多于 12 → earnings 冲突概率非线性升高
 
@@ -573,38 +700,40 @@ Seed 完之后，**DB 中的 watchlist 表是权威源**。YAML 仅作为 bootst
 - 任一 GICS sector 最多占已部署资金的 **25%**
 - Tier 1 sector（指数 + 主导 tech）放宽到 **35%**
 - 单一 sub-industry 最多 **2 个名字**（不能 AMD + NVDA 同时开）
+- 🆕 v1.1：**Factor / correlation cap**（QQQ + AAPL + MSFT + GOOGL 高度相关，sector cap 不能替代）—— M2 阶段加入 correlation 监控，short-term v1.1 通过 watchlist tier 间接控制（core 中 tech 类不超过 3 个名字）
 
-**满仓示例（10 个仓位，$386K 部署）：**
+**满仓示例（10 个仓位，$306K 部署 —— v1.1 重算）：**
 
 | # | Ticker | Strike | Contracts | Reserved $ | Sector |
 |---|---|---|---|---|---|
-| 1 | SPY | $580 | 1 | $58,000 | Index |
+| 1 | SPY | $580 | 1 | $58,000 | Index *(ETF 上限 $50K → 引擎调整为 0 张或换 strike)* |
+| 1' | SPY | $480 | 1 | $48,000 | Index *(实际选低一档)* |
 | 2 | QQQ | $470 | 1 | $47,000 | Index |
 | 3 | AAPL | $230 | 1 | $23,000 | Tech |
-| 4 | MSFT | $420 | 1 | $42,000 | Tech |
-| 5 | GOOGL | $180 | 2 | $36,000 | Tech |
-| 6 | AMZN | $200 | 2 | $40,000 | Cons. Disc. |
+| 4 | MSFT | $300 | 1 | $30,000 | Tech *($30K 上限即 1 张)* |
+| 5 | GOOGL | $150 | 2 | $30,000 | Tech |
+| 6 | AMZN | $150 | 2 | $30,000 | Cons. Disc. |
 | 7 | JPM | $230 | 1 | $23,000 | Financials |
 | 8 | KO | $70 | 4 | $28,000 | Cons. Staples |
-| 9 | XOM | $115 | 3 | $34,500 | Energy |
-| 10 | UNH | $550 | 1 | $55,000 | Healthcare |
-| | | | **合计** | **$386,500** | |
+| 9 | XOM | $100 | 3 | $30,000 | Energy |
+| 10 | UNH | $300 | 1 | $30,000 | Healthcare *($30K 上限即 1 张)* |
+| | | | **合计** | **~$317,000** | |
 
-（引擎会把最贵那只缩到 ≤$350K 之内。Cash 闲置约 $150K = 30%，正好。）
+引擎对超 $30K 的单 ticker 自动缩单或挑更低 strike。Cash 闲置约 $183K = 37%（v1.1 比 v1.0 更保守，留更多 buffer）。
 
 ### 3.2 默认交易参数
 
 | 参数 | 默认 | 区间 | 理由 |
 |---|---|---|---|
-| Put delta (CSP 入场) | **-0.22** | -0.15 ~ -0.30 | Research 0.20-0.30 sweet spot 的保守端。约 78% OTM 到期概率 |
-| Call delta (CC 入场) | **+0.25** | +0.20 ~ +0.35 | 比 CSP 略高 —— 被 assigned 后想让 called away 的概率合理 |
-| DTE target（入场） | **35** | 28-45 | Research 30-45 区间中位。避开 <21 DTE gamma zone |
+| Put delta (CSP 入场) | **-0.18** *(v1.1)* | -0.15 ~ -0.22 *(v1.1)* | 外部 council：原 0.22 偏激进，$500K 真钱建议更保守端。-0.18 ≈ 82% OTM 概率 |
+| Call delta (CC 入场) | **+0.20** *(v1.1)* | +0.15 ~ +0.25 *(v1.1)* | 外部 council：原 0.25 偏激进。-0.20 给被 called away 更宽的余地 |
+| DTE target（入场） | **42** *(v1.1)* | 35-50 *(v1.1)* | 外部 council：原 35 离 21-DTE time stop 太近；42 给 50% TP 更充分的时间 |
 | 提前关仓 (profit take) | **50% credit** | 40-60% | tastytrade 200K trade 研究。50% 时关（除非 <7 DTE，让它过期） |
-| Time stop | **21 DTE** | 18-25 | Research 默认值。IVR ≥50 延到 14 DTE，IVR ≤35 提前到 25 DTE |
+| Time stop | **21 DTE 固定** *(v1.1)* | 不随 IVR 漂移 | 外部 council 反对 v1.0 的 IVR-dependent 调整 —— 简单规则更可靠 |
 | Stop loss | short delta ≥ 0.65 或 close 要付的 debit ≥ 2× credit | 同时 | 两个冗余触发；股票可能比单一规则更快穿仓 |
-| Roll 触发 | strike breached AND short delta ≥ 0.50 AND ≤21 DTE | 三者必须同时 | 避免在 noise 上反应过度 |
-| 最大 roll 次数 | **2 次** | 硬上限 | Research 默认。第三次决策：take assignment / close / rescue |
-| IV rank 入场 | **25 ≤ IVR ≤ 65** | 硬约束 | <25 太便宜不能补偿 tail risk；>65 通常是 event 在被 price in |
+| Roll 触发 | strike breached AND short delta ≥ 0.40 AND ≤21 DTE | 三者必须同时 *(v1.1: 0.50 → 0.40)* | Gemini 提出：0.50 时合约已 ITM、bid-ask 极宽难拿 net credit；0.40 提前防守 |
+| 最大 roll 次数 | **1 次** *(v1.1: 2 → 1)* | 硬上限 | 外部 council：防止 roll-down 死亡螺旋。第二次决策：take assignment / close / rescue |
+| IV rank 入场 | **25 ≤ IVR ≤ 65** | 硬约束 | <25 太便宜不能补偿 tail risk；>65 通常是 event 在被 price in。**例外：v1.1 允许 IVR > 65 的 ETF / Tier 1 名字 进入**（避免 panic 时砍掉肥尾机会，由 LLM outlook 单独审视个股 idiosyncratic risk） |
 | Bid-ask spread | ≤ 5% mid | 硬约束 | Slippage |
 | Open interest | ≥ 500 目标行权价 | 硬约束 | 比 research 的 100 紧 —— $500K 规模可能需要 roll size |
 | 最低 credit | ≥ 0.5% strike (CSP)、≥ 0.4% strike (CC) | 硬约束 | "这张合约的位置值不值"的底线 |
@@ -652,10 +781,10 @@ Seed 完之后，**DB 中的 watchlist 表是权威源**。YAML 仅作为 bootst
 
 | # | Gate | 阈值 |
 |---|---|---|
-| G1 | Earnings | underlying earnings ≤ ±7 日（相对入场或到期） |
+| G1 | Earnings | underlying earnings ≤ ±10 日（v1.1：±7 → ±10；相对入场或到期，任一） |
 | G2 | 宏观事件 | FOMC / CPI / NFP / PCE ±2 日内 |
 | G3 | VIX | >28 全冻；22-28 仅 Tier 1；≤22 两层都开 |
-| G4 | IV rank | <25 或 >65 |
+| G4 | IV rank | <25（始终拒）；>65 仅对 Tier 1 / ETF 例外允许（v1.1） |
 | G5 | OI | <500 在目标行权价 |
 | G6 | 价差 | >5% mid |
 | G7 | 期权 volume | 20 日均 <200 |
@@ -663,31 +792,57 @@ Seed 完之后，**DB 中的 watchlist 表是权威源**。YAML 仅作为 bootst
 | G9 | CSP cash 上限 | 加上这笔会超 $350K 总预留 |
 | G10 | 行业集中度 | 加上后 sector >25%（Tier 1 >35%） |
 | G11 | 子行业冲突 | 同一子行业已有未平仓位 |
-| G12 | 单 ticker 敞口 | 预留需 >$40K（SPY/QQQ 例外 $60K） |
+| G12 | 单 ticker 敞口 | 预留需 >$30K（SPY/QQQ 例外 $50K）（v1.1：从 $40K/$60K 收紧） |
 | G13 | 数据陈旧 | quote / chain >5 分钟未更新 |
 | G14 | Watchlist | Ticker 不在 ACTIVE watchlist |
 | G15 | 待 review 的 rescue | 此 ticker 有未解决的 rescue flag |
 | G16 | 当日入场上限 | 当日已开 >3 个新 CSP |
 | G17 | Drawdown brake | 账户在 CB 状态 |
 | G18 | Broker 健康 | Alpaca health monitor 降级 |
+| **G19** | **Single-name gap freeze**（v1.1 新增） | 该 ticker 在过去 5 个交易日内任一日单日跌幅 > 12% → 该 ticker 5 个交易日内禁开新仓 |
+| **G20** | **Corporate action**（v1.1 新增） | 该 ticker 在 `CORPORATE_ACTION` 状态 → 拒绝 |
+| **G21** | **Wash sale**（v1.1 新增） | 该 ticker 在过去 30 日内有亏损平仓 → 新仓只在评估后开（损失会被 deferred，需要预计 cost basis 调整） |
 
 ### 3.5 Assignment / Bag-Holder 管理
 
 被 assigned 时：
-1. Cost basis = strike − 整个 wheel cycle 收到的净 premium（CSP credits − roll debit）。
+1. **Cost basis 公式（v1.1 显式化）：** `Adjusted Basis = strike + Σ(roll debits) − Σ(all credits)`
+   - 包含：assignment 行权价 + 历次 roll 支付的 net debit − CSP 期收到的所有 net credits − CC 期收到的所有 net credits − 持有期分红
+   - **死亡螺旋防护：** 代码硬性禁止"为了赚 premium 反复 roll-down 导致 effective basis 升高"。详见 §3.2 `max_roll_count = 1`。
 2. 预留 cash 变成 shares；重算 sector + ticker 敞口。
 3. 只有 escalation tier 允许时才提 CC（见下）。
 
 **硬约束：** 任一 CC 的 strike `K` 必须满足 `K ≥ cost_basis`。代码强制。**全系统最重要的一行代码**。
 
+**🆕 v1.1：CC strike floor 例外路径**（外部 council 提出：极端套牢下硬约束会导致永久僵死）
+
+仅在 **同时满足以下所有条件**时，允许 CC strike < cost_basis（"basis-below CC"）：
+1. Ticker 处于 T3/T4 escalation 状态（drawdown ≥ -20%）
+2. 已经至少 60 天未能在 K ≥ basis 卖出 CC（连续 4 周 `cc_no_viable_strike` log）
+3. **操作员显式人工批准**（不能由 LLM rescue 单独决定）
+4. 该笔锁定亏损 ≤ 季度 realized loss budget 上限（默认账户净值 1%/季 = $5K/季）
+5. 在 daily report + 推送通知中标红记录
+
+如果上述任一不满足，CC 不开，等待 ticker 价格恢复或被强制退出。
+
+**🆕 v1.1：Wash Sale 追踪**（taxable 账户必备，外部 council 提出）
+
+US IRS 30 天 wash sale 规则：30 日内同一 "substantially identical" 标的的亏损不能立即抵税，而是 deferred 到新仓位的 cost basis。Wheel 高频换手 + 同标的反复交易 = wash sale 高发场景。
+
+**实现：** `db/cost_basis_repo.py` + `wash_sale_events` 表（§2.6 已建）：
+- 任一 CSP / CC / shares 平仓有亏损 → 写入 `wash_sale_events` PENDING
+- 30 日内同一 ticker 再开新 CSP / CC / 接到 assignment → 把之前的 disallowed_loss 加到新仓位 cost basis 上
+- Gate G21 在新开 CSP 前查询 pending wash sales，给出预警（不强制拒绝，但 daily report 标记）
+- Cycle log 的 `realized_pnl` 区分 *会计 P&L*（含 wash sale 调整）和 *经济 P&L*（不含）
+
 **按 cost basis drawdown 的分级 escalation：**
 
 | Tier | DD | 动作 |
 |---|---|---|
-| **T0 Normal** | 0% 到 -5% | 标准 CC：delta 0.25、DTE 30-45、K ≥ basis |
-| **T1 Watch** | -5% 到 -10% | delta 降到 0.15-0.20；K = max(basis, current × 1.05)。日报里标记 |
+| **T0 Normal** | 0% 到 -5% | 标准 CC：delta 0.20（v1.1）、DTE 35-50、K ≥ basis |
+| **T1 Watch** | -5% 到 -10% | delta 降到 0.12-0.18（v1.1：更保守）；K = max(basis, current × 1.05)。日报里标记 |
 | **T2 Stress** | -10% 到 -20% | **暂停自动 CC。** 开 rescue review ticket。LLM rescue 评估：继续持有？远期低 delta CC（<0.10）？加仓拉低 basis？ |
-| **T3 Critical** | -20% 到 -30% | **此 ticker 全部自动操作暂停。** 强制 LLM rescue review。给人类 3 个选项 |
+| **T3 Critical** | -20% 到 -30% | **此 ticker 全部自动操作暂停。** 强制 LLM rescue review。给人类 3 个选项。**可启用 basis-below CC 例外路径**（需人工批准） |
 | **T4 Forced exit** | <-30% | 5 个工作日内人类必须 review。无输入则默认：3 日 TWAP 退出。Ticker 从 watchlist 移除至少 90 天 |
 
 **强制退出（无视 tier）：** underlying <$15/股、宣布破产、审计失败、持有 >365 天且未恢复到 -10% basis 内、市值跌破 $5B。
@@ -698,12 +853,14 @@ Seed 完之后，**DB 中的 watchlist 表是权威源**。YAML 仅作为 bootst
 |---|---|---|---|
 | **CB1 日亏** | 日 P&L < -1.5% equity (约 $7.5K) | 冻新仓 24h | 次日自动 |
 | **CB2 周亏** | 5 日滚动 P&L < -4% (约 $20K) | 冻新仓；现有 TP 收紧到 30% | 手动解锁 |
-| **CB3 Drawdown** | peak-to-trough DD ≥ 8% (约 $40K) | 停新；CC 一有利润就平；保护现金 | 手动 + DD <5% 连续 5 日 |
-| **CB4 灾难性 DD** | DD ≥ 15% (约 $75K) | 完全停；任何 option 都不开；只保 shares | 强制全系统 review |
+| **CB3 Drawdown** | peak-to-trough DD ≥ **6%** (约 $30K)（v1.1：8% → 6%） | 停新；CC 一有利润就平；保护现金 | 手动 + DD <4% 连续 5 日 |
+| **CB4 灾难性 DD** | DD ≥ 12%（v1.1：15% → 12%）(约 $60K) | 完全停；任何 option 都不开；只保 shares | 强制全系统 review |
 | **CB5 Broker 健康** | 10 分钟内 API 错误 >10% 或 >5 个连续 5xx | 只读模式 | 30 分钟正常后自动 |
 | **CB6 数据陈旧** | quote / IV / earnings >4h 未更新 | 跳过本 cycle | 数据新鲜后自动 |
 | **CB7 仓位漂移** | Broker vs DB 不一致 >1 cycle | 暂停新仓 | reconcile 通过后自动 |
 | **CB8 订单速率** | 单日新订单 >8 | 当日不再开仓 | 次日自动 |
+| **CB9 单票 gap**（v1.1 新增） | 单 ticker 单日跌幅 > 12% | 该 ticker 冻结 5 个交易日（也由 G19 在 gate 层捕获） | 5 个交易日后自动；或操作员手动早释 |
+| **CB10 LLM 服务降级**（v1.1 新增） | OpenRouter API 错误率 >50% 持续 30 分钟 | 进入 `llm_degraded` 模式：所有 LLM touchpoint 用 last-good cache | LLM 恢复后自动 |
 
 **自动恢复** 用于基础设施问题（CB5/6/7）；**手动解锁** 用于资金问题（CB2/3/4）。资金类违规说明 *框架本身有问题*，不只是连接问题。
 
@@ -773,8 +930,8 @@ Seed 完之后，**DB 中的 watchlist 表是权威源**。YAML 仅作为 bootst
    "removed_from_prior": [...], "sector_concentration_note": "..."}
   ```
 - **为什么用 LLM：** Watchlist 本质就是问 "我作为长期投资者愿意在这个 strike 买入并持有这家公司吗？"—— 纯定性公司质量问题。Research §2.1：只在你 *愿意持有 2 年以上* 的股票上 wheel。
-- **模型：** **5 模型 propose-then-blind-score council** —— 直接复用 `options-copilot` 的模式。每个模型独立排序；提案匿名化后再被同 5 模型打分；进入 `core` 需 ≥3/5 同意。
-- **成本：** $3-6/run × 每月 4-5 run = **约 $15-25/月**。
+- **模型：** **3 模型 propose-then-blind-score council**（v1.1：5 → 3，外部 council review 一致认为 5 模型对单一 Wheel 是过度工程）—— 3 模型组合：`anthropic/claude-opus-4-7` + `openai/gpt-5.4` + `google/gemini-3.1-pro-preview`。每个模型独立排序；提案匿名化后再被同 3 模型打分；进入 `core` 需 **3/3 一致**（v1.1：5/5 → 3/3），降级到 `satellite` 或保持现状需 2/3。
+- **成本：** ~$2-3/run × 每月 4-5 run = **约 $10-15/月**（v1.1 比 v1.0 节省约 $8）。
 
 #### 4.1.3 基本面深读 —— `fundamentals-deepdive`（每月每 ticker，单 Opus）
 - **决策：** 单 ticker 基本面评分卡，作为 watchlist-curate council 的 *evidence* 使用，不单独决策。
@@ -800,8 +957,8 @@ Seed 完之后，**DB 中的 watchlist 表是权威源**。YAML 仅作为 bootst
 - **输入：** 完整仓位历史、当前 basis vs market、≥basis 的 CC 行权价候选、持有天数、最新基本面、行业 + 宏观背景、保护性 put / collar 合约链。
 - **输出 schema：** 恰选一项：`{hold_and_wait, sell_cc_at_basis, sell_cc_below_basis_for_premium, buy_protective_put, convert_to_collar, take_loss_close, escalate_to_human}` + 理由 + 估算 P&L 影响。
 - **为什么用 LLM：** Research §5 唯一明确点名 LLM 加价值的地方。高信息密度、多选项、单一规则 base rate 差。
-- **模型：** **5 模型 propose-and-vote**（无 blind-score —— 输出是 categorical，不连续）。多数票胜。平票 → `escalate_to_human`。
-- **成本：** $2-4/次。预期 **<$10/月**。
+- **模型：** **3 模型 propose-and-vote**（v1.1：5 → 3）—— 同 watchlist 的 3 个模型。无 blind-score（输出是 categorical，不连续）。多数票胜（2/3）。**平票 → `escalate_to_human`**（在 3 模型组合下平票即 1-1-1 三选项全分歧，更需要人介入）。
+- **成本：** ~$1-3/次。预期 **<$5/月**（v1.1 比 v1.0 节省约 $5）。
 
 #### 4.1.6 每日 "今天该不该交易" → 已合并到 4.1.1
 Regime read 已经处理。单独的 gate 是冗余 + 增加延迟。
@@ -873,26 +1030,26 @@ Step 4 —— 综合与持久化
 
 | 接入点 | 模式 | 理由 |
 |---|---|---|
-| Watchlist curate | 5 模型 propose + blind-score | 最高 stakes；周度 policy；成本不对称偏向 consensus |
-| Rescue decide | 5 模型 propose + vote（无 blind-score） | Categorical 输出；防止单模型在灾难路径上过度自信 |
+| Watchlist curate | **3 模型** propose + blind-score（v1.1） | 高 stakes；周度 policy；3 模型已经够覆盖盲点，避免过度工程 |
+| Rescue decide | **3 模型** propose + vote（v1.1） | Categorical 输出；防止单模型在灾难路径上过度自信 |
 | Fundamentals deepdive | 单 Opus | Evidence 不是 verdict；下游 council 加权 |
 | Outlook analysis | 单 Sonnet | 调节信号；不直接执行 |
 | Regime read | 单 Sonnet | 每日延迟敏感；规则已经盖了最坏情况 |
 
 ### 4.4 成本管理
 
-**稳态月成本：**
+**稳态月成本（v1.1：5 模型 → 3 模型 后）：**
 
 | 接入点 | 频率 | $/run | $/月 |
 |---|---|---|---|
 | Regime read (Sonnet) | 22 交易日 | $0.02 | ~$0.50 |
-| Watchlist council (5×) | 4-5/月 | $4 | ~$18 |
+| Watchlist council (3×) | 4-5/月 | ~$2.5 | ~$11 |
 | Fundamentals (Opus) | 约 40 ticker-events | $0.40 | ~$16（缓存后 ~$8） |
 | Outlook (Sonnet) | 约 80 ticker-events | $0.08 | ~$7 |
-| Rescue council | 0-3/月 | $3 | ~$5 |
-| **总计** | | | **~$40-50/月** |
+| Rescue council (3×) | 0-3/月 | ~$2 | ~$3 |
+| **总计** | | | **~$25-30/月** |
 
-vs 预期月毛 premium $3-8K → 成本 <2% 收入。不是约束。
+vs 预期月毛 premium $3-8K → 成本 <1% 收入。不是约束。v1.1 比 v1.0 节省约 $15/月（5→3 模型 council）。
 
 **缓存策略**（巨大乘数）：
 - Fundamentals 输出按 (ticker, 最近 10Q filing 日期) 缓存 —— 季度级。$1.60/ticker/年 vs $19.20 无缓存。
@@ -1024,10 +1181,22 @@ Alpaca paper 10 周 + 真钱 6 周阶梯上线。
 - 0 次 CC 试图在 strike 低于 cost basis 提交
 - 第 9-10 周 0 次需要人工介入
 
-**LLM 质量：**
-- LLM-curated watchlist 比 frozen baseline 的 premium yield 高 ≥5%（Week 5-10 取 4 周 min sample）
+**LLM 质量（v1.1：从 "premium yield 对比" 改为 shadow A/B 多维评估）：**
+
+外部 council 指出：用 paper PnL 来证明 LLM watchlist 比 baseline 强，样本太小且 Alpaca paper fill 失真。改为 **shadow A/B**：
+
+- **Shadow A/B 设置：** 每周日 LLM curate 出 watchlist A；同时维护一个 frozen baseline watchlist B（Phase 2 static list）。两个 watchlist 都跑 gate + 模拟入场决策（不真的下单 B 的），记录后续 4 周 metrics
+- **评估维度（不再单看 PnL）：**
+  - **候选质量（candidate quality）：** A vs B 通过全部 gate 的候选数、平均 IV rank、平均 OI、平均 spread
+  - **命中率（hit rate）：** 被推到 core 的 ticker，4 周后是否仍满足入场条件（earnings 漂移、IV 崩塌、被退市等导致失效的比例越低越好）
+  - **后续风险事件率（risk event rate）：** A 推的 ticker 在持有期间触发 G19 single-name gap、rescue trigger、forced exit 的比例，应显著低于 B
+  - **多样性 / 集中度：** A 的 sector / sub-industry 分布是否合理
+- **Gate 阈值（v1.1）：**
+  - A 在"命中率"上 ≥ B + 10pp（百分点），或
+  - A 在"风险事件率"上 ≤ B − 5pp，或
+  - 两者综合 score ≥ 70/100（按候选质量 30% + 命中率 40% + 风险事件率 30% 加权）
 - 0 个 rescue 决策用户 review 时会推翻
-- LLM 成本 ≤$30/周
+- LLM 成本 ≤$30/周（v1.1：模型缩 3 个后实际 <$10/周）
 
 **可观测性：**
 - 日报邮件 ≥48/50 个交易日送达
@@ -1047,8 +1216,15 @@ Alpaca paper 10 周 + 真钱 6 周阶梯上线。
 | 7 | Assignment 通知漏 / 延迟 | 跳过周一早 reconcile；周二恢复 | 周二 reconcile 检测到漏掉的 assignment、更新 DB、算 basis、下个 cycle 开 CC；告警 |
 | 8 | Cost basis 算错（分红 / 拆股） | 找一个即将分红的 ticker（真）；拆股则模拟 | Basis 按分红调整；CC strike floor 用调整后 basis。拆股 → 人工 review flag |
 | 9 | 同日多个 assignment | 注入：3 个 deep-ITM CSP 同周五到期，3 个不同 ticker | 周一早 3 个一起处理；`positions` 表无 race；组合上限被执行 |
+| **10** | **🆕 Ex-div 提前行权（CC）** | 找一个真实即将 ex-div 且有 deep ITM CC 候选的 ticker；或合成 ex-div 前 CC | EOD ex-div 预检触发；强制 close CC 或检测到 called-away 后用 `assignment_lifecycle.process_called_away` + ex-div flag 正确入账（不收 dividend） |
+| **11** | **🆕 MLEG Roll partial fill** | 注入：roll 订单的 long leg 成交、short leg 未成交（设置极宽 limit price 让 short 不到位） | FSM 转 `PENDING_ROLL`；5 分钟超时；cancel 未成交 leg；如果 cancel 失败 → `MANUAL_REVIEW` + critical 推送 |
+| **12** | **🆕 交易暂停 / LUDP** | 注入：API 返回 `halt` 状态 30 分钟 | 该 ticker 暂停所有新决策；现有仓位继续监控；解除后正常恢复 |
+| **13** | **🆕 Chain 缺 Greeks** | 注入：Alpaca chain 响应缺 delta / gamma 字段 | `csp_selector` / `cc_selector` 拒绝选；G13 触发 stale-data；操作员告警 |
+| **14** | **🆕 公司行动**（special dividend / spin-off / merger 调整） | 找一个真实即将 spin-off 的 ticker，或注入 `corporate_actions` 表 | `wheel_states` 进 `CORPORATE_ACTION` 状态；操作员手动 unfreeze 前不交易；OCC 调整后 basis 重算 |
+| **15** | **🆕 Half-day cutoff** | 注入：market_clock 报告今天 13:00 ET 收盘 | EOD cycle 移到 13:15 ET 跑；intraday cycle 在 13:00 后停 |
+| **16** | **🆕 Bid-ask spread 暴增到 20%** | 注入：chain mid 不变，spread 扩到 20% mid | G6 拒新仓；roll 决策走"挂 limit 等"路径，绝不 market order 跨 spread |
 
-1-3 在 10 周里大概率自然发生；4-9 需要注入。每个有一个独立脚本在 `scripts/stress/` 下。
+1-3 在 10 周里大概率自然发生；4-16 需要注入。每个有一个独立脚本在 `scripts/stress/` 下。
 
 ### 5.5 可观测性
 
@@ -1074,14 +1250,25 @@ Alpaca paper 10 周 + 真钱 6 周阶梯上线。
 
 ### 5.6 Paper → Live 资金阶梯
 
-| Stage | 资金 | Ticker 数 | 时长 | 进下一阶段的 gate |
+| Stage | 资金 | Ticker 数 | 时长 *(v1.1)* | 进下一阶段的 gate |
 |---|---|---|---|---|
-| **Live-α** | $50K | 2（SPY、QQQ） | 2 周 | §5.3 所有 gate 在 live 数据上仍绿；与 paper 比 0 个 surprise；用户批准 |
-| **Live-β** | $150K | 4（加 AAPL、MSFT） | 2 周 | Live P&L 减去真手续费仍正；reconcile 干净；slippage <20% vs paper。用户批准 |
-| **Live-γ** | $300K | 6-8（完整 core） | 2 周 | 0 个 CB 触发；LLM 行为与 paper 一致。用户批准 |
+| **🆕 Live-μ** *(v1.1)* | **$5-10K** | 1（SPY） | **≥20 交易日或 1 完整 cycle，取长** | Live fill / slippage 真实 校准；与 paper 对比建立"divergence baseline"；用户批准 |
+| **Live-α** | $50K | 2（SPY、QQQ） | **≥20 交易日或 1 完整 cycle，取长** | §5.3 所有 gate 在 live 数据上仍绿；与 paper / μ 比 0 个 surprise；用户批准 |
+| **Live-β** | $150K | 4（加 AAPL、MSFT） | **≥20 交易日或 1 完整 cycle，取长** | Live P&L 减去真手续费仍正；reconcile 干净；slippage <20% vs paper。用户批准 |
+| **Live-γ** | $300K | 6-8（完整 core） | **≥20 交易日或 1 完整 cycle，取长** | 0 个 CB 触发；LLM 行为与 paper 一致。用户批准 |
 | **Live-1.0** | $500K | 完整 LLM-curated（8-12） | open | 稳态 |
 
-**Live-α + Live-β 期间（前 4 周）做 paper-live 并行。** Paper 账户用 *同代码、同 watchlist、同 prompt* 继续跑。日报有 "paper vs live divergence" 对比。日 P&L 偏差 >1% 且无可解释原因 → 停下来调查。Live-β 之后 paper 降级为被动监控。
+**🆕 v1.1：Live-μ micro-test 的目的**（外部 council 强烈建议）
+
+Alpaca paper fill 在期权上极度不真实（基本按 mid 瞬间成交），Phase 2 设定的 "<5% slippage" 在 paper 中没有验证价值。直接跳 paper → $50K 会在 Live-α 撞上严重 slippage 损耗。Live-μ 用 $5-10K 的"实验性"资金提前校准：
+- 真实 fill price vs paper mid 的差距分布
+- Real bid-ask spread 在 SPY/QQQ 上的实际表现
+- Alpaca live API 与 paper API 的行为差异（限价单、cancel 行为、ack 延迟）
+- 真实手续费、SEC 费、ORF 等小额扣费
+
+**Live-α + Live-β 期间（≥40 交易日）做 paper-live 并行。** Paper 账户用 *同代码、同 watchlist、同 prompt* 继续跑。日报有 "paper vs live divergence" 对比。日 P&L 偏差 >1% 且无可解释原因 → 停下来调查。Live-β 之后 paper 降级为被动监控。
+
+**为什么从 v1.0 "每档 2 周" 改为 "≥20 交易日或 1 完整 cycle，取长"（外部 council 提出）：** 一个完整 wheel cycle（CASH → CSP → assign → CC → called away → CASH）平均 4-8 周，2 周连一个 cycle 都跑不完。20 交易日（约 4 周）是观察一个 cycle 的最低门槛。
 
 **批准 gate：** 用户每次资金升档前书面确认（一行 yes/no 回复每周 review 邮件）。默认 **stay**，不是 **advance**。沉默不等于批准。
 
@@ -1132,30 +1319,35 @@ Alpaca paper 10 周 + 真钱 6 周阶梯上线。
 - `wheels_copilot/shared/` 按 §2.3 模块表从 `options-copilot` vendor-copy 过来
 - `scripts/sync_shared.sh` diff 工具
 - `SHARED_PROVENANCE.md` 含 git SHA
+- 🆕 **`shared/` 上游同步 SLA**（v1.1）：每周一次 diff、关键 bugfix 24h 内 sync、用 `contract_tests/` 锁住共享模块的接口
 - `pyproject.toml`、`.env` 模板、`.gitignore`（已完成）
 - `wheels_daemon.py` 框架（boot APScheduler，job 是 no-op）
-- `db/schema.py` + `scripts/init_db.py` —— 新表创建
+- `db/schema.py` + `scripts/init_db.py` —— 新表创建（含 v1.1 新增 `wash_sale_events`、`corporate_actions`、`roll_decisions`）
+- 🆕 **DB 抽象层**（v1.1）：SQLAlchemy core 或薄 DAO，paper/live 双 backend，connection string 决定。M0 实现 SQLite path，Postgres path 留 stub
 - CI workflow（lint、unit test）
 
-**退出：** daemon 启动、heartbeat、DB 初始化；测试通过。
+**退出：** daemon 启动、heartbeat、DB 初始化；测试通过。DB 抽象层在 SQLite 后端跑通所有 CRUD。
 
 ### M1 —— Wheel 状态机 + 单 ticker MVP（Week -3 至 -2，2026-06-02 → 2026-06-08）
 **交付物：**
-- `engines/wheel_state_machine.py` + `transitions.py`（手写 FSM）
+- `engines/wheel_state_machine.py` + `transitions.py`（手写 FSM，含 v1.1 新增的 `PENDING_ROLL` / `CORPORATE_ACTION` / `ASSIGNED_HELD` / `MANUAL_REVIEW`）
 - `engines/csp_selector.py`（按 `config.yaml` 默认值 deterministic 选行权价/DTE）
-- `engines/cc_selector.py`（强制 cost_basis floor）
-- `engines/wheel_exit_plan.py`（50% TP、21 DTE、delta 0.65 stop）
-- `engines/wheel_gates.py`（G1-G18 硬 gate）
-- `engines/assignment_lifecycle.py`
+- `engines/cc_selector.py`（强制 cost_basis floor；含 ex-div 预检逻辑）
+- `engines/wheel_exit_plan.py`（50% TP、21 DTE 固定、delta 0.65 stop、delta 0.40 roll trigger）
+- `engines/wheel_gates.py`（G1-G21 硬 gate；含 v1.1 G19/G20/G21）
+- `engines/assignment_lifecycle.py`（含 ex-div 提前行权特例处理）
 - `engines/risk_budget.py`
+- 🆕 **`engines/cost_basis_repo.py`**（v1.1）：包含 wash sale 30 日窗口的损失追踪 + cost basis 调整逻辑
+- 🆕 **OMS idempotency + per-ticker order lock**（v1.1）：在 `shared/engines/oms.py` 之上加一层薄 wrapper
+- 🆕 **Broker activity stream consumer**（v1.1）：长连 Alpaca trade events
 - `schemas/wheel_position.py`、`wheel_state.py`、`decisions.py`
 - `skills/wheel-cycle/`（per-ticker dispatcher，暂不接 LLM）
-- Daemon 的 morning/intraday/EOD cycle 接到 FSM
-- `tests/unit/` 覆盖 FSM 转换、gate、selector
-- `tests/integration/` 在 synthetic broker stub 上跑完整 cycle
+- Daemon 的 pre-market / open-validate / morning / intraday / EOD cycle 接到 FSM
+- `tests/unit/` 覆盖 FSM 转换、gate、selector、wash sale 计算
+- `tests/integration/` 在 synthetic broker stub 上跑完整 cycle（含 ex-div、partial fill、wash sale 等 v1.1 场景）
 - `scripts/dry_run_cycle.py`（跑完整 cycle 但不发单）
 
-**退出：** 在 synthetic broker 上能跑通单 ticker SPY 的 CSP→assign→CC→called-away→cash；所有单元 + 集成测试通过。
+**退出：** 在 synthetic broker 上能跑通单 ticker SPY 的 CSP→assign→CC→called-away→cash；所有单元 + 集成测试通过；wash sale 边界 case 测试通过。
 
 ### M2 —— 多 ticker + Watchlist（Week -2 至 -1，2026-06-09 → 2026-06-15）
 **交付物：**
@@ -1193,13 +1385,20 @@ Alpaca paper 10 周 + 真钱 6 周阶梯上线。
 **退出：** Phase 2 结束时 Phase 3 进入条件满足。
 
 ### M5 —— 压测脚本（Paper Week 4-5，并行 Phase 2-3）
-**交付物：**
+**交付物（v1.1：从 6 个扩到 13 个场景）：**
 - `scripts/stress/inject_vix_spike.py`
 - `scripts/stress/inject_broker_outage.py`
 - `scripts/stress/inject_llm_outage.py`
 - `scripts/stress/inject_pin_risk.py`
 - `scripts/stress/inject_missed_reconcile.py`
 - `scripts/stress/inject_multi_assignment.py`
+- 🆕 `scripts/stress/inject_ex_div_early_exercise.py`（v1.1）
+- 🆕 `scripts/stress/inject_partial_fill_roll.py`（v1.1）
+- 🆕 `scripts/stress/inject_halt_ludp.py`（v1.1）
+- 🆕 `scripts/stress/inject_missing_greeks.py`（v1.1）
+- 🆕 `scripts/stress/inject_corporate_action.py`（v1.1）
+- 🆕 `scripts/stress/inject_half_day_cutoff.py`（v1.1）
+- 🆕 `scripts/stress/inject_spread_blowout.py`（v1.1）
 - 推送通知集成（ntfy.sh 或 Slack）
 
 **退出：** Phase 4 进入条件满足。
@@ -1210,44 +1409,58 @@ Alpaca paper 10 周 + 真钱 6 周阶梯上线。
 - `config.yaml` "live" profile review
 - Live API key 安全配置
 - 操作 runbook `docs/RUNBOOK.md`
+- 🆕 **Postgres 15+ 部署**（v1.1）：本地 / 云端，schema 迁移脚本，paper SQLite → Postgres 全量数据迁移演练 + 回滚演练
+- 🆕 **Live-μ kickoff prep**（v1.1）：$5-10K micro 账户激活，仅 SPY，确认所有 CB / 推送链路在 live 下正常
 - 在 live API 上 dry-run（不发单）1 个交易日
 
-**退出：** §5.3 所有 go-live gate 全绿；用户签字。
+**退出：** §5.3 所有 go-live gate 全绿；用户签字；Postgres 迁移演练成功。
 
-### M7-M10 —— Live 资金阶梯
-- M7：Live-α（$50K）
-- M8：Live-β（$150K）
-- M9：Live-γ（$300K）
-- M10：Live-1.0（$500K，稳态）
+### M7-M11 —— Live 资金阶梯（v1.1：从 M7-M10 扩为 M7-M11，加 Live-μ）
+- **🆕 M7：Live-μ（$5-10K，SPY only）** —— 校准 paper-to-live divergence
+- M8：Live-α（$50K，SPY + QQQ）
+- M9：Live-β（$150K，加 AAPL + MSFT）
+- M10：Live-γ（$300K，6-8 个 core ticker）
+- M11：Live-1.0（$500K，稳态完整 watchlist）
 
 ---
 
 ## 7. 待用户决定的开放问题
 
-Council 都给了 provisional answer，但在 kickoff 前值得你明确表态：
+Council 都给了 provisional answer，v1.1 把外部 council 已经收敛的问题去掉、把新引入的问题补上。Kickoff 前未处理的部分，按上面 provisional 答案推进。
+
+**已 resolved（v1.1 应用 council 后已经确定）：**
+
+| # | 问题 | 决定 |
+|---|---|---|
+| ~~5~~ | LLM 模型组合 | ✅ **3 模型 council**：Opus 4.7 + GPT-5.4 + Gemini-3.1-Pro（v1.1 终态） |
+| ~~7~~ | per-ticker 上限 | ✅ **6%**（$30K，v1.1 已 lock） |
+| ~~8~~ | Drawdown CB 阈值 | ✅ **6%**（$30K，v1.1 已 lock） |
+
+**仍待用户决定：**
 
 | # | 问题 | Provisional 答案 | 为什么问 |
 |---|---|---|---|
 | 1 | **代码复用方式** | 现在 vendor-copy → 后续抽 pip package | 确认 vs monorepo 或 day-1 就抽 package |
-| 2 | **账户类型** | 假设 taxable | Alpaca 不支持 IRA，但需要确认你接受 taxable —— wheel 主要产生短期资本利得，按 ordinary income 计税 |
+| 2 | **账户类型** | taxable（含 v1.1 wash sale 追踪） | Alpaca 不支持 IRA。Wash sale 短期 capital gain 处理已纳入正文，但确认你接受这套税务复杂度 |
 | 3 | **初始 Watchlist seed** | §3.3 列出的 15 个（7 core + 8 satellite） | 想加 / 减哪些？有"绝对不持有"列表？ |
 | 4 | **推送通知通道** | 建议 ntfy.sh | 接受？还是用 Slack / SMS / 只邮件？ |
-| 5 | **LLM 模型组合** | Opus 4.7 + Sonnet 4.7 + GPT-5.4 + Grok 4.20 + Gemini 3.1 + DeepSeek v3.2 | 接受这个 council 组合？对成本敏感？还是少几个？ |
-| 6 | **Live-α 起始资金** | $50K（$500K 中的 10%） | 接受？还是更小（$25K）/ 更大（$100K）？ |
-| 7 | **per-ticker 上限** | 8%（$40K） | 保守 —— 6% ($30K，更分散) 或 10% ($50K，更高效) 都可 |
-| 8 | **Drawdown CB 阈值** | 8% peak-to-trough（$40K） | 激进操作员跑 10-12%，保守 5-6% |
+| 6 | **Live-α 起始资金** | $50K（$500K 中的 10%） | v1.1 已加 Live-μ ($5-10K) 在 α 之前。是否仍想用 $50K 作 α？ |
 | 9 | **Earnings transcript 提供商** | API Ninjas（约 $30/月起步） | 这个成本可接受？或者跳过、只靠 10-Q？ |
 | 10 | **Dashboard / Web UI** | v1 跳过（只 CLI + 邮件） | 想早点有个最小 web view？ |
-| 11 | **Live 期间是否 paper 并行** | 是，Live-α/β 前 4 周 | 有用还是浪费？ |
+| 11 | **Live 期间是否 paper 并行** | 是，Live-α + Live-β 前 4-8 周 | 有用还是浪费？ |
 | 12 | **账户号** | wheels 用单独 Alpaca 账户 | 确认 —— 不与 options-copilot 共用账户 |
-
-任何方向有想法都告诉我。Kickoff 前未处理的部分，按上面 provisional 答案推进。
+| **🆕 13** *(v1.1)* | **Postgres 部署位置** | 本地 / Docker / 云（Supabase / RDS / Railway） | M6 阶段决定即可，但 hosting 路径影响 SLA |
+| **🆕 14** *(v1.1)* | **Live-μ micro-test 金额** | $5-10K | 确认 —— 想 $5K（更便宜）还是 $10K（更接近 $50K 行为）？ |
+| **🆕 15** *(v1.1)* | **basis-below CC 例外路径是否启用** | 是，但仅 T3/T4 + 人工批准 + 季度损失预算 ≤1% equity | 接受？还是更激进（直接禁止）/ 更宽松（T2 即可）？ |
+| **🆕 16** *(v1.1)* | **`shared/` 上游 sync SLA** | 每周一次 diff、bugfix 24h sync | 接受？还是更紧（每日）/ 更松（每月）？ |
 
 ---
 
 ## 8. Council 与过程说明
 
-本 plan 由 4 个 specialist subagent 并行起草后综合而成：
+本 plan 经过 **两道 council** 才进入 v1.1：
+
+**Council 1（起草 council，2026-05-18 上午）** —— 4 个 specialist subagent 并行起草后综合：
 
 1. **System Architect**（Plan subagent）—— 负责 §2 + 模块表 + 状态机 + DB schema
 2. **Quant / Risk Specialist**（general-purpose subagent）—— 负责 §3 + 参数 + 标的池 + circuit breaker
@@ -1258,15 +1471,24 @@ Council 都给了 provisional answer，但在 kickoff 前值得你明确表态�
 - `docs/RESEARCH.md` 作为必读
 - 用户 4 条 lock 决策
 - 限定的 scope + 字数预算（1500-2500 词）
-- 输出 markdown 由我综合
+- 输出 markdown 由我综合 → v1.0
 
-这与 `options-copilot` 的 5 模型交易 council 不同：
+**🆕 Council 2（外部 review council，2026-05-18 下午）** —— 通过 [`~/.claude/skills/council-review.md`](file:///Users/tianyuwang/.claude/skills/council-review.md) 触发：
+
+1. **GPT-5.4**（`openai/gpt-5.4` via OpenRouter）—— 独立审阅 v1.0
+2. **Gemini-3.1-Pro**（`google/gemini-3.1-pro-preview` via OpenRouter）—— 独立审阅 v1.0
+3. **GPT-5.4 二次调用**做 3 方综合（Claude proposal + GPT-5.4 review + Gemini review）→ consensus
+
+外部 review 给出了 11 项必改清单，v1.0 → v1.1 把每条都应用到正文里。原始 review + consensus 见 [附录 A](#附录-acouncil-review-2026-05-18-已应用)。
+
+**这与 `options-copilot` 的 5 模型交易 council 不同：**
 - **options-copilot council：** 5 个同角色 LLM 提议交易、互相 blind-score、投票 → 共识
-- **wheels-copilot 规划 council：** 4 个不同角色 specialist 写互不重叠的章节，我做跨章节冲突 reconcile
+- **wheels-copilot 起草 council：** 4 个不同角色 specialist 写互不重叠的章节，我做跨章节冲突 reconcile
+- **wheels-copilot 外部 review council：** 2 个独立 LLM 做 adversarial review + 1 个综合 —— 像 PR review
 
-两者都符合 "council" 精神 —— 多元视角 + 结构化聚合 —— 但交易版本优化 *同类决策的共识*，规划版本优化 *不同维度的深度*。Project planning 用 specialist decomposition 比 4 个 redundant 通用 proposal 出来的文档更有连贯性。
+3 种模式都符合 "council" 精神 —— 多元视角 + 结构化聚合。第一种适合 *同类决策的共识*；第二种适合 *不同维度的深度*；第三种适合 *Claude 自身盲点的发现*。Project planning 这种"先起草，后审视"的二段 council 模式是 v1.1 的核心方法论改进。
 
-**综合阶段 reconcile 的跨章节冲突：**
+**综合阶段 reconcile 的跨章节冲突（Council 1）：**
 
 | 冲突点 | Architect | Quant | LLM | Forward Test | 决议 |
 |---|---|---|---|---|---|
@@ -1279,8 +1501,19 @@ Council 都给了 provisional answer，但在 kickoff 前值得你明确表态�
 
 ---
 
-**Plan v1.0 完。** 下一步：处理 §7 的开放问题，然后开始 M0 工程。
+**Plan v1.1 完。** 下一步：处理 §7 的开放问题，然后开始 M0 工程。
 
+---
+
+## 附录 A：Council Review（2026-05-18 已应用）
+
+> **状态：** ✅ 已应用到正文（v1.0 → v1.1）。本附录保留作为审计记录 + future reference。
+>
+> **触发方式：** [`~/.claude/skills/council-review.md`](file:///Users/tianyuwang/.claude/skills/council-review.md)
+>
+> **审计 JSON：** `/tmp/council_review_audit_20260518_110724.json`
+>
+> 下面是 GPT-5.4 和 Gemini-3.1-Pro 对 v1.0 的原始 review，以及 GPT-5.4 综合的 consensus。**正文已经按 consensus 逐条修订**，请以正文 §0-§8 为准。
 
 ---
 
