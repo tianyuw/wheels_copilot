@@ -150,6 +150,10 @@ trade_planner:
     time_in_force: day
     position_intent: sell_to_open
 
+shadow_order_validation:
+  max_quote_age_seconds: 30
+  max_spread_pct_of_mid: 0.12
+
 cc_selector:
   dte_min: 1
   dte_max: 9

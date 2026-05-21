@@ -183,10 +183,14 @@ class TradePlannerTests(unittest.TestCase):
 
             self.assertTrue(paths["trade_proposals"].exists())
             self.assertTrue(paths["shadow_orders"].exists())
+            self.assertTrue(paths["validated_shadow_orders"].exists())
             proposals = json.loads(paths["trade_proposals"].read_text())
             orders = json.loads(paths["shadow_orders"].read_text())
+            validated = json.loads(paths["validated_shadow_orders"].read_text())
             self.assertEqual(proposals["summary"], {"PROPOSED": 1})
             self.assertEqual(orders["order_count"], 1)
+            self.assertEqual(validated["order_count"], 1)
+            self.assertEqual(validated["summary"], {"BLOCKED": 1})
 
 
 def _config(

@@ -12,6 +12,7 @@ from .csp_selector import evaluate_csp_candidates
 from .gates import evaluate_earnings_gate, evaluate_fundamentals
 from .market_data import fetch_daily_bars, fetch_fundamental_snapshot, fetch_put_chain
 from .models import GateResult, PortfolioSnapshot
+from .order_validation import build_validated_shadow_orders
 from .portfolio_risk import evaluate_portfolio_risk, summarize_portfolio_snapshot
 from .support import analyze_support
 from .trade_planner import build_shadow_orders, build_trade_proposals
@@ -181,12 +182,14 @@ def write_scan_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     trade_proposals = build_trade_proposals(scan, config)
     shadow_orders = build_shadow_orders(trade_proposals, config)
+    validated_shadow_orders = build_validated_shadow_orders(shadow_orders, config)
     paths = {
         "json": output_dir / "scan_results.json",
         "markdown": output_dir / "scan_report.md",
         "csv": output_dir / "scan_summary.csv",
         "trade_proposals": output_dir / "trade_proposals.json",
         "shadow_orders": output_dir / "shadow_orders.json",
+        "validated_shadow_orders": output_dir / "validated_shadow_orders.json",
     }
     paths["json"].write_text(
         json.dumps(scan, indent=2, ensure_ascii=False, default=str),
@@ -200,6 +203,15 @@ def write_scan_outputs(
     )
     paths["shadow_orders"].write_text(
         json.dumps(shadow_orders, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    paths["validated_shadow_orders"].write_text(
+        json.dumps(
+            validated_shadow_orders,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        ),
         encoding="utf-8",
     )
     return paths

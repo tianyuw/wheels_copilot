@@ -11,10 +11,11 @@ Current implementation scope:
 - Earnings gate that keeps CSP expirations before the next earnings date.
 - CSP candidate selector.
 - Trade proposal and shadow order planner for dry-run Alpaca order payloads.
+- Shadow order readiness gate using fresh Alpaca OPRA latest quotes.
 - Unit tests for support scoring, delta policy, fundamentals, and earnings.
 
 No live or paper orders are submitted by the current code. `shadow_orders.json`
-is an auditable dry-run artifact only.
+and `validated_shadow_orders.json` are auditable dry-run artifacts only.
 Covered-call selection, assignment lifecycle, persistence, and Alpaca order
 submission are not implemented yet.
 
@@ -41,8 +42,8 @@ python3 scripts/scan_watchlist.py --with-alpaca
 ```
 
 `--date` controls the report date and option DTE calculation. It does not
-perform a historical market-data replay; the current Yahoo Finance bars and
-option chains are still fetched.
+perform a historical market-data replay; current Alpaca SIP bars and OPRA
+option data are still fetched.
 
 The scan requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in the environment or
 local `.env` for Alpaca market data. `--with-alpaca` also performs read-only
@@ -58,6 +59,7 @@ workspace/scans/YYYY-MM-DD/
   scan_summary.csv
   trade_proposals.json
   shadow_orders.json
+  validated_shadow_orders.json
 ```
 
 `trade_proposals.json` records candidate decisions (`PROPOSED`, `WATCH`,
@@ -65,7 +67,10 @@ workspace/scans/YYYY-MM-DD/
 allocation. Planner allocation is deterministic: AUTO_TRADE candidates are
 prioritized by support score, then weekly return, then ticker. `shadow_orders.json`
 contains only `PROPOSED` trades as dry-run Alpaca limit-order payloads with
-`dry_run_only: true`; the CLI does not submit them.
+`dry_run_only: true`. `validated_shadow_orders.json` revalidates each shadow
+order with fresh Alpaca OPRA latest quotes and active/tradable contract checks,
+then marks it `submit_ready` or records blocking reasons. The CLI does not
+submit orders.
 
 ## Tests
 

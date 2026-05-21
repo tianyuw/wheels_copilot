@@ -187,6 +187,11 @@ class AlpacaAdapterTests(unittest.TestCase):
             if "/v1beta1/options/snapshots?" in req.full_url:
                 self.assertIn("feed=opra", req.full_url)
                 return _Response({"snapshots": {"AAPL260522P00275000": {}}})
+            if "/v1beta1/options/quotes/latest?" in req.full_url:
+                self.assertIn("feed=opra", req.full_url)
+                return _Response(
+                    {"quotes": {"AAPL260522P00275000": {"bp": 1, "ap": 1.1}}}
+                )
             raise AssertionError(req.full_url)
 
         client = AlpacaMarketDataClient("key", "secret", opener=fake_open)
@@ -203,11 +208,13 @@ class AlpacaAdapterTests(unittest.TestCase):
             expiration_date_lte=date(2026, 5, 29),
         )
         snapshots = client.fetch_option_snapshots(["AAPL260522P00275000"])
+        quotes = client.fetch_option_latest_quotes(["AAPL260522P00275000"])
 
         self.assertEqual(bars, [{"t": "2026-05-20T04:00:00Z", "c": 1}])
         self.assertEqual(contracts[0]["symbol"], "AAPL260522P00275000")
         self.assertEqual(snapshots, {"AAPL260522P00275000": {}})
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(quotes, {"AAPL260522P00275000": {"bp": 1, "ap": 1.1}})
+        self.assertEqual(len(calls), 4)
 
     def test_market_data_client_paginates_and_preserves_empty_snapshots(self):
         def fake_open(req, timeout):

@@ -278,6 +278,18 @@ class AlpacaMarketDataClient:
             if not page_token:
                 return snapshots
 
+    def fetch_option_latest_quotes(
+        self,
+        symbols: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        if not symbols:
+            return {}
+        payload = self._get_data_json(
+            "/v1beta1/options/quotes/latest",
+            {"symbols": ",".join(symbols), "feed": self.option_feed},
+        )
+        return payload.get("quotes") or {}
+
     def _get_data_json(
         self,
         path: str,
