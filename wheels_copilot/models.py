@@ -185,8 +185,16 @@ class BrokerPosition:
         return self.underlying_symbol is not None
 
     @property
+    def is_long_equity(self) -> bool:
+        return not self.is_option and self.qty > 0
+
+    @property
     def is_short_put(self) -> bool:
         return self.option_type == "put" and self.qty < 0
+
+    @property
+    def is_short_call(self) -> bool:
+        return self.option_type == "call" and self.qty < 0
 
     @property
     def assignment_cash_required(self) -> float:
@@ -222,6 +230,16 @@ class BrokerOrder:
         intent = (self.position_intent or "").lower()
         return (
             self.option_type == "put"
+            and (self.side or "").lower() == "sell"
+            and self.parent_order_id is None
+            and intent not in {"sell_to_close", "stc", "close"}
+        )
+
+    @property
+    def is_sell_call(self) -> bool:
+        intent = (self.position_intent or "").lower()
+        return (
+            self.option_type == "call"
             and (self.side or "").lower() == "sell"
             and self.parent_order_id is None
             and intent not in {"sell_to_close", "stc", "close"}

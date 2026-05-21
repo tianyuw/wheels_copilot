@@ -76,12 +76,52 @@ def fetch_put_chain(
     config: dict[str, Any] | None = None,
     client: AlpacaMarketDataClient | None = None,
 ) -> list[OptionQuote]:
+    return _fetch_option_chain(
+        ticker,
+        option_type="put",
+        dte_min=dte_min,
+        dte_max=dte_max,
+        as_of=as_of,
+        config=config,
+        client=client,
+    )
+
+
+def fetch_call_chain(
+    ticker: str,
+    dte_min: int,
+    dte_max: int,
+    as_of: date | None = None,
+    config: dict[str, Any] | None = None,
+    client: AlpacaMarketDataClient | None = None,
+) -> list[OptionQuote]:
+    return _fetch_option_chain(
+        ticker,
+        option_type="call",
+        dte_min=dte_min,
+        dte_max=dte_max,
+        as_of=as_of,
+        config=config,
+        client=client,
+    )
+
+
+def _fetch_option_chain(
+    ticker: str,
+    *,
+    option_type: str,
+    dte_min: int,
+    dte_max: int,
+    as_of: date | None = None,
+    config: dict[str, Any] | None = None,
+    client: AlpacaMarketDataClient | None = None,
+) -> list[OptionQuote]:
     as_of = as_of or date.today()
     client = client or AlpacaMarketDataClient.from_config(config or {})
     max_quote_age_seconds = _max_option_quote_age_seconds(config)
     contracts = client.fetch_option_contracts(
         ticker,
-        option_type="put",
+        option_type=option_type,
         expiration_date_gte=as_of + timedelta(days=dte_min),
         expiration_date_lte=as_of + timedelta(days=dte_max),
     )
@@ -89,7 +129,7 @@ def fetch_put_chain(
         contract
         for contract in contracts
         if _str_or_none(contract.get("symbol"))
-        and str(contract.get("type") or "").lower() == "put"
+        and str(contract.get("type") or "").lower() == option_type
         and contract.get("tradable") is not False
     ]
     if not contracts:

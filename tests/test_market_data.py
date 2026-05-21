@@ -11,6 +11,7 @@ from wheels_copilot.market_data import (
     _net_income_values,
     _period_start,
     _recent_move_pct,
+    fetch_call_chain,
     fetch_fundamental_snapshot,
     fetch_daily_bars,
     fetch_put_chain,
@@ -66,6 +67,22 @@ class MarketDataTests(unittest.TestCase):
             datetime(2026, 5, 20, 14, 30, tzinfo=timezone.utc),
         )
 
+    def test_fetch_call_chain_returns_call_contracts(self):
+        client = _FakeAlpacaMarketDataClient()
+
+        options = fetch_call_chain(
+            "TEST",
+            dte_min=1,
+            dte_max=9,
+            as_of=date(2026, 5, 20),
+            client=client,
+        )
+
+        self.assertEqual(client.contract_calls[0]["option_type"], "call")
+        self.assertEqual([opt.symbol for opt in options], ["TEST260529C00105000"])
+        self.assertEqual(options[0].strike, 105)
+        self.assertEqual(options[0].delta, 0.2)
+
     def test_zero_implied_volatility_is_treated_as_missing(self):
         client = _FakeAlpacaMarketDataClient(iv=0.0)
 
@@ -100,6 +117,20 @@ class MarketDataTests(unittest.TestCase):
             dte_max=2,
             as_of=date(2026, 5, 20),
             client=invalid_client,
+        )
+
+        self.assertEqual(options, [])
+
+    def test_fetch_call_chain_filters_stale_quotes(self):
+        client = _FakeAlpacaMarketDataClient(quote_timestamp="2026-05-20T14:30:00Z")
+
+        options = fetch_call_chain(
+            "TEST",
+            dte_min=1,
+            dte_max=9,
+            as_of=date(2026, 5, 20),
+            config={"market_data": {"max_option_quote_age_seconds": 30}},
+            client=client,
         )
 
         self.assertEqual(options, [])
@@ -227,36 +258,47 @@ class _FakeAlpacaMarketDataClient:
 
     def fetch_option_contracts(self, underlying_symbol: str, **kwargs):
         self.contract_calls.append({"underlying_symbol": underlying_symbol, **kwargs})
-        contracts = [
-            {
-                "symbol": "TEST260521P00095000",
-                "expiration_date": "2026-05-21",
-                "strike_price": "95",
-                "type": "put",
-                "tradable": True,
-            },
-            {
-                "symbol": "TEST260522P00090000",
-                "expiration_date": "2026-05-22",
-                "strike_price": "90",
-                "type": "put",
-                "tradable": True,
-            },
-            {
-                "symbol": "TEST260529P00085000",
-                "expiration_date": "2026-05-29",
-                "strike_price": "85",
-                "type": "put",
-                "tradable": True,
-            },
-            {
-                "symbol": "TEST260619P00080000",
-                "expiration_date": "2026-06-19",
-                "strike_price": "80",
-                "type": "put",
-                "tradable": True,
-            },
-        ]
+        if kwargs["option_type"] == "call":
+            contracts = [
+                {
+                    "symbol": "TEST260529C00105000",
+                    "expiration_date": "2026-05-29",
+                    "strike_price": "105",
+                    "type": "call",
+                    "tradable": True,
+                }
+            ]
+        else:
+            contracts = [
+                {
+                    "symbol": "TEST260521P00095000",
+                    "expiration_date": "2026-05-21",
+                    "strike_price": "95",
+                    "type": "put",
+                    "tradable": True,
+                },
+                {
+                    "symbol": "TEST260522P00090000",
+                    "expiration_date": "2026-05-22",
+                    "strike_price": "90",
+                    "type": "put",
+                    "tradable": True,
+                },
+                {
+                    "symbol": "TEST260529P00085000",
+                    "expiration_date": "2026-05-29",
+                    "strike_price": "85",
+                    "type": "put",
+                    "tradable": True,
+                },
+                {
+                    "symbol": "TEST260619P00080000",
+                    "expiration_date": "2026-06-19",
+                    "strike_price": "80",
+                    "type": "put",
+                    "tradable": True,
+                },
+            ]
         start = kwargs["expiration_date_gte"]
         end = kwargs["expiration_date_lte"]
         return [
@@ -281,7 +323,7 @@ class _FakeAlpacaMarketDataClient:
                     "p": 1.1,
                 },
                 "impliedVolatility": self.iv,
-                "greeks": {"delta": -0.2},
+                "greeks": {"delta": 0.2 if "C" in symbol[-15:] else -0.2},
                 "dailyBar": {"v": 0},
                 "openInterest": 0,
             }

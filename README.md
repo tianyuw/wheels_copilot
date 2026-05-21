@@ -17,13 +17,15 @@ Current implementation scope:
   IDs.
 - SQLite-backed OMS ledger and Alpaca paper reconciliation for submitted CSP
   orders.
+- Broker-sourced wheel lifecycle snapshot for `CSP_OPEN`, `ASSIGNED`, and
+  `CC_OPEN` states, plus dry-run covered-call proposals for assigned shares.
 - Unit tests for support scoring, delta policy, fundamentals, and earnings.
 
 Normal scans do not submit orders. `shadow_orders.json` and
 `validated_shadow_orders.json` remain auditable dry-run artifacts unless the CLI
 is run with `--execute-paper` or `scripts/execute_validated_orders.py` is called
-explicitly. Live trading is not implemented. Covered-call selection and
-assignment lifecycle are not implemented yet.
+explicitly. Live trading is not implemented. Covered-call planning is dry-run
+only; covered-call execution is not implemented yet.
 
 All stock and option price data is fetched from Alpaca. The scan fails closed
 unless the stock feed is `sip` and the option feed is `opra`; it does not
@@ -47,6 +49,7 @@ python3 scripts/scan_watchlist.py --tickers AAPL,UPS --output /tmp/wheels-scan -
 python3 scripts/scan_watchlist.py --with-alpaca
 python3 scripts/scan_watchlist.py --with-alpaca --execute-paper
 python3 scripts/reconcile_orders.py
+python3 scripts/plan_covered_calls.py
 ```
 
 `--date` controls the report date and option DTE calculation. It does not
@@ -119,6 +122,35 @@ ambiguous submit failures by looking up Alpaca orders with the original
 position with assignment cash recorded. This reconciliation layer tracks orders
 submitted through Wheels Copilot; externally created broker positions are a
 separate follow-up sync task.
+
+## Covered Call Planning
+
+After reconciliation, build a broker-sourced wheel lifecycle snapshot and
+covered-call dry-run proposals:
+
+```bash
+python3 scripts/plan_covered_calls.py --output workspace/covered_calls/YYYY-MM-DD --overwrite
+```
+
+The lifecycle snapshot treats Alpaca as the source of truth. A ticker with
+long stock and no open short call is marked `ASSIGNED` and becomes eligible for
+covered-call evaluation. A ticker with long stock plus an open short call/order
+is marked `CC_OPEN`; a ticker with short-put exposure and no stock is marked
+`CSP_OPEN`.
+
+The covered-call planner does not submit orders. It only writes:
+
+```text
+workspace/covered_calls/YYYY-MM-DD/
+  wheel_lifecycle.json
+  covered_call_proposals.json
+  covered_call_shadow_orders.json
+  covered_call_report.md
+```
+
+The planner blocks any call whose strike is below adjusted cost basis, whose
+bid/spread/open interest fails `cc_selector`, or whose call delta is outside the
+configured range. If no safe call exists, the position remains `WATCH`.
 
 The first paper executor supports one-contract CSP orders only. Multi-contract
 and partial-fill position accounting will be added after the single-contract
