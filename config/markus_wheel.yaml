@@ -8,6 +8,12 @@ account:
   currency: USD
   live_trading_enabled: false
 
+alpaca:
+  paper_base_url: https://paper-api.alpaca.markets
+  api_key_env: ALPACA_API_KEY
+  secret_key_env: ALPACA_SECRET_KEY
+  request_timeout_seconds: 20
+
 watchlist:
   tickers:
     - BBY

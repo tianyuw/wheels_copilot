@@ -11,7 +11,8 @@ from typing import Any
 from .csp_selector import evaluate_csp_candidates
 from .gates import evaluate_earnings_gate, evaluate_fundamentals
 from .market_data import fetch_daily_bars, fetch_fundamental_snapshot, fetch_put_chain
-from .models import GateResult
+from .models import GateResult, PortfolioSnapshot
+from .portfolio_risk import evaluate_portfolio_risk, summarize_portfolio_snapshot
 from .support import analyze_support
 
 
@@ -28,6 +29,9 @@ def scan_watchlist(
     tickers: list[str] | None = None,
     period: str = "1y",
     as_of: date | None = None,
+    portfolio_snapshot: PortfolioSnapshot | None = None,
+    portfolio_required: bool = False,
+    portfolio_error: str | None = None,
 ) -> dict[str, Any]:
     as_of = as_of or date.today()
     tickers = tickers or list(config.get("watchlist", {}).get("tickers", []))
@@ -36,7 +40,17 @@ def scan_watchlist(
     results = []
     for ticker in normalized:
         try:
-            results.append(scan_ticker(ticker, config, period=period, as_of=as_of))
+            results.append(
+                scan_ticker(
+                    ticker,
+                    config,
+                    period=period,
+                    as_of=as_of,
+                    portfolio_snapshot=portfolio_snapshot,
+                    portfolio_required=portfolio_required,
+                    portfolio_error=portfolio_error,
+                )
+            )
         except Exception as exc:
             results.append(_error_payload(ticker, repr(exc)))
     results.sort(
@@ -53,6 +67,7 @@ def scan_watchlist(
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "period": period,
         "ticker_count": len(normalized),
+        "portfolio": summarize_portfolio_snapshot(portfolio_snapshot, portfolio_error),
         "summary": dict(sorted(counts.items())),
         "results": results,
     }
@@ -63,6 +78,9 @@ def scan_ticker(
     config: dict[str, Any],
     period: str = "1y",
     as_of: date | None = None,
+    portfolio_snapshot: PortfolioSnapshot | None = None,
+    portfolio_required: bool = False,
+    portfolio_error: str | None = None,
 ) -> dict[str, Any]:
     as_of = as_of or date.today()
     ticker = ticker.strip().upper()
@@ -79,6 +97,8 @@ def scan_ticker(
                 fundamental_snapshot=fundamental_snapshot,
                 fundamental_gate=fundamental_gate,
                 earnings_gate=None,
+                portfolio_gate=None,
+                portfolio_risk=None,
                 status_reason="fundamental gate rejected",
             )
 
@@ -102,11 +122,21 @@ def scan_ticker(
                 fundamental_gate=fundamental_gate,
                 earnings_gate=earnings_gate,
                 earnings_filtered_option_count=0,
+                portfolio_gate=None,
+                portfolio_risk=None,
             )
             payload["status"] = "REJECT"
             payload["status_reason"] = "earnings gate rejected"
             return payload
         selection = evaluate_csp_candidates(earnings_allowed_options, support, config)
+        portfolio_gate, portfolio_risk = evaluate_portfolio_risk(
+            ticker,
+            selection.candidate,
+            portfolio_snapshot,
+            config,
+            required=portfolio_required,
+            portfolio_error=portfolio_error,
+        )
         payload = _payload(
             ticker,
             support,
@@ -116,6 +146,8 @@ def scan_ticker(
             fundamental_gate=fundamental_gate,
             earnings_gate=earnings_gate,
             earnings_filtered_option_count=len(earnings_allowed_options),
+            portfolio_gate=portfolio_gate,
+            portfolio_risk=portfolio_risk,
         )
         payload["status"] = classify_scan_result(payload)
         payload["status_reason"] = _status_reason(payload)
@@ -170,10 +202,27 @@ def render_markdown_report(scan: dict[str, Any]) -> str:
         f"- Period: `{scan['period']}`",
         f"- Tickers: `{scan['ticker_count']}`",
         f"- Summary: `{scan['summary']}`",
-        "",
-        "| Status | Ticker | Price | Fundamental | Earnings | Support Score | CSP Candidate | Rejection Summary |",
-        "|---|---:|---:|---|---|---:|---|---|",
     ]
+    portfolio = scan.get("portfolio")
+    if portfolio:
+        if portfolio.get("error"):
+            lines.append(f"- Portfolio: `ERROR {portfolio['error']}`")
+        else:
+            lines.append(
+                "- Portfolio: "
+                f"`cash={_fmt(portfolio.get('cash'), 0)}, "
+                f"equity={_fmt(portfolio.get('equity'), 0)}, "
+                f"reserved_assignment_cash={_fmt(portfolio.get('reserved_assignment_cash'), 0)}, "
+                f"positions={portfolio.get('position_count')}, "
+                f"open_orders={portfolio.get('open_order_count')}`"
+            )
+    lines.extend(
+        [
+            "",
+            "| Status | Ticker | Price | Fundamental | Earnings | Portfolio | Support Score | CSP Candidate | Rejection Summary |",
+            "|---|---:|---:|---|---|---|---:|---|---|",
+        ]
+    )
     for row in scan["results"]:
         lines.append(_markdown_table_row(row))
 
@@ -192,6 +241,8 @@ def _payload(
     fundamental_gate: GateResult | None = None,
     earnings_gate: GateResult | None = None,
     earnings_filtered_option_count: int | None = None,
+    portfolio_gate: GateResult | None = None,
+    portfolio_risk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     selected = support.selected_zone
     candidate = selection.candidate
@@ -222,7 +273,13 @@ def _payload(
         "fundamental_snapshot": asdict(fundamental_snapshot) if fundamental_snapshot else None,
         "fundamental_gate": asdict(fundamental_gate) if fundamental_gate else None,
         "earnings_gate": asdict(earnings_gate) if earnings_gate else None,
-        "manual_review_required": _manual_review_required(fundamental_gate, earnings_gate),
+        "portfolio_gate": asdict(portfolio_gate) if portfolio_gate else None,
+        "portfolio_risk": portfolio_risk,
+        "manual_review_required": _manual_review_required(
+            fundamental_gate,
+            earnings_gate,
+            portfolio_gate,
+        ),
         "reasons": support.reasons,
         "error": None,
     }
@@ -249,6 +306,8 @@ def _error_payload(ticker: str, error: str) -> dict[str, Any]:
         "fundamental_snapshot": None,
         "fundamental_gate": None,
         "earnings_gate": None,
+        "portfolio_gate": None,
+        "portfolio_risk": None,
         "manual_review_required": False,
         "reasons": [],
         "error": error,
@@ -288,6 +347,7 @@ def _markdown_table_row(row: dict[str, Any]) -> str:
         f"| {_md_cell(row['status'])} | {_md_cell(row['ticker'])} | {_fmt(row.get('current_price'))} | "
         f"{_md_cell(_gate_status(row.get('fundamental_gate')))} | "
         f"{_md_cell(_gate_status(row.get('earnings_gate')))} | "
+        f"{_md_cell(_gate_status(row.get('portfolio_gate')))} | "
         f"{_fmt(row.get('support_score'), 1)} | "
         f"{candidate_text} | {_md_cell(_top_rejections(row.get('rejection_summary') or {}))} |"
     )
@@ -309,6 +369,17 @@ def _detail_section(row: dict[str, Any]) -> list[str]:
         )
     if row.get("earnings_gate"):
         lines.append(f"- Earnings gate: `{_gate_status(row['earnings_gate'])}`")
+    if row.get("portfolio_gate"):
+        lines.append(f"- Portfolio gate: `{_gate_status(row['portfolio_gate'])}`")
+    if row.get("portfolio_risk"):
+        risk = row["portfolio_risk"]
+        lines.append(
+            "- Portfolio risk: "
+            f"`assignment_cash={_fmt(risk.get('assignment_cash_required'), 0)}, "
+            f"projected_reserved={_fmt(risk.get('projected_reserved_assignment_cash'), 0)}, "
+            f"cash_after_reserve={_fmt(risk.get('projected_cash_after_reserve'), 0)}, "
+            f"active_tickers={risk.get('projected_active_ticker_count')}`"
+        )
     if row.get("manual_review_required"):
         lines.append("- Manual review required: `True`")
     snapshot = row.get("fundamental_snapshot")
@@ -360,8 +431,12 @@ def _write_csv(scan: dict[str, Any], path: Path) -> None:
         "support_top",
         "fundamental_status",
         "earnings_status",
+        "portfolio_status",
         "manual_review_required",
         "next_earnings_date",
+        "assignment_cash_required",
+        "projected_reserved_assignment_cash",
+        "projected_cash_after_reserve",
         "candidate_expiration",
         "candidate_strike",
         "candidate_delta",
@@ -375,6 +450,7 @@ def _write_csv(scan: dict[str, Any], path: Path) -> None:
         for row in scan["results"]:
             support = row.get("selected_support") or {}
             snapshot = row.get("fundamental_snapshot") or {}
+            risk = row.get("portfolio_risk") or {}
             candidate = row.get("candidate") or {}
             option = candidate.get("option") or {}
             writer.writerow(
@@ -388,8 +464,14 @@ def _write_csv(scan: dict[str, Any], path: Path) -> None:
                     "support_top": support.get("top"),
                     "fundamental_status": (row.get("fundamental_gate") or {}).get("status"),
                     "earnings_status": (row.get("earnings_gate") or {}).get("status"),
+                    "portfolio_status": (row.get("portfolio_gate") or {}).get("status"),
                     "manual_review_required": row.get("manual_review_required"),
                     "next_earnings_date": snapshot.get("next_earnings_date"),
+                    "assignment_cash_required": risk.get("assignment_cash_required"),
+                    "projected_reserved_assignment_cash": risk.get(
+                        "projected_reserved_assignment_cash"
+                    ),
+                    "projected_cash_after_reserve": risk.get("projected_cash_after_reserve"),
                     "candidate_expiration": option.get("expiration"),
                     "candidate_strike": option.get("strike"),
                     "candidate_delta": candidate.get("delta"),
@@ -428,6 +510,8 @@ def _gate_reject_payload(
     fundamental_snapshot,
     fundamental_gate: GateResult,
     earnings_gate: GateResult | None,
+    portfolio_gate: GateResult | None,
+    portfolio_risk: dict[str, Any] | None,
     status_reason: str,
 ) -> dict[str, Any]:
     return {
@@ -450,7 +534,13 @@ def _gate_reject_payload(
         "fundamental_snapshot": asdict(fundamental_snapshot),
         "fundamental_gate": asdict(fundamental_gate),
         "earnings_gate": asdict(earnings_gate) if earnings_gate else None,
-        "manual_review_required": fundamental_gate.manual_review_required,
+        "portfolio_gate": asdict(portfolio_gate) if portfolio_gate else None,
+        "portfolio_risk": portfolio_risk,
+        "manual_review_required": _manual_review_required(
+            fundamental_gate,
+            earnings_gate,
+            portfolio_gate,
+        ),
         "reasons": fundamental_gate.reasons,
         "error": None,
     }
@@ -459,10 +549,11 @@ def _gate_reject_payload(
 def _manual_review_required(
     fundamental_gate: GateResult | None,
     earnings_gate: GateResult | None,
+    portfolio_gate: GateResult | None = None,
 ) -> bool:
     return any(
         gate.manual_review_required
-        for gate in (fundamental_gate, earnings_gate)
+        for gate in (fundamental_gate, earnings_gate, portfolio_gate)
         if gate is not None
     )
 
@@ -482,12 +573,12 @@ def _gate_status(gate: dict[str, Any] | None) -> str:
 def _gate_rejected(payload: dict[str, Any]) -> bool:
     return any(
         (payload.get(name) or {}).get("status") == "REJECT"
-        for name in ("fundamental_gate", "earnings_gate")
+        for name in ("fundamental_gate", "earnings_gate", "portfolio_gate")
     )
 
 
 def _gate_reason(payload: dict[str, Any]) -> str:
-    for name in ("fundamental_gate", "earnings_gate"):
+    for name in ("fundamental_gate", "earnings_gate", "portfolio_gate"):
         gate = payload.get(name) or {}
         if gate.get("status") == "REJECT":
             reasons = gate.get("reasons") or []

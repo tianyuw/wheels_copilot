@@ -147,6 +147,97 @@ class GateResult:
         return self.status == "WARN" or bool(self.warnings)
 
 
+@dataclass(frozen=True)
+class BrokerAccountSnapshot:
+    status: str | None = None
+    equity: float | None = None
+    cash: float | None = None
+    buying_power: float | None = None
+    options_trading_level: int | None = None
+    trading_blocked: bool = False
+    account_blocked: bool = False
+
+
+@dataclass(frozen=True)
+class BrokerPosition:
+    symbol: str
+    qty: float
+    asset_class: str | None = None
+    side: str | None = None
+    market_value: float | None = None
+    cost_basis: float | None = None
+    underlying_symbol: str | None = None
+    option_type: str | None = None
+    expiration: date | None = None
+    strike: float | None = None
+
+    @property
+    def active_underlying(self) -> str:
+        return (self.underlying_symbol or self.symbol).upper()
+
+    @property
+    def is_option(self) -> bool:
+        return self.underlying_symbol is not None
+
+    @property
+    def is_short_put(self) -> bool:
+        return self.option_type == "put" and self.qty < 0
+
+    @property
+    def assignment_cash_required(self) -> float:
+        if not self.is_short_put or self.strike is None:
+            return 0.0
+        return abs(self.qty) * self.strike * 100.0
+
+
+@dataclass(frozen=True)
+class BrokerOrder:
+    id: str
+    symbol: str
+    side: str | None
+    qty: float
+    status: str | None = None
+    asset_class: str | None = None
+    order_class: str | None = None
+    position_intent: str | None = None
+    limit_price: float | None = None
+    submitted_at: str | None = None
+    parent_order_id: str | None = None
+    underlying_symbol: str | None = None
+    option_type: str | None = None
+    expiration: date | None = None
+    strike: float | None = None
+
+    @property
+    def active_underlying(self) -> str:
+        return (self.underlying_symbol or self.symbol).upper()
+
+    @property
+    def is_sell_put(self) -> bool:
+        intent = (self.position_intent or "").lower()
+        return (
+            self.option_type == "put"
+            and (self.side or "").lower() == "sell"
+            and self.parent_order_id is None
+            and intent not in {"sell_to_close", "stc", "close"}
+        )
+
+    @property
+    def assignment_cash_required(self) -> float:
+        if not self.is_sell_put or self.strike is None:
+            return 0.0
+        return self.qty * self.strike * 100.0
+
+
+@dataclass(frozen=True)
+class PortfolioSnapshot:
+    account: BrokerAccountSnapshot
+    positions: list[BrokerPosition] = field(default_factory=list)
+    open_orders: list[BrokerOrder] = field(default_factory=list)
+    source: str = "unknown"
+    fetched_at: str | None = None
+
+
 @dataclass
 class CspCandidate:
     option: OptionQuote

@@ -31,11 +31,17 @@ python3 scripts/dry_run.py --ticker AAPL --json
 ```bash
 python3 scripts/scan_watchlist.py
 python3 scripts/scan_watchlist.py --tickers AAPL,UPS --output /tmp/wheels-scan --overwrite
+python3 scripts/scan_watchlist.py --with-alpaca
 ```
 
 `--date` controls the report date and option DTE calculation. It does not
 perform a historical market-data replay; the current Yahoo Finance bars and
 option chains are still fetched.
+
+`--with-alpaca` performs read-only calls against the Alpaca paper Trading API
+for account, positions, and open orders, then applies portfolio risk gates. It
+requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in the environment or local
+`.env`. It does not submit or cancel orders.
 
 Default output:
 

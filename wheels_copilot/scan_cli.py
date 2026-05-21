@@ -5,6 +5,7 @@ import json
 from datetime import date
 from pathlib import Path
 
+from .alpaca import fetch_alpaca_portfolio_snapshot
 from .config import load_config
 from .scan import resolve_output_dir, scan_watchlist, write_scan_outputs
 
@@ -36,6 +37,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Write directly into output directory even if files already exist.",
     )
     parser.add_argument("--json-stdout", action="store_true")
+    parser.add_argument(
+        "--with-alpaca",
+        action="store_true",
+        help=(
+            "Fetch Alpaca paper account/positions/open orders read-only and "
+            "apply portfolio risk gates."
+        ),
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -43,12 +52,22 @@ def main(argv: list[str] | None = None) -> int:
     tickers = _parse_tickers(args.tickers)
     base_output = args.output or Path("workspace/scans") / scan_date.isoformat()
     output_dir = resolve_output_dir(base_output, overwrite=args.overwrite)
+    portfolio_snapshot = None
+    portfolio_error = None
+    if args.with_alpaca:
+        try:
+            portfolio_snapshot = fetch_alpaca_portfolio_snapshot(cfg)
+        except Exception as exc:
+            portfolio_error = f"{type(exc).__name__}: {exc}"
 
     scan = scan_watchlist(
         config=cfg,
         tickers=tickers,
         period=args.period,
         as_of=scan_date,
+        portfolio_snapshot=portfolio_snapshot,
+        portfolio_required=args.with_alpaca,
+        portfolio_error=portfolio_error,
     )
     paths = write_scan_outputs(scan, output_dir)
 

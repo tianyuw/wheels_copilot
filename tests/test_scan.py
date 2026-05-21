@@ -9,8 +9,11 @@ from unittest.mock import patch
 
 from wheels_copilot.config import load_config
 from wheels_copilot.models import (
+    BrokerAccountSnapshot,
+    BrokerPosition,
     FundamentalSnapshot,
     OptionQuote,
+    PortfolioSnapshot,
     PriceBar,
     SupportAnalysis,
     SupportZone,
@@ -182,6 +185,66 @@ class ScanWorkflowTests(unittest.TestCase):
         self.assertEqual(row["fundamental_gate"]["status"], "PASS")
         self.assertEqual(row["earnings_gate"]["status"], "PASS")
 
+    def test_scan_ticker_rejects_when_portfolio_gate_rejects(self):
+        from wheels_copilot.scan import scan_ticker
+
+        config = load_config("config/markus_wheel.yaml")
+        portfolio = _portfolio(
+            positions=[BrokerPosition(symbol="GOOD", qty=100, asset_class="us_equity")]
+        )
+
+        with (
+            patch("wheels_copilot.scan.fetch_daily_bars", return_value=[_price_bar(100)]),
+            patch(
+                "wheels_copilot.scan.fetch_fundamental_snapshot",
+                return_value=_snapshot(next_earnings_date=date(2026, 8, 1)),
+            ),
+            patch("wheels_copilot.scan.analyze_support", return_value=_tradable_support()),
+            patch("wheels_copilot.scan.fetch_put_chain", return_value=[_option(date(2026, 5, 22))]),
+        ):
+            row = scan_ticker(
+                "GOOD",
+                config,
+                as_of=date(2026, 5, 20),
+                portfolio_snapshot=portfolio,
+                portfolio_required=True,
+            )
+
+        self.assertEqual(row["status"], "REJECT")
+        self.assertEqual(row["portfolio_gate"]["status"], "REJECT")
+        self.assertIn(
+            "covered_call_workflow_required_existing_100_shares",
+            row["portfolio_gate"]["reasons"],
+        )
+
+    def test_scan_watchlist_with_missing_required_portfolio_demotes_candidate_to_watch(self):
+        good = _sample_scan()
+        candidate_row = good["results"][0]
+
+        def fake_scan_ticker(ticker, *_args, **kwargs):
+            row = dict(candidate_row)
+            row["ticker"] = ticker
+            if kwargs.get("portfolio_required"):
+                row["portfolio_gate"] = {
+                    "status": "WARN",
+                    "reasons": ["portfolio_review_required"],
+                    "warnings": ["AlpacaRequestError: down"],
+                }
+                row["manual_review_required"] = True
+                row["status"] = classify_scan_result(row)
+            return row
+
+        with patch("wheels_copilot.scan.scan_ticker", side_effect=fake_scan_ticker):
+            scan = scan_watchlist(
+                {},
+                tickers=["GOOD"],
+                portfolio_required=True,
+                portfolio_error="AlpacaRequestError: down",
+            )
+
+        self.assertEqual(scan["portfolio"]["error"], "AlpacaRequestError: down")
+        self.assertEqual(scan["results"][0]["status"], "WATCH")
+
     def test_scan_ticker_rejects_when_all_options_hit_earnings_window(self):
         from wheels_copilot.scan import scan_ticker
 
@@ -249,6 +312,8 @@ def _sample_scan(
                 },
                 "fundamental_gate": {"status": "PASS", "reasons": ["ok"], "warnings": []},
                 "earnings_gate": {"status": "PASS", "reasons": ["ok"], "warnings": []},
+                "portfolio_gate": None,
+                "portfolio_risk": None,
                 "manual_review_required": False,
                 "candidate": candidate,
                 "option_count": 3,
@@ -326,6 +391,22 @@ def _tradable_support() -> SupportAnalysis:
         current_price=100,
         min_score_to_trade=70,
         reasons=[],
+    )
+
+
+def _portfolio(
+    positions: list[BrokerPosition] | None = None,
+) -> PortfolioSnapshot:
+    return PortfolioSnapshot(
+        account=BrokerAccountSnapshot(
+            status="ACTIVE",
+            equity=500000,
+            cash=500000,
+            buying_power=500000,
+        ),
+        positions=positions or [],
+        open_orders=[],
+        source="test",
     )
 
 
