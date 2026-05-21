@@ -80,12 +80,24 @@ def execute_validated_shadow_orders(
             except (AlpacaConfigError, AlpacaRequestError) as exc:
                 client_error = f"{type(exc).__name__}: {exc}"
 
+        account_identity_blocking_reasons: list[str] = []
+        if client is not None and not config_reasons:
+            try:
+                account = client.fetch_account_snapshot()
+                account_identity_blocking_reasons = [
+                    f"account_identity:{reason}"
+                    for reason in account_identity_reasons(config, account)
+                ]
+            except (AlpacaConfigError, AlpacaRequestError) as exc:
+                client_error = f"{type(exc).__name__}: {exc}"
+                account_identity_blocking_reasons.append("account_identity_unavailable")
+
         clock = None
         clock_reasons: list[str] = []
         if client is None:
             if client_error:
                 clock_reasons.append("alpaca_trading_client_unavailable")
-        elif not config_reasons:
+        elif not config_reasons and not account_identity_blocking_reasons:
             try:
                 clock = client.fetch_clock()
                 clock_reasons = _clock_blocking_reasons(clock, config)
@@ -97,7 +109,12 @@ def execute_validated_shadow_orders(
         in_run_open_orders: list[BrokerOrder] = []
         results = []
         for order in orders:
-            global_reasons = list(config_reasons) + list(artifact_reasons) + list(clock_reasons)
+            global_reasons = (
+                list(config_reasons)
+                + list(artifact_reasons)
+                + list(account_identity_blocking_reasons)
+                + list(clock_reasons)
+            )
             if submitted_count >= max_orders:
                 global_reasons.append("max_orders_per_run_reached")
             result = _execute_one_order(
@@ -137,6 +154,7 @@ def execute_validated_shadow_orders(
                     or DEFAULT_NO_OPEN_MINUTES_BEFORE_CLOSE
                 ),
                 "paper_only_guard": True,
+                "account_identity_gate": True,
                 "portfolio_risk_gate": True,
                 "market_clock_gate": True,
                 "oms_enabled": ledger is not None,
@@ -186,13 +204,6 @@ def _execute_one_order(
             portfolio_snapshot = _with_in_run_open_orders(
                 portfolio_snapshot,
                 in_run_open_orders,
-            )
-            identity_reasons = account_identity_reasons(
-                config,
-                portfolio_snapshot.account,
-            )
-            blocking_reasons.extend(
-                f"account_identity:{reason}" for reason in identity_reasons
             )
             portfolio_gate, portfolio_risk = _portfolio_gate_for_order(
                 order, payload, portfolio_snapshot, config

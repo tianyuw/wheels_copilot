@@ -228,8 +228,63 @@ class AlpacaAdapterTests(unittest.TestCase):
         self.assertIn("account_id_mismatch:actual=acct-1", reasons)
         self.assertIn("account_number_mismatch:actual=PA123", reasons)
 
+    def test_account_identity_reasons_fail_closed_without_guard_config(self):
+        account = AlpacaTradingClient(
+            "key",
+            "secret",
+            opener=lambda req, timeout: _Response(
+                {
+                    "id": "acct-1",
+                    "account_number": "PA123",
+                    "status": "ACTIVE",
+                    "equity": "500000",
+                    "cash": "500000",
+                }
+            ),
+        ).fetch_account_snapshot()
+
+        self.assertEqual(
+            account_identity_reasons({"alpaca": {}}, account),
+            ["missing_account_identity_guard_config"],
+        )
+        self.assertIn(
+            "missing_expected_account_id_env:EXPECTED_ACCOUNT_ID",
+            account_identity_reasons(
+                {"alpaca": {"expected_account_id_env": "EXPECTED_ACCOUNT_ID"}},
+                account,
+                env={"EXPECTED_ACCOUNT_ID": ""},
+            ),
+        )
+
+    def test_account_identity_explicit_env_overrides_dotenv(self):
+        account = AlpacaTradingClient(
+            "key",
+            "secret",
+            opener=lambda req, timeout: _Response(
+                {
+                    "id": "acct-explicit",
+                    "account_number": "PA123",
+                    "status": "ACTIVE",
+                    "equity": "500000",
+                    "cash": "500000",
+                }
+            ),
+        ).fetch_account_snapshot()
+
+        self.assertEqual(
+            account_identity_reasons(
+                {"alpaca": {"expected_account_id_env": "ALPACA_EXPECTED_ACCOUNT_ID"}},
+                account,
+                env={"ALPACA_EXPECTED_ACCOUNT_ID": "acct-explicit"},
+            ),
+            [],
+        )
+
     def test_fetch_portfolio_snapshot_fails_on_account_identity_mismatch(self):
+        calls = []
+
         def fake_open(req, timeout):
+            calls.append(req.full_url)
             if req.full_url.endswith("/v2/account"):
                 return _Response(
                     {
@@ -239,7 +294,7 @@ class AlpacaAdapterTests(unittest.TestCase):
                         "equity": "500000",
                         "cash": "500000",
                     }
-                )
+                    )
             if req.full_url.endswith("/v2/positions"):
                 return _Response([])
             if "/v2/orders?" in req.full_url:
@@ -264,6 +319,7 @@ class AlpacaAdapterTests(unittest.TestCase):
                 },
                 client=client,
             )
+        self.assertEqual(len(calls), 1)
 
     def test_nested_orders_include_parent_and_children(self):
         def fake_open(req, timeout):

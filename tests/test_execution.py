@@ -128,6 +128,30 @@ class ExecutionTests(unittest.TestCase):
             "account_identity:account_id_mismatch:actual=other-account",
             result["orders"][0]["blocking_reasons"],
         )
+        self.assertEqual(client.fetch_account_snapshot_count, 1)
+        self.assertEqual(client.fetch_clock_count, 0)
+        self.assertEqual(client.fetch_portfolio_snapshot_count, 0)
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_missing_account_identity_guard_config_blocks_submission(self):
+        cfg = _config()
+        cfg["alpaca"].pop("expected_account_id")
+        client = _FakeExecutionClient()
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_order()]),
+            cfg,
+            client=client,
+        )
+
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn(
+            "account_identity:missing_account_identity_guard_config",
+            result["orders"][0]["blocking_reasons"],
+        )
+        self.assertEqual(client.fetch_account_snapshot_count, 1)
+        self.assertEqual(client.fetch_clock_count, 0)
+        self.assertEqual(client.fetch_portfolio_snapshot_count, 0)
         self.assertEqual(client.submitted_payloads, [])
 
     def test_previous_execution_result_blocks_duplicate_client_order_id(self):
@@ -294,7 +318,10 @@ def _config() -> dict:
         "mode": "paper",
         "broker": "alpaca",
         "account": {"account_type": "paper", "live_trading_enabled": False},
-        "alpaca": {"paper_base_url": "https://paper-api.alpaca.markets"},
+        "alpaca": {
+            "paper_base_url": "https://paper-api.alpaca.markets",
+            "expected_account_id": "acct-test",
+        },
         "execution": {"max_orders_per_run": 3, "no_open_minutes_before_close": 30},
         "risk": {
             "max_assignment_cash_pct": 0.80,
@@ -361,6 +388,7 @@ def _portfolio(
             equity=500000,
             cash=500000,
             buying_power=500000,
+            account_id="acct-test",
         ),
         positions=positions or [],
         open_orders=open_orders or [],
@@ -387,11 +415,20 @@ class _FakeExecutionClient:
         self.submit_error = submit_error
         self.submit_status = submit_status
         self.submitted_payloads = []
+        self.fetch_account_snapshot_count = 0
+        self.fetch_clock_count = 0
+        self.fetch_portfolio_snapshot_count = 0
 
     def fetch_clock(self):
+        self.fetch_clock_count += 1
         return self.clock
 
+    def fetch_account_snapshot(self):
+        self.fetch_account_snapshot_count += 1
+        return self.portfolio.account
+
     def fetch_portfolio_snapshot(self):
+        self.fetch_portfolio_snapshot_count += 1
         return self.portfolio
 
     def submit_order(self, payload):

@@ -36,11 +36,11 @@ def fetch_alpaca_portfolio_snapshot(
     client: AlpacaTradingClient | None = None,
 ) -> PortfolioSnapshot:
     client = client or AlpacaTradingClient.from_config(config, env=env)
-    snapshot = client.fetch_portfolio_snapshot()
-    reasons = account_identity_reasons(config, snapshot.account, env=env)
+    account = client.fetch_account_snapshot()
+    reasons = account_identity_reasons(config, account, env=env)
     if reasons:
         raise AlpacaConfigError("Alpaca account identity mismatch: " + "; ".join(reasons))
-    return snapshot
+    return client.fetch_portfolio_snapshot(account=account)
 
 
 class AlpacaTradingClient:
@@ -81,8 +81,11 @@ class AlpacaTradingClient:
             timeout=timeout,
         )
 
-    def fetch_portfolio_snapshot(self) -> PortfolioSnapshot:
-        account = self.fetch_account_snapshot()
+    def fetch_portfolio_snapshot(
+        self,
+        account: BrokerAccountSnapshot | None = None,
+    ) -> PortfolioSnapshot:
+        account = account or self.fetch_account_snapshot()
         positions = [
             _position_from_payload(item)
             for item in self._get_json("/v2/positions")
@@ -449,6 +452,17 @@ def account_identity_reasons(
     cfg = config.get("alpaca", {})
     env_values = _merged_env(env)
     reasons = []
+    has_expected_id_config = bool(
+        _str_or_none(cfg.get("expected_account_id"))
+        or _str_or_none(cfg.get("expected_account_id_env"))
+    )
+    has_expected_number_config = bool(
+        _str_or_none(cfg.get("expected_account_number"))
+        or _str_or_none(cfg.get("expected_account_number_env"))
+    )
+    if not has_expected_id_config and not has_expected_number_config:
+        reasons.append("missing_account_identity_guard_config")
+
     expected_id = _expected_identity_value(
         cfg,
         env_values,
@@ -467,11 +481,11 @@ def account_identity_reasons(
         reasons.append(
             f"missing_expected_account_number_env:{cfg['expected_account_number_env']}"
         )
-    if expected_id and account.account_id != expected_id:
+    if expected_id is not None and account.account_id != expected_id:
         reasons.append(
             f"account_id_mismatch:actual={account.account_id or 'missing'}"
         )
-    if expected_number and account.account_number != expected_number:
+    if expected_number is not None and account.account_number != expected_number:
         reasons.append(
             f"account_number_mismatch:actual={account.account_number or 'missing'}"
         )

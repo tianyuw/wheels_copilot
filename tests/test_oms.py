@@ -190,7 +190,10 @@ def _config(db_path: Path) -> dict:
         "mode": "paper",
         "broker": "alpaca",
         "account": {"account_type": "paper", "live_trading_enabled": False},
-        "alpaca": {"paper_base_url": "https://paper-api.alpaca.markets"},
+        "alpaca": {
+            "paper_base_url": "https://paper-api.alpaca.markets",
+            "expected_account_id": "acct-test",
+        },
         "execution": {
             "max_orders_per_run": 3,
             "max_validated_order_age_seconds": 120,
@@ -250,7 +253,7 @@ class _FakeOmsClient:
         self,
         fetch_order_status: str = "filled",
         *,
-        account_id: str | None = None,
+        account_id: str | None = "acct-test",
         account_number: str | None = None,
     ):
         self.fetch_order_status = fetch_order_status
