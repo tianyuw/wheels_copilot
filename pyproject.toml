@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 wheel-dry-run = "wheels_copilot.cli:main"
+wheel-scan-watchlist = "wheels_copilot.scan_cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

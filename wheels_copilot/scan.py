@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+import csv
+import json
+from collections import Counter
+from dataclasses import asdict
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+from .csp_selector import evaluate_csp_candidates
+from .market_data import fetch_daily_bars, fetch_put_chain
+from .support import analyze_support
+
+
+STATUS_ORDER = {
+    "AUTO_TRADE": 0,
+    "WATCH": 1,
+    "REJECT": 2,
+    "ERROR": 3,
+}
+
+
+def scan_watchlist(
+    config: dict[str, Any],
+    tickers: list[str] | None = None,
+    period: str = "1y",
+    as_of: date | None = None,
+) -> dict[str, Any]:
+    as_of = as_of or date.today()
+    tickers = tickers or list(config.get("watchlist", {}).get("tickers", []))
+    normalized = [t.strip().upper() for t in tickers if t and t.strip()]
+
+    results = []
+    for ticker in normalized:
+        try:
+            results.append(scan_ticker(ticker, config, period=period, as_of=as_of))
+        except Exception as exc:
+            results.append(_error_payload(ticker, repr(exc)))
+    results.sort(
+        key=lambda row: (
+            STATUS_ORDER.get(row["status"], 99),
+            -float(row.get("support_score") or 0),
+            row["ticker"],
+        )
+    )
+
+    counts = Counter(row["status"] for row in results)
+    return {
+        "scan_date": as_of.isoformat(),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "period": period,
+        "ticker_count": len(normalized),
+        "summary": dict(sorted(counts.items())),
+        "results": results,
+    }
+
+
+def scan_ticker(
+    ticker: str,
+    config: dict[str, Any],
+    period: str = "1y",
+    as_of: date | None = None,
+) -> dict[str, Any]:
+    as_of = as_of or date.today()
+    ticker = ticker.strip().upper()
+    try:
+        bars = fetch_daily_bars(ticker, period=period)
+        if not bars:
+            return _error_payload(ticker, "no_daily_bars")
+
+        support = analyze_support(bars, config)
+        options = fetch_put_chain(
+            ticker,
+            int(config["csp_selector"]["dte_min"]),
+            int(config["csp_selector"]["dte_max"]),
+            as_of=as_of,
+        )
+        selection = evaluate_csp_candidates(options, support, config)
+        payload = _payload(ticker, support, selection, len(options))
+        payload["status"] = classify_scan_result(payload)
+        payload["status_reason"] = _status_reason(payload)
+        return payload
+    except Exception as exc:
+        return _error_payload(ticker, repr(exc))
+
+
+def classify_scan_result(payload: dict[str, Any]) -> str:
+    if payload.get("error"):
+        return "ERROR"
+    candidate = payload.get("candidate")
+    if candidate and candidate.get("auto_trade"):
+        return "AUTO_TRADE"
+    if candidate:
+        return "WATCH"
+    if payload.get("support_tradable"):
+        return "WATCH"
+    return "REJECT"
+
+
+def write_scan_outputs(scan: dict[str, Any], output_dir: Path) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "json": output_dir / "scan_results.json",
+        "markdown": output_dir / "scan_report.md",
+        "csv": output_dir / "scan_summary.csv",
+    }
+    paths["json"].write_text(
+        json.dumps(scan, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    paths["markdown"].write_text(render_markdown_report(scan), encoding="utf-8")
+    _write_csv(scan, paths["csv"])
+    return paths
+
+
+def resolve_output_dir(base: Path, overwrite: bool = False) -> Path:
+    if overwrite or not base.exists() or not any(base.iterdir()):
+        return base
+    suffix = datetime.now().strftime("run-%H%M%S")
+    return base / suffix
+
+
+def render_markdown_report(scan: dict[str, Any]) -> str:
+    lines = [
+        f"# Markus Wheel Daily Dry Run - {scan['scan_date']}",
+        "",
+        f"- Generated: `{scan['generated_at']}`",
+        f"- Period: `{scan['period']}`",
+        f"- Tickers: `{scan['ticker_count']}`",
+        f"- Summary: `{scan['summary']}`",
+        "",
+        "| Status | Ticker | Price | Support Score | Support Zone | CSP Candidate | Rejection Summary |",
+        "|---|---:|---:|---:|---|---|---|",
+    ]
+    for row in scan["results"]:
+        lines.append(_markdown_table_row(row))
+
+    lines.extend(["", "## Details", ""])
+    for row in scan["results"]:
+        lines.extend(_detail_section(row))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _payload(ticker: str, support, selection, option_count: int) -> dict[str, Any]:
+    selected = support.selected_zone
+    candidate = selection.candidate
+    candidate_payload = None
+    if candidate:
+        candidate_payload = asdict(candidate)
+        candidate_payload["option"]["mid"] = candidate.option.mid
+        candidate_payload["option"]["executable_mid"] = candidate.option.executable_mid
+        candidate_payload["option"]["spread_pct_of_mid"] = (
+            candidate.option.spread_pct_of_mid
+        )
+    selected_payload = asdict(selected) if selected else None
+    return {
+        "ticker": ticker,
+        "current_price": round(support.current_price, 2),
+        "trend_passed": support.trend.passed,
+        "trend_reasons": support.trend.reasons,
+        "atr14": round(support.atr14, 2) if support.atr14 is not None else None,
+        "support_tradable": support.tradable,
+        "support_score": round(selected.score, 1) if selected else None,
+        "selected_support": selected_payload,
+        "top_support_zones": [asdict(z) for z in support.zones[:5]],
+        "option_count": option_count,
+        "candidate": candidate_payload,
+        "csp_policy": selection.policy_name,
+        "rejection_summary": selection.rejection_summary,
+        "reasons": support.reasons,
+        "error": None,
+    }
+
+
+def _error_payload(ticker: str, error: str) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "status": "ERROR",
+        "status_reason": error,
+        "current_price": None,
+        "trend_passed": False,
+        "trend_reasons": [],
+        "atr14": None,
+        "support_tradable": False,
+        "support_score": None,
+        "selected_support": None,
+        "top_support_zones": [],
+        "option_count": 0,
+        "candidate": None,
+        "csp_policy": None,
+        "rejection_summary": {},
+        "reasons": [],
+        "error": error,
+    }
+
+
+def _status_reason(payload: dict[str, Any]) -> str:
+    if payload.get("error"):
+        return payload["error"]
+    candidate = payload.get("candidate")
+    if candidate and candidate.get("auto_trade"):
+        option = candidate["option"]
+        return f"auto CSP candidate {option['expiration']} {option['strike']}P"
+    if candidate:
+        return "candidate found but not auto-tradable"
+    if payload.get("support_tradable"):
+        return "technical setup tradable but no eligible CSP"
+    reasons = payload.get("reasons") or payload.get("trend_reasons") or []
+    return "; ".join(reasons[:3]) if reasons else "technical setup rejected"
+
+
+def _markdown_table_row(row: dict[str, Any]) -> str:
+    support = row.get("selected_support")
+    candidate = row.get("candidate")
+    support_text = "-"
+    if support:
+        support_text = (
+            f"{support['method']} "
+            f"{_fmt(support['bottom'])}-{_fmt(support['top'])}"
+        )
+    candidate_text = "-"
+    if candidate:
+        option = candidate["option"]
+        candidate_text = (
+            f"{option['expiration']} {option['strike']}P "
+            f"mid {_fmt(option.get('executable_mid') or option.get('mid'))} "
+            f"delta {_fmt(candidate['delta'], 3)}"
+        )
+    return (
+        f"| {_md_cell(row['status'])} | {_md_cell(row['ticker'])} | {_fmt(row.get('current_price'))} | "
+        f"{_fmt(row.get('support_score'), 1)} | {support_text} | "
+        f"{candidate_text} | {_md_cell(_top_rejections(row.get('rejection_summary') or {}))} |"
+    )
+
+
+def _detail_section(row: dict[str, Any]) -> list[str]:
+    lines = [
+        f"### {row['ticker']} - {row['status']}",
+        "",
+        f"- Reason: {row.get('status_reason') or '-'}",
+        f"- Price: `{_fmt(row.get('current_price'))}`",
+        f"- Trend passed: `{row.get('trend_passed')}`",
+        f"- Support tradable: `{row.get('support_tradable')}`",
+        f"- Option contracts checked: `{row.get('option_count')}`",
+    ]
+    support = row.get("selected_support")
+    if support:
+        lines.append(
+            f"- Selected support: `{support['method']} "
+            f"{_fmt(support['bottom'])}-{_fmt(support['top'])}, "
+            f"score {_fmt(support['score'], 1)}`"
+        )
+    candidate = row.get("candidate")
+    if candidate:
+        option = candidate["option"]
+        lines.extend(
+            [
+                f"- CSP: `{option['expiration']} {option['strike']}P`",
+                f"- Premium: `${(option.get('executable_mid') or option.get('mid') or 0) * 100:.0f}` per contract",
+                f"- Delta bucket: `{candidate['delta_bucket']}`",
+                f"- Weekly ROC: `{_fmt(candidate['weekly_return_on_strike_pct'], 2)}%`",
+                f"- Auto trade: `{candidate['auto_trade']}`",
+            ]
+        )
+    if row.get("rejection_summary"):
+        lines.append(f"- Rejections: `{_top_rejections(row['rejection_summary'], limit=8)}`")
+    if row.get("trend_reasons"):
+        lines.append(f"- Trend reasons: `{'; '.join(row['trend_reasons'])}`")
+    if row.get("reasons"):
+        lines.append(f"- Support reasons: `{'; '.join(row['reasons'])}`")
+    lines.append("")
+    return lines
+
+
+def _write_csv(scan: dict[str, Any], path: Path) -> None:
+    fields = [
+        "status",
+        "ticker",
+        "current_price",
+        "support_score",
+        "support_method",
+        "support_bottom",
+        "support_top",
+        "candidate_expiration",
+        "candidate_strike",
+        "candidate_delta",
+        "candidate_mid",
+        "candidate_auto_trade",
+        "status_reason",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in scan["results"]:
+            support = row.get("selected_support") or {}
+            candidate = row.get("candidate") or {}
+            option = candidate.get("option") or {}
+            writer.writerow(
+                {
+                    "status": row.get("status"),
+                    "ticker": row.get("ticker"),
+                    "current_price": row.get("current_price"),
+                    "support_score": row.get("support_score"),
+                    "support_method": support.get("method"),
+                    "support_bottom": support.get("bottom"),
+                    "support_top": support.get("top"),
+                    "candidate_expiration": option.get("expiration"),
+                    "candidate_strike": option.get("strike"),
+                    "candidate_delta": candidate.get("delta"),
+                    "candidate_mid": option.get("executable_mid") or option.get("mid"),
+                    "candidate_auto_trade": candidate.get("auto_trade"),
+                    "status_reason": row.get("status_reason"),
+                }
+            )
+
+
+def _top_rejections(summary: dict[str, int], limit: int = 3) -> str:
+    if not summary:
+        return "-"
+    return ", ".join(
+        f"{reason}:{count}"
+        for reason, count in list(summary.items())[:limit]
+    )
+
+
+def _fmt(value: Any, digits: int = 2) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+def _md_cell(value: Any) -> str:
+    text = _fmt(value)
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("`", "\\`")

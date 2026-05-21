@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import logging
 
 import pandas as pd
 import yfinance as yf
 
 from .models import OptionQuote, PriceBar
+
+logger = logging.getLogger(__name__)
 
 
 def fetch_daily_bars(ticker: str, period: str = "1y") -> list[PriceBar]:
@@ -33,7 +36,11 @@ def fetch_put_chain(
         return []
     options: list[OptionQuote] = []
     for exp, dte, raw in sorted(expirations, key=lambda item: item[1]):
-        chain = tk.option_chain(raw).puts
+        try:
+            chain = tk.option_chain(raw).puts
+        except Exception as exc:
+            logger.warning("Failed to fetch %s option chain %s: %s", ticker, raw, exc)
+            continue
         options.extend(_puts_from_frame(chain, exp, dte))
     return options
 
@@ -94,7 +101,8 @@ def _nullable_num(value) -> float | None:
     try:
         if pd.isna(value):
             return None
-        return float(value)
+        parsed = float(value)
+        return parsed if parsed > 0 else None
     except Exception:
         return None
 

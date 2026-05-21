@@ -24,6 +24,26 @@ python3 scripts/dry_run.py --ticker AAPL
 python3 scripts/dry_run.py --ticker AAPL --json
 ```
 
+## Daily Watchlist Scan
+
+```bash
+python3 scripts/scan_watchlist.py
+python3 scripts/scan_watchlist.py --tickers AAPL,UPS --output /tmp/wheels-scan --overwrite
+```
+
+`--date` controls the report date and option DTE calculation. It does not
+perform a historical market-data replay; the current Yahoo Finance bars and
+option chains are still fetched.
+
+Default output:
+
+```text
+workspace/scans/YYYY-MM-DD/
+  scan_results.json
+  scan_report.md
+  scan_summary.csv
+```
+
 ## Tests
 
 ```bash
