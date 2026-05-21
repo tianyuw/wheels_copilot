@@ -3,12 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
+from dataclasses import asdict
 from datetime import date, datetime
 from typing import Any
 
 from .alpaca import AlpacaMarketDataClient
-from .market_data import fetch_call_chain
-from .models import OptionQuote
+from .gates import (
+    evaluate_covered_call_earnings_gate,
+    evaluate_covered_call_ex_dividend_gate,
+)
+from .market_data import fetch_call_chain, fetch_fundamental_snapshot
+from .models import FundamentalSnapshot, GateResult, OptionQuote
 
 
 MONEY_EPSILON = 0.005
@@ -21,6 +26,7 @@ def build_covered_call_proposals(
     as_of: date | None = None,
     client: AlpacaMarketDataClient | None = None,
     option_chain_by_ticker: dict[str, list[OptionQuote]] | None = None,
+    fundamental_by_ticker: dict[str, FundamentalSnapshot] | None = None,
 ) -> dict[str, Any]:
     """Build dry-run covered-call proposals for assigned wheel positions."""
 
@@ -50,9 +56,16 @@ def build_covered_call_proposals(
                 client=client,
             )
         )
+        fundamental_snapshot = (
+            fundamental_by_ticker[ticker]
+            if fundamental_by_ticker is not None and ticker in fundamental_by_ticker
+            else fetch_fundamental_snapshot(ticker, as_of=as_of)
+        )
         proposal = _position_proposal(
             position=position,
             options=chain or [],
+            fundamental_snapshot=fundamental_snapshot,
+            as_of=as_of,
             scan_date=as_of.isoformat(),
             generated_at=generated_at,
             config=config,
@@ -111,6 +124,9 @@ def build_covered_call_shadow_orders(
                 "available_shares_for_cc": proposal.get("available_shares_for_cc"),
                 "adjusted_cost_basis": proposal.get("adjusted_cost_basis"),
                 "min_acceptable_strike": proposal.get("min_acceptable_strike"),
+                "fundamental_snapshot": proposal.get("fundamental_snapshot"),
+                "earnings_gate": proposal.get("earnings_gate"),
+                "ex_dividend_gate": proposal.get("ex_dividend_gate"),
                 "unchecked_risks": proposal.get("unchecked_risks") or [],
                 "payload": {
                     "symbol": option.get("symbol"),
@@ -180,6 +196,8 @@ def _position_proposal(
     *,
     position: dict[str, Any],
     options: list[OptionQuote],
+    fundamental_snapshot: FundamentalSnapshot,
+    as_of: date,
     scan_date: str,
     generated_at: str,
     config: dict[str, Any],
@@ -190,7 +208,13 @@ def _position_proposal(
     rejected = []
     eligible = []
     for option in options:
-        reasons = _option_rejection_reasons(option, position, config)
+        reasons = _option_rejection_reasons(
+            option,
+            position,
+            fundamental_snapshot,
+            as_of,
+            config,
+        )
         if reasons:
             rejected.append(_rejected_option(option, reasons))
         else:
@@ -214,6 +238,18 @@ def _position_proposal(
             rejected,
         )
     selected = sorted(eligible, key=lambda option: _option_rank(option, cc_cfg))[0]
+    earnings_gate = evaluate_covered_call_earnings_gate(
+        fundamental_snapshot,
+        selected,
+        as_of,
+        config,
+    )
+    ex_dividend_gate = evaluate_covered_call_ex_dividend_gate(
+        fundamental_snapshot,
+        selected,
+        as_of,
+        config,
+    )
     limit_price = _limit_price(selected)
     proposal_id = _proposal_id(scan_date, ticker, selected.expiration.isoformat(), selected.strike)
     premium = limit_price * 100.0 * quantity
@@ -224,7 +260,11 @@ def _position_proposal(
         "ticker": ticker,
         "strategy": "covered_call",
         "decision": "PROPOSED",
-        "decision_reasons": ["assigned_stock_has_eligible_covered_call"],
+        "decision_reasons": [
+            "assigned_stock_has_eligible_covered_call",
+            *earnings_gate.reasons,
+            *ex_dividend_gate.reasons,
+        ],
         "requires_manual_review": False,
         "quantity": quantity,
         "share_quantity": position.get("long_shares"),
@@ -234,7 +274,10 @@ def _position_proposal(
         "estimated_premium_credit": round(premium, 2),
         "limit_price": round(limit_price, 2),
         "option": _option_payload(selected),
-        "unchecked_risks": ["earnings_not_checked", "ex_dividend_not_checked"],
+        "fundamental_snapshot": _fundamental_payload(fundamental_snapshot),
+        "earnings_gate": _gate_payload(earnings_gate),
+        "ex_dividend_gate": _gate_payload(ex_dividend_gate),
+        "unchecked_risks": _unchecked_risks(earnings_gate, ex_dividend_gate),
         "rejected_option_count": len(rejected),
         "rejection_summary": _rejection_summary(rejected),
         "shadow_order_ref": proposal_id,
@@ -283,6 +326,8 @@ def _watch_proposal(
 def _option_rejection_reasons(
     option: OptionQuote,
     position: dict[str, Any],
+    fundamental_snapshot: FundamentalSnapshot,
+    as_of: date,
     config: dict[str, Any],
 ) -> list[str]:
     cc_cfg = config.get("cc_selector") or {}
@@ -313,6 +358,25 @@ def _option_rejection_reasons(
         reasons.append("delta_missing")
     elif delta < min_delta - MONEY_EPSILON or delta > max_delta + MONEY_EPSILON:
         reasons.append(f"delta_outside_target:{delta:.4f}")
+    # Autonomous covered-call proposals require both event-risk gates to fully
+    # pass. Config can downgrade unknown data from REJECT to WARN for reporting,
+    # but WARN still stays on watch and never clears unchecked_risks.
+    earnings_gate = evaluate_covered_call_earnings_gate(
+        fundamental_snapshot,
+        option,
+        as_of,
+        config,
+    )
+    if earnings_gate.status != "PASS":
+        reasons.extend(earnings_gate.reasons)
+    ex_dividend_gate = evaluate_covered_call_ex_dividend_gate(
+        fundamental_snapshot,
+        option,
+        as_of,
+        config,
+    )
+    if ex_dividend_gate.status != "PASS":
+        reasons.extend(ex_dividend_gate.reasons)
     return reasons
 
 
@@ -364,6 +428,34 @@ def _option_payload(option: OptionQuote) -> dict[str, Any]:
         else None,
         "data_feed": option.data_feed,
     }
+
+
+def _gate_payload(gate: GateResult) -> dict[str, Any]:
+    return {
+        "status": gate.status,
+        "reasons": gate.reasons,
+        "warnings": gate.warnings,
+    }
+
+
+def _unchecked_risks(
+    earnings_gate: GateResult,
+    ex_dividend_gate: GateResult,
+) -> list[str]:
+    risks = []
+    if earnings_gate.status != "PASS":
+        risks.append("earnings_not_checked")
+    if ex_dividend_gate.status != "PASS":
+        risks.append("ex_dividend_not_checked")
+    return risks
+
+
+def _fundamental_payload(snapshot: FundamentalSnapshot) -> dict[str, Any]:
+    payload = asdict(snapshot)
+    for key in ("next_earnings_date", "ex_dividend_date"):
+        if payload.get(key):
+            payload[key] = payload[key].isoformat()
+    return payload
 
 
 def _rejected_option(option: OptionQuote, reasons: list[str]) -> dict[str, Any]:

@@ -189,6 +189,16 @@ class ShadowOrderValidationTests(unittest.TestCase):
                         extra={
                             "adjusted_cost_basis": 88.8,
                             "available_shares_for_cc": 100,
+                            "earnings_gate": {
+                                "status": "PASS",
+                                "reasons": ["cc_earnings_after_expiration:2026-08-01"],
+                                "warnings": [],
+                            },
+                            "ex_dividend_gate": {
+                                "status": "PASS",
+                                "reasons": ["cc_ex_dividend_after_expiration:2026-06-01"],
+                                "warnings": [],
+                            },
                             "unchecked_risks": [
                                 "earnings_not_checked",
                                 "ex_dividend_not_checked",
@@ -206,6 +216,8 @@ class ShadowOrderValidationTests(unittest.TestCase):
         self.assertEqual(order["validated_limit_price"], 0.55)
         self.assertEqual(order["adjusted_cost_basis"], 88.8)
         self.assertEqual(order["available_shares_for_cc"], 100)
+        self.assertEqual(order["earnings_gate"]["status"], "PASS")
+        self.assertEqual(order["ex_dividend_gate"]["status"], "PASS")
         self.assertEqual(
             order["unchecked_risks"],
             ["earnings_not_checked", "ex_dividend_not_checked"],

@@ -50,6 +50,9 @@ def fetch_fundamental_snapshot(
         info.get("dividendYield")
         or info.get("trailingAnnualDividendYield")
     )
+    annual_dividend_rate = _positive_num(
+        info.get("dividendRate") or info.get("trailingAnnualDividendRate")
+    )
     return FundamentalSnapshot(
         ticker=ticker.upper(),
         quote_type=_str_or_none(info.get("quoteType")),
@@ -61,6 +64,8 @@ def fetch_fundamental_snapshot(
         market_cap=market_cap,
         pe_ratio=pe_ratio,
         dividend_yield=dividend_yield,
+        annual_dividend_rate=annual_dividend_rate,
+        ex_dividend_date=_ex_dividend_date(tk, info, as_of),
         quarterly_net_income=_net_income_values(_safe_statement(tk, "quarterly_income_stmt"), limit=5),
         annual_net_income=_net_income_values(_safe_statement(tk, "income_stmt"), limit=5),
         next_earnings_date=_next_earnings_date(tk, as_of),
@@ -260,14 +265,51 @@ def _next_earnings_date(ticker, as_of: date) -> date | None:
     return future[0] if future else None
 
 
+def _ex_dividend_date(ticker, info: dict[str, Any], as_of: date) -> date | None:
+    candidates: list[date] = []
+    candidates.extend(_dates_from_epoch_or_value(info.get("exDividendDate")))
+    candidates.extend(_dates_from_epoch_or_value(info.get("ex_dividend_date")))
+    try:
+        calendar = ticker.calendar
+        if isinstance(calendar, pd.DataFrame):
+            candidates.extend(_dates_from_frame_keywords(calendar, ["ex", "div"]))
+        elif isinstance(calendar, dict):
+            candidates.extend(
+                _dates_from_frame_keywords(pd.DataFrame([calendar]), ["ex", "div"])
+            )
+    except Exception:
+        pass
+    future = sorted(d for d in candidates if d >= as_of)
+    return future[0] if future else None
+
+
 def _dates_from_frame(frame: pd.DataFrame) -> list[date]:
+    return _dates_from_frame_keywords(frame, ["earn"])
+
+
+def _dates_from_frame_keywords(frame: pd.DataFrame, keywords: list[str]) -> list[date]:
     out: list[date] = []
     for column in frame.columns:
-        if "earn" not in str(column).lower():
+        lowered = str(column).lower()
+        if not all(keyword in lowered for keyword in keywords):
             continue
         for value in frame[column].dropna().tolist():
             out.extend(_dates_from_value(value))
     return out
+
+
+def _dates_from_epoch_or_value(value) -> list[date]:
+    if value in (None, ""):
+        return []
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return _dates_from_value(value)
+    if number <= 0:
+        return []
+    if number > 10_000:
+        return [datetime.fromtimestamp(number, tz=timezone.utc).date()]
+    return _dates_from_value(value)
 
 
 def _dates_from_value(value) -> list[date]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import date
 
@@ -7,7 +8,7 @@ from wheels_copilot.covered_call_planner import (
     build_covered_call_proposals,
     build_covered_call_shadow_orders,
 )
-from wheels_copilot.models import OptionQuote
+from wheels_copilot.models import FundamentalSnapshot, OptionQuote
 
 
 class CoveredCallPlannerTests(unittest.TestCase):
@@ -34,6 +35,7 @@ class CoveredCallPlannerTests(unittest.TestCase):
                     _call("AAPL260529C00095000", strike=95, delta=0.45),
                 ]
             },
+            fundamental_by_ticker={"AAPL": _fundamental()},
         )
         orders = build_covered_call_shadow_orders(proposals, _config())
 
@@ -43,10 +45,9 @@ class CoveredCallPlannerTests(unittest.TestCase):
         self.assertEqual(proposal["option"]["symbol"], "AAPL260529C00090000")
         self.assertGreaterEqual(proposal["option"]["strike"], proposal["adjusted_cost_basis"])
         self.assertEqual(proposal["estimated_premium_credit"], 52.5)
-        self.assertEqual(
-            proposal["unchecked_risks"],
-            ["earnings_not_checked", "ex_dividend_not_checked"],
-        )
+        self.assertEqual(proposal["unchecked_risks"], [])
+        self.assertEqual(proposal["earnings_gate"]["status"], "PASS")
+        self.assertEqual(proposal["ex_dividend_gate"]["status"], "PASS")
 
         self.assertEqual(orders["order_count"], 1)
         payload = orders["orders"][0]["payload"]
@@ -56,10 +57,9 @@ class CoveredCallPlannerTests(unittest.TestCase):
         self.assertTrue(payload["client_order_id"].startswith("whcc-"))
         self.assertEqual(orders["orders"][0]["adjusted_cost_basis"], 88.8)
         self.assertEqual(orders["orders"][0]["available_shares_for_cc"], 100)
-        self.assertEqual(
-            orders["orders"][0]["unchecked_risks"],
-            ["earnings_not_checked", "ex_dividend_not_checked"],
-        )
+        self.assertEqual(orders["orders"][0]["earnings_gate"]["status"], "PASS")
+        self.assertEqual(orders["orders"][0]["ex_dividend_gate"]["status"], "PASS")
+        self.assertEqual(orders["orders"][0]["unchecked_risks"], [])
 
     def test_no_eligible_call_keeps_position_on_watch(self):
         proposals = build_covered_call_proposals(
@@ -83,6 +83,7 @@ class CoveredCallPlannerTests(unittest.TestCase):
                     _call("AAPL260529C00105000", strike=105, delta=0.5),
                 ]
             },
+            fundamental_by_ticker={"AAPL": _fundamental()},
         )
         orders = build_covered_call_shadow_orders(proposals, _config())
 
@@ -118,6 +119,7 @@ class CoveredCallPlannerTests(unittest.TestCase):
             _config(),
             as_of=date(2026, 5, 21),
             option_chain_by_ticker={"AAPL": []},
+            fundamental_by_ticker={"AAPL": _fundamental()},
         )
 
         ids = [proposal["proposal_id"] for proposal in proposals["proposals"]]
@@ -140,10 +142,169 @@ class CoveredCallPlannerTests(unittest.TestCase):
             _config(),
             as_of=date(2026, 5, 21),
             option_chain_by_ticker={"AAPL": []},
+            fundamental_by_ticker={"AAPL": _fundamental()},
         )
 
         self.assertEqual(proposals["proposal_count"], 0)
         self.assertEqual(proposals["audit_count"], 1)
+
+    def test_covered_call_earnings_before_expiration_keeps_position_on_watch(self):
+        proposals = build_covered_call_proposals(
+            _lifecycle(
+                [
+                    {
+                        "ticker": "AAPL",
+                        "state": "ASSIGNED",
+                        "covered_call_eligible": True,
+                        "long_shares": 100,
+                        "available_shares_for_cc": 100,
+                        "adjusted_cost_basis": 88.8,
+                    }
+                ]
+            ),
+            _config(),
+            as_of=date(2026, 5, 21),
+            option_chain_by_ticker={
+                "AAPL": [_call("AAPL260529C00090000", strike=90, delta=0.22)]
+            },
+            fundamental_by_ticker={"AAPL": _fundamental(next_earnings_date=date(2026, 5, 29))},
+        )
+
+        proposal = proposals["proposals"][0]
+        self.assertEqual(proposal["decision"], "WATCH")
+        self.assertIn("cc_expiration_on_or_after_earnings", proposal["rejection_summary"])
+        self.assertEqual(build_covered_call_shadow_orders(proposals, _config())["order_count"], 0)
+
+    def test_covered_call_ex_dividend_inside_window_keeps_position_on_watch(self):
+        proposals = build_covered_call_proposals(
+            _lifecycle(
+                [
+                    {
+                        "ticker": "AAPL",
+                        "state": "ASSIGNED",
+                        "covered_call_eligible": True,
+                        "long_shares": 100,
+                        "available_shares_for_cc": 100,
+                        "adjusted_cost_basis": 88.8,
+                    }
+                ]
+            ),
+            _config(),
+            as_of=date(2026, 5, 21),
+            option_chain_by_ticker={
+                "AAPL": [_call("AAPL260529C00090000", strike=90, delta=0.22)]
+            },
+            fundamental_by_ticker={
+                "AAPL": _fundamental(ex_dividend_date=date(2026, 5, 28))
+            },
+        )
+
+        proposal = proposals["proposals"][0]
+        self.assertEqual(proposal["decision"], "WATCH")
+        self.assertIn("cc_ex_dividend_within_contract_window", proposal["rejection_summary"])
+        self.assertEqual(build_covered_call_shadow_orders(proposals, _config())["order_count"], 0)
+
+    def test_covered_call_etf_skips_earnings_but_checks_ex_dividend(self):
+        proposals = build_covered_call_proposals(
+            _lifecycle(
+                [
+                    {
+                        "ticker": "IWM",
+                        "state": "ASSIGNED",
+                        "covered_call_eligible": True,
+                        "long_shares": 100,
+                        "available_shares_for_cc": 100,
+                        "adjusted_cost_basis": 200.0,
+                    }
+                ]
+            ),
+            _config(),
+            as_of=date(2026, 5, 21),
+            option_chain_by_ticker={
+                "IWM": [_call("IWM260529C00210000", strike=210, delta=0.22)]
+            },
+            fundamental_by_ticker={
+                "IWM": _fundamental(
+                    ticker="IWM",
+                    quote_type="ETF",
+                    next_earnings_date=None,
+                    ex_dividend_date=date(2026, 6, 1),
+                )
+            },
+        )
+
+        proposal = proposals["proposals"][0]
+        self.assertEqual(proposal["decision"], "PROPOSED")
+        self.assertIn("cc_earnings_not_applicable_etf", proposal["decision_reasons"])
+        self.assertEqual(proposal["unchecked_risks"], [])
+
+    def test_covered_call_warn_risk_gate_stays_watch_and_does_not_create_order(self):
+        cfg = _config()
+        cfg["cc_risk"] = {
+            "block_unknown_stock_earnings_date": False,
+            "block_unknown_ex_dividend_date_for_dividend_payers": False,
+        }
+
+        proposals = build_covered_call_proposals(
+            _lifecycle(
+                [
+                    {
+                        "ticker": "AAPL",
+                        "state": "ASSIGNED",
+                        "covered_call_eligible": True,
+                        "long_shares": 100,
+                        "available_shares_for_cc": 100,
+                        "adjusted_cost_basis": 88.8,
+                    }
+                ]
+            ),
+            cfg,
+            as_of=date(2026, 5, 21),
+            option_chain_by_ticker={
+                "AAPL": [_call("AAPL260529C00090000", strike=90, delta=0.22)]
+            },
+            fundamental_by_ticker={
+                "AAPL": _fundamental(
+                    next_earnings_date=None,
+                    dividend_yield=0.01,
+                    ex_dividend_date=None,
+                )
+            },
+        )
+
+        proposal = proposals["proposals"][0]
+        self.assertEqual(proposal["decision"], "WATCH")
+        self.assertIn("cc_earnings_date_unknown", proposal["rejection_summary"])
+        self.assertIn(
+            "cc_ex_dividend_date_unknown_for_dividend_payer",
+            proposal["rejection_summary"],
+        )
+        self.assertEqual(build_covered_call_shadow_orders(proposals, cfg)["order_count"], 0)
+
+    def test_covered_call_shadow_order_metadata_is_json_serializable(self):
+        proposals = build_covered_call_proposals(
+            _lifecycle(
+                [
+                    {
+                        "ticker": "AAPL",
+                        "state": "ASSIGNED",
+                        "covered_call_eligible": True,
+                        "long_shares": 100,
+                        "available_shares_for_cc": 100,
+                        "adjusted_cost_basis": 88.8,
+                    }
+                ]
+            ),
+            _config(),
+            as_of=date(2026, 5, 21),
+            option_chain_by_ticker={
+                "AAPL": [_call("AAPL260529C00090000", strike=90, delta=0.22)]
+            },
+            fundamental_by_ticker={"AAPL": _fundamental()},
+        )
+        orders = build_covered_call_shadow_orders(proposals, _config())
+
+        json.dumps(orders)
 
 
 def _config() -> dict:
@@ -175,6 +336,31 @@ def _lifecycle(positions: list[dict]) -> dict:
         "summary": {},
         "positions": positions,
     }
+
+
+def _fundamental(
+    *,
+    ticker: str = "AAPL",
+    quote_type: str = "EQUITY",
+    next_earnings_date: date | None = date(2026, 8, 1),
+    dividend_yield: float | None = 0.01,
+    annual_dividend_rate: float | None = None,
+    ex_dividend_date: date | None = date(2026, 6, 1),
+) -> FundamentalSnapshot:
+    return FundamentalSnapshot(
+        ticker=ticker,
+        quote_type=quote_type,
+        long_name=f"{ticker} Test",
+        market_cap=10_000_000_000,
+        pe_ratio=20,
+        dividend_yield=dividend_yield,
+        annual_dividend_rate=annual_dividend_rate,
+        ex_dividend_date=ex_dividend_date,
+        quarterly_net_income=[1, 1, 1, 1, 1],
+        annual_net_income=[1, 1, 1, 1, 1],
+        next_earnings_date=next_earnings_date,
+        recent_move_pct=10,
+    )
 
 
 def _call(

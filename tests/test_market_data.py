@@ -184,6 +184,10 @@ class MarketDataTests(unittest.TestCase):
                 "quoteType": "EQUITY",
                 "shortName": "Test Corp",
                 "dividendYield": 6.63,
+                "dividendRate": 4.2,
+                "exDividendDate": int(
+                    datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp()
+                ),
                 "trailingPE": -4.5,
             }
         )
@@ -192,7 +196,40 @@ class MarketDataTests(unittest.TestCase):
             snapshot = fetch_fundamental_snapshot("TEST", bars=[], as_of=date(2026, 5, 20))
 
         self.assertAlmostEqual(snapshot.dividend_yield, 0.0663)
+        self.assertEqual(snapshot.annual_dividend_rate, 4.2)
+        self.assertEqual(snapshot.ex_dividend_date, date(2026, 6, 1))
         self.assertEqual(snapshot.pe_ratio, -4.5)
+
+    def test_fetch_fundamental_snapshot_reads_ex_dividend_from_calendar(self):
+        fake = _FakeFundamentalTicker(
+            info={
+                "quoteType": "EQUITY",
+                "shortName": "Test Corp",
+                "dividendYield": 0.02,
+                "trailingPE": 20,
+            },
+            calendar=pd.DataFrame([{"Ex-Dividend Date": date(2026, 6, 1)}]),
+        )
+
+        with patch("wheels_copilot.market_data.yf.Ticker", return_value=fake):
+            snapshot = fetch_fundamental_snapshot("TEST", bars=[], as_of=date(2026, 5, 20))
+
+        self.assertEqual(snapshot.ex_dividend_date, date(2026, 6, 1))
+
+        dict_calendar = _FakeFundamentalTicker(
+            info={
+                "quoteType": "EQUITY",
+                "shortName": "Test Corp",
+                "dividendYield": 0.02,
+                "trailingPE": 20,
+            },
+            calendar={"Ex-Dividend Date": date(2026, 6, 8)},
+        )
+
+        with patch("wheels_copilot.market_data.yf.Ticker", return_value=dict_calendar):
+            snapshot = fetch_fundamental_snapshot("TEST", bars=[], as_of=date(2026, 5, 20))
+
+        self.assertEqual(snapshot.ex_dividend_date, date(2026, 6, 8))
 
     def test_net_income_values_are_sorted_newest_first(self):
         frame = pd.DataFrame(
@@ -334,10 +371,10 @@ class _FakeAlpacaMarketDataClient:
 class _FakeFundamentalTicker:
     quarterly_income_stmt = pd.DataFrame()
     income_stmt = pd.DataFrame()
-    calendar = {}
 
-    def __init__(self, info: dict):
+    def __init__(self, info: dict, calendar=None):
         self._info = info
+        self.calendar = {} if calendar is None else calendar
 
     def get_info(self):
         return self._info

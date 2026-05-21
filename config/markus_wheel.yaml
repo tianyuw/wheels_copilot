@@ -176,6 +176,12 @@ cc_selector:
   max_spread_pct_of_mid: 0.15
   min_open_interest: 50
 
+cc_risk:
+  require_earnings_after_expiration: true
+  block_unknown_stock_earnings_date: true
+  block_ex_dividend_within_contract_window: true
+  block_unknown_ex_dividend_date_for_dividend_payers: true
+
 risk:
   max_assignment_cash_pct: 0.80
   min_cash_buffer_pct: 0.15

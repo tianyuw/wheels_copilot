@@ -161,8 +161,16 @@ covered-call orders after re-fetching the Alpaca portfolio. It blocks if the
 account is not active, the stock position cannot cover the call contracts, the
 call strike is below adjusted cost basis, or proposal-level unresolved risks
 remain. Current covered-call proposals deliberately carry
-`earnings_not_checked` and `ex_dividend_not_checked` until those gates are
-implemented, so the execution path is wired but fail-closed by default.
+`earnings_not_checked` or `ex_dividend_not_checked` only when those gates cannot
+prove the candidate safe.
+
+Covered-call risk gates are conservative by default:
+
+- Stock calls must expire before the next earnings date; ETFs skip the earnings
+  gate because earnings do not apply.
+- Dividend-paying symbols must have a known ex-dividend date.
+- A call is blocked when an ex-dividend date falls after the scan date and on or
+  before the call expiration.
 
 ## Tests
 

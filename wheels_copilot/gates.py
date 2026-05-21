@@ -122,6 +122,125 @@ def evaluate_earnings_gate(
     )
 
 
+def evaluate_covered_call_earnings_gate(
+    snapshot: FundamentalSnapshot,
+    option: OptionQuote,
+    as_of: date,
+    config: dict[str, Any] | None = None,
+) -> GateResult:
+    cfg = (config or {}).get("cc_risk") or {}
+    if snapshot.is_etf:
+        return GateResult(
+            status="PASS",
+            reasons=["cc_earnings_not_applicable_etf"],
+            warnings=[],
+        )
+    if snapshot.next_earnings_date is None:
+        if not cfg.get("block_unknown_stock_earnings_date", True):
+            return GateResult(
+                status="WARN",
+                reasons=["cc_earnings_date_unknown"],
+                warnings=["cannot_confirm_call_expiration_before_earnings"],
+            )
+        return GateResult(
+            status="REJECT",
+            reasons=["cc_earnings_date_unknown"],
+            warnings=["cannot_confirm_call_expiration_before_earnings"],
+        )
+    if snapshot.next_earnings_date < as_of:
+        return GateResult(
+            status="REJECT",
+            reasons=[f"cc_earnings_date_stale:{snapshot.next_earnings_date}"],
+            warnings=[],
+        )
+    if (
+        cfg.get("require_earnings_after_expiration", True)
+        and option.expiration >= snapshot.next_earnings_date
+    ):
+        return GateResult(
+            status="REJECT",
+            reasons=[
+                "cc_expiration_on_or_after_earnings:"
+                f"{option.expiration}>={snapshot.next_earnings_date}"
+            ],
+            warnings=[],
+        )
+    return GateResult(
+        status="PASS",
+        reasons=[f"cc_earnings_after_expiration:{snapshot.next_earnings_date}"],
+        warnings=[],
+    )
+
+
+def evaluate_covered_call_ex_dividend_gate(
+    snapshot: FundamentalSnapshot,
+    option: OptionQuote,
+    as_of: date,
+    config: dict[str, Any] | None = None,
+) -> GateResult:
+    cfg = (config or {}).get("cc_risk") or {}
+    pays_dividend = bool(snapshot.dividend_yield) or bool(snapshot.annual_dividend_rate)
+    if not pays_dividend and snapshot.ex_dividend_date is None:
+        return GateResult(
+            status="PASS",
+            reasons=["cc_no_dividend_detected"],
+            warnings=[],
+        )
+    if snapshot.ex_dividend_date is None:
+        if not cfg.get("block_unknown_ex_dividend_date_for_dividend_payers", True):
+            return GateResult(
+                status="WARN",
+                reasons=["cc_ex_dividend_date_unknown_for_dividend_payer"],
+                warnings=["cannot_confirm_no_ex_dividend_before_expiration"],
+            )
+        return GateResult(
+            status="REJECT",
+            reasons=["cc_ex_dividend_date_unknown_for_dividend_payer"],
+            warnings=["cannot_confirm_no_ex_dividend_before_expiration"],
+        )
+    if snapshot.ex_dividend_date <= as_of:
+        if pays_dividend:
+            if not cfg.get("block_unknown_ex_dividend_date_for_dividend_payers", True):
+                return GateResult(
+                    status="WARN",
+                    reasons=[
+                        f"cc_ex_dividend_date_stale:{snapshot.ex_dividend_date}",
+                        "cc_ex_dividend_date_unknown_for_dividend_payer",
+                    ],
+                    warnings=["cannot_confirm_next_ex_dividend_before_expiration"],
+                )
+            return GateResult(
+                status="REJECT",
+                reasons=[
+                    f"cc_ex_dividend_date_stale:{snapshot.ex_dividend_date}",
+                    "cc_ex_dividend_date_unknown_for_dividend_payer",
+                ],
+                warnings=["cannot_confirm_next_ex_dividend_before_expiration"],
+            )
+        return GateResult(
+            status="PASS",
+            reasons=[f"cc_ex_dividend_already_passed:{snapshot.ex_dividend_date}"],
+            warnings=[],
+        )
+    if (
+        cfg.get("block_ex_dividend_within_contract_window", True)
+        and snapshot.ex_dividend_date <= option.expiration
+    ):
+        return GateResult(
+            status="REJECT",
+            reasons=[
+                "cc_ex_dividend_within_contract_window:"
+                f"{snapshot.ex_dividend_date}<={option.expiration}"
+            ],
+            warnings=[],
+        )
+    return GateResult(
+        status="PASS",
+        reasons=[f"cc_ex_dividend_after_expiration:{snapshot.ex_dividend_date}"],
+        warnings=[],
+    )
+
+
 def _evaluate_stock_quality(
     snapshot: FundamentalSnapshot,
     cfg: dict[str, Any],

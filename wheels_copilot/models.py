@@ -120,6 +120,8 @@ class FundamentalSnapshot:
     market_cap: float | None = None
     pe_ratio: float | None = None
     dividend_yield: float | None = None
+    annual_dividend_rate: float | None = None
+    ex_dividend_date: date | None = None
     quarterly_net_income: list[float] = field(default_factory=list)
     annual_net_income: list[float] = field(default_factory=list)
     next_earnings_date: date | None = None

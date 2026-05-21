@@ -22,6 +22,9 @@ VALIDATED_ORDER_METADATA_KEYS = (
     "available_shares_for_cc",
     "adjusted_cost_basis",
     "min_acceptable_strike",
+    "fundamental_snapshot",
+    "earnings_gate",
+    "ex_dividend_gate",
     "unchecked_risks",
     "warnings",
 )
