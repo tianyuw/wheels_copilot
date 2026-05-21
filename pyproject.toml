@@ -1,0 +1,18 @@
+[project]
+name = "wheels-copilot"
+version = "0.1.0"
+description = "Markus-style weekly wheel strategy research and paper-trading system"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+    "yfinance>=0.2.0",
+]
+
+[project.scripts]
+wheel-dry-run = "wheels_copilot.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

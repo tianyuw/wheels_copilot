@@ -1,0 +1,156 @@
+mode: paper
+broker: alpaca
+
+account:
+  broker: alpaca
+  account_type: paper
+  starting_equity: 500000
+  currency: USD
+  live_trading_enabled: false
+
+watchlist:
+  tickers:
+    - BBY
+    - TSCO
+    - IWM
+    - MRK
+    - XLE
+    - UPS
+    - HAL
+    - ABNB
+    - EOG
+    - GDXJ
+
+fundamental_filters:
+  market_cap_min_hard: 2000000000
+  market_cap_preferred: 5000000000
+  pe_max: 50
+  min_positive_quarters_out_of_5: 4
+  min_positive_years_out_of_5: 4
+  allow_2020_pandemic_exception: true
+  prefer_dividend: true
+  reject_biotech: true
+  reject_chinese_adr: true
+  reject_leveraged_etf: true
+  reject_recent_100pct_movers: true
+
+portfolio:
+  max_active_tickers: 5
+  max_correlation: 0.65
+  max_same_sector_tickers: 2
+
+trend_filter:
+  require_price_above_sma200: true
+  sma200_slope_lookback_days: 20
+  require_sma200_slope_non_negative: true
+  pause_if_price_breaks_sma200: true
+
+support:
+  primary_method: pivot_cluster_zone
+
+  pivot_cluster:
+    enabled: true
+    pivot_left_bars: 4
+    pivot_right_bars: 4
+    lookback_days: 180
+    min_touches_required: 2
+    preferred_touches: 3
+    zone_width_atr_multiple: 0.5
+    zone_width_price_pct: 1.0
+    reject_if_broken_within_days: 10
+    break_requires_close_below_zone: true
+
+  rejection_count:
+    enabled: true
+    min_rejections_required: 2
+    wick_reclaim_required: true
+
+  range_box:
+    enabled: true
+    lookback_days: 20
+    min_box_bars: 10
+    use_close_for_floor_ceiling: true
+    max_box_height_atr_multiple: 4.0
+    require_price_inside_box: true
+    reject_if_close_below_floor: true
+
+  moving_average_supports:
+    enabled: true
+    periods: [50, 200]
+    zone_width_atr_multiple: 0.35
+
+  lowest_low_reference:
+    enabled: true
+    lookbacks: [20, 50, 100]
+    allow_20d_low_alone: false
+
+  bollinger_lower_band:
+    enabled: true
+    bollinger_window_days: 20
+    bollinger_stddev: 2
+
+  scoring:
+    min_score_to_trade: 70
+    pivot_cluster_weight: 35
+    range_floor_weight: 20
+    ma_confluence_weight: 15
+    rejection_count_weight: 15
+    lowest_low_reference_weight: 5
+    recency_weight: 10
+    penalty_recent_break: -50
+    penalty_new_low_within_days: -30
+
+csp_selector:
+  dte_min: 1
+  dte_max: 9
+  allowed_strike_offset_count: 1
+  require_strike_at_or_below_support_zone_bottom: true
+  allow_strike_inside_support_zone_only_in_paper: true
+  allow_one_strike_above_support_only_manual_review: true
+  min_strike_distance_atr_multiple: 1.0
+  min_strike_distance_pct: 3.0
+  delta_policy:
+    strong_support:
+      min_support_score: 85
+      target_delta_min: 0.15
+      target_delta_max: 0.30
+      auto_trade: true
+    normal_support:
+      min_support_score: 70
+      max_support_score: 84
+      target_delta_min: 0.10
+      target_delta_max: 0.25
+      auto_trade: true
+    manual_review:
+      target_delta_min: 0.25
+      target_delta_max: 0.35
+      auto_trade: false
+  min_bid: 0.20
+  max_spread_pct_of_mid: 0.12
+  min_open_interest: 100
+  min_weekly_return_on_strike_pct: 0.25
+
+cc_selector:
+  dte_min: 1
+  dte_max: 9
+  min_strike_vs_cost_basis_pct: 0.0
+  target_delta_min: 0.10
+  target_delta_max: 0.35
+  min_bid: 0.10
+  max_spread_pct_of_mid: 0.15
+  min_open_interest: 50
+
+risk:
+  max_assignment_cash_pct: 0.80
+  min_cash_buffer_pct: 0.15
+  max_single_ticker_assignment_pct: 0.15
+  max_single_ticker_assignment_dollars: 75000
+  no_margin_assignment: true
+
+management:
+  csp_hold_to_expiry: true
+  cc_hold_to_expiry: true
+  allow_close_near_expiry: true
+  close_if_value_remaining_pct_of_credit_below: 10
+  no_debit_roll: true
+  dca_requires_manual_approval: true
