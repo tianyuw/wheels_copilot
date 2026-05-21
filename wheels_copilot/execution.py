@@ -12,6 +12,7 @@ from .alpaca import (
     parse_occ_option_symbol,
 )
 from .models import BrokerOrder, CspCandidate, OptionQuote, PortfolioSnapshot, SupportZone
+from .oms import OrderLedger, oms_enabled
 from .portfolio_risk import evaluate_portfolio_risk
 
 
@@ -44,6 +45,7 @@ def execute_validated_shadow_orders(
     config: dict[str, Any],
     *,
     client: AlpacaTradingClient | None = None,
+    ledger: OrderLedger | None = None,
     previous_execution_results: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Submit validated CSP shadow orders to the Alpaca paper account.
@@ -59,86 +61,95 @@ def execute_validated_shadow_orders(
     execution_cfg = config.get("execution") or {}
     max_orders = int(execution_cfg.get("max_orders_per_run") or DEFAULT_MAX_ORDERS_PER_RUN)
     previously_submitted = _submitted_client_order_ids(previous_execution_results)
+    owns_ledger = ledger is None and oms_enabled(config)
+    if owns_ledger:
+        ledger = OrderLedger.from_config(config)
 
-    config_reasons = _execution_config_reasons(config)
-    artifact_reasons = _validation_artifact_reasons(
-        validated_shadow_orders,
-        generated_at=generated_at,
-        config=config,
-    )
-    client_error = None
-    if client is None and not config_reasons:
-        try:
-            client = AlpacaTradingClient.from_config(config)
-        except (AlpacaConfigError, AlpacaRequestError) as exc:
-            client_error = f"{type(exc).__name__}: {exc}"
-
-    clock = None
-    clock_reasons: list[str] = []
-    if client is None:
-        if client_error:
-            clock_reasons.append("alpaca_trading_client_unavailable")
-    elif not config_reasons:
-        try:
-            clock = client.fetch_clock()
-            clock_reasons = _clock_blocking_reasons(clock, config)
-        except (AlpacaConfigError, AlpacaRequestError) as exc:
-            client_error = f"{type(exc).__name__}: {exc}"
-            clock_reasons.append("market_clock_unavailable")
-
-    submitted_count = 0
-    in_run_open_orders: list[BrokerOrder] = []
-    results = []
-    for order in orders:
-        global_reasons = list(config_reasons) + list(artifact_reasons) + list(clock_reasons)
-        if submitted_count >= max_orders:
-            global_reasons.append("max_orders_per_run_reached")
-        result = _execute_one_order(
-            order,
-            config,
-            client=client,
-            global_blocking_reasons=global_reasons,
-            previously_submitted=previously_submitted,
-            in_run_open_orders=in_run_open_orders,
+    try:
+        config_reasons = _execution_config_reasons(config)
+        artifact_reasons = _validation_artifact_reasons(
+            validated_shadow_orders,
+            generated_at=generated_at,
+            config=config,
         )
-        if result["status"] == "SUBMITTED":
-            submitted_count += 1
-            previously_submitted.add(result["client_order_id"])
-            synthetic_order = _broker_order_from_payload(order.get("validated_payload") or {})
-            if synthetic_order:
-                in_run_open_orders.append(synthetic_order)
-        results.append(result)
+        client_error = None
+        if client is None and not config_reasons:
+            try:
+                client = AlpacaTradingClient.from_config(config)
+            except (AlpacaConfigError, AlpacaRequestError) as exc:
+                client_error = f"{type(exc).__name__}: {exc}"
 
-    summary = Counter(result["status"] for result in results)
-    return {
-        "scan_date": validated_shadow_orders.get("scan_date"),
-        "generated_at": generated_at,
-        "source_validated_shadow_orders_generated_at": validated_shadow_orders.get(
-            "generated_at"
-        ),
-        "broker": "alpaca",
-        "account_type": "paper",
-        "executor": {
-            "version": 1,
-            "mode": "paper",
-            "strategy": "cash_secured_put",
-            "max_orders_per_run": max_orders,
-            "max_validated_order_age_seconds": _max_validated_order_age_seconds(config),
-            "no_open_minutes_before_close": int(
-                execution_cfg.get("no_open_minutes_before_close")
-                or DEFAULT_NO_OPEN_MINUTES_BEFORE_CLOSE
+        clock = None
+        clock_reasons: list[str] = []
+        if client is None:
+            if client_error:
+                clock_reasons.append("alpaca_trading_client_unavailable")
+        elif not config_reasons:
+            try:
+                clock = client.fetch_clock()
+                clock_reasons = _clock_blocking_reasons(clock, config)
+            except (AlpacaConfigError, AlpacaRequestError) as exc:
+                client_error = f"{type(exc).__name__}: {exc}"
+                clock_reasons.append("market_clock_unavailable")
+
+        submitted_count = 0
+        in_run_open_orders: list[BrokerOrder] = []
+        results = []
+        for order in orders:
+            global_reasons = list(config_reasons) + list(artifact_reasons) + list(clock_reasons)
+            if submitted_count >= max_orders:
+                global_reasons.append("max_orders_per_run_reached")
+            result = _execute_one_order(
+                order,
+                config,
+                client=client,
+                ledger=ledger,
+                global_blocking_reasons=global_reasons,
+                previously_submitted=previously_submitted,
+                in_run_open_orders=in_run_open_orders,
+            )
+            if result["status"] == "SUBMITTED":
+                submitted_count += 1
+                previously_submitted.add(result["client_order_id"])
+                synthetic_order = _broker_order_from_payload(order.get("validated_payload") or {})
+                if synthetic_order:
+                    in_run_open_orders.append(synthetic_order)
+            results.append(result)
+
+        summary = Counter(result["status"] for result in results)
+        return {
+            "scan_date": validated_shadow_orders.get("scan_date"),
+            "generated_at": generated_at,
+            "source_validated_shadow_orders_generated_at": validated_shadow_orders.get(
+                "generated_at"
             ),
-            "paper_only_guard": True,
-            "portfolio_risk_gate": True,
-            "market_clock_gate": True,
-        },
-        "clock": _clock_summary(clock),
-        "client_error": client_error,
-        "order_count": len(results),
-        "submitted_count": submitted_count,
-        "summary": dict(sorted(summary.items())),
-        "orders": results,
-    }
+            "broker": "alpaca",
+            "account_type": "paper",
+            "executor": {
+                "version": 1,
+                "mode": "paper",
+                "strategy": "cash_secured_put",
+                "max_orders_per_run": max_orders,
+                "max_validated_order_age_seconds": _max_validated_order_age_seconds(config),
+                "no_open_minutes_before_close": int(
+                    execution_cfg.get("no_open_minutes_before_close")
+                    or DEFAULT_NO_OPEN_MINUTES_BEFORE_CLOSE
+                ),
+                "paper_only_guard": True,
+                "portfolio_risk_gate": True,
+                "market_clock_gate": True,
+                "oms_enabled": ledger is not None,
+            },
+            "clock": _clock_summary(clock),
+            "client_error": client_error,
+            "order_count": len(results),
+            "submitted_count": submitted_count,
+            "summary": dict(sorted(summary.items())),
+            "orders": results,
+        }
+    finally:
+        if owns_ledger and ledger is not None:
+            ledger.close()
 
 
 def _execute_one_order(
@@ -146,6 +157,7 @@ def _execute_one_order(
     config: dict[str, Any],
     *,
     client: AlpacaTradingClient | None,
+    ledger: OrderLedger | None,
     global_blocking_reasons: list[str],
     previously_submitted: set[str],
     in_run_open_orders: list[BrokerOrder],
@@ -201,11 +213,38 @@ def _execute_one_order(
         )
 
     broker_payload = _broker_payload(payload)
+    ledger_order_id = None
+    if ledger is not None:
+        begin = ledger.begin_submit(
+            client_order_id=client_order_id,
+            order=order,
+            broker_payload=broker_payload,
+        )
+        if not begin.inserted:
+            return {
+                **_base_result(order, payload),
+                "status": "DUPLICATE_IN_OMS",
+                "blocking_reasons": [],
+                "error": f"client_order_id already exists in OMS with status {begin.existing_status}",
+                "portfolio_error": portfolio_error,
+                "portfolio_risk": portfolio_risk,
+                "broker_payload": broker_payload,
+                "broker_order": None,
+                "oms_order_id": begin.order_id,
+            }
+        ledger_order_id = begin.order_id
+
     try:
         broker_order = client.submit_order(broker_payload) if client else None
     except (AlpacaConfigError, AlpacaRequestError) as exc:
         error_text = f"{type(exc).__name__}: {exc}"
         if _is_duplicate_client_order_error(error_text):
+            if ledger is not None and ledger_order_id is not None:
+                ledger.update_after_submit(
+                    order_id=ledger_order_id,
+                    status="DUPLICATE_AT_BROKER",
+                    error_message=error_text,
+                )
             return {
                 **_base_result(order, payload),
                 "status": "DUPLICATE_AT_BROKER",
@@ -215,16 +254,24 @@ def _execute_one_order(
                 "portfolio_risk": portfolio_risk,
                 "broker_payload": broker_payload,
                 "broker_order": None,
+                "oms_order_id": ledger_order_id,
             }
+        if ledger is not None and ledger_order_id is not None:
+            ledger.update_after_submit(
+                order_id=ledger_order_id,
+                status="SUBMIT_ERROR",
+                error_message=error_text,
+            )
         return {
             **_base_result(order, payload),
-            "status": "ERROR",
+            "status": "SUBMIT_ERROR",
             "blocking_reasons": [],
             "error": error_text,
             "portfolio_error": portfolio_error,
             "portfolio_risk": portfolio_risk,
             "broker_payload": broker_payload,
             "broker_order": None,
+            "oms_order_id": ledger_order_id,
         }
 
     broker_status = str((broker_order or {}).get("status") or "").lower()
@@ -237,6 +284,13 @@ def _execute_one_order(
     else:
         status = "ERROR"
         error = f"unexpected_broker_order_status:{broker_status or 'missing'}"
+    if ledger is not None and ledger_order_id is not None:
+        ledger.update_after_submit(
+            order_id=ledger_order_id,
+            status=status,
+            broker_order=broker_order or {},
+            error_message=error,
+        )
     return {
         **_base_result(order, payload),
         "status": status,
@@ -246,6 +300,7 @@ def _execute_one_order(
         "portfolio_risk": portfolio_risk,
         "broker_payload": broker_payload,
         "broker_order": _broker_order_summary(broker_order or {}),
+        "oms_order_id": ledger_order_id,
     }
 
 
@@ -411,6 +466,8 @@ def _payload_blocking_reasons(payload: dict[str, Any]) -> list[str]:
     qty = _number(payload.get("qty"))
     if qty is None or qty <= 0 or int(qty) != qty:
         reasons.append("invalid_quantity")
+    elif int(qty) != 1:
+        reasons.append("unsupported_quantity_gt_one")
     limit = _number(payload.get("limit_price"))
     if limit is None or limit <= MONEY_EPSILON:
         reasons.append("invalid_limit_price")

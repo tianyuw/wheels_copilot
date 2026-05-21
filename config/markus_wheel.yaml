@@ -6,6 +6,10 @@ execution:
   max_validated_order_age_seconds: 120
   no_open_minutes_before_close: 30
 
+oms:
+  enabled: true
+  db_path: workspace/oms/wheels_oms.sqlite
+
 account:
   broker: alpaca
   account_type: paper

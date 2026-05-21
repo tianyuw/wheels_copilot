@@ -14,6 +14,7 @@ dependencies = [
 wheel-dry-run = "wheels_copilot.cli:main"
 wheel-scan-watchlist = "wheels_copilot.scan_cli:main"
 wheel-execute-validated = "wheels_copilot.execute_cli:main"
+wheel-reconcile-orders = "wheels_copilot.reconcile_cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

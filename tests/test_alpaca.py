@@ -122,6 +122,25 @@ class AlpacaAdapterTests(unittest.TestCase):
                         "next_close": "2026-05-20T20:00:00Z",
                     }
                 )
+            if req.full_url.endswith("/v2/orders/alpaca-1"):
+                return _Response(
+                    {
+                        "id": "alpaca-1",
+                        "status": "filled",
+                        "filled_avg_price": "1.05",
+                    }
+                )
+            if "/v2/orders:by_client_order_id?" in req.full_url:
+                parsed = urlparse(req.full_url)
+                query = parse_qs(parsed.query)
+                self.assertEqual(query["client_order_id"], ["client-1"])
+                return _Response(
+                    {
+                        "id": "alpaca-1",
+                        "status": "accepted",
+                        "client_order_id": "client-1",
+                    }
+                )
             if req.full_url.endswith("/v2/orders"):
                 body = json.loads(req.data.decode("utf-8"))
                 self.assertEqual(body["symbol"], "AAPL260529P00090000")
@@ -151,10 +170,14 @@ class AlpacaAdapterTests(unittest.TestCase):
                 "client_order_id": "client-1",
             }
         )
+        fetched = client.fetch_order("alpaca-1")
+        fetched_by_client_id = client.fetch_order_by_client_order_id("client-1")
 
         self.assertTrue(clock["is_open"])
         self.assertEqual(order["id"], "alpaca-1")
-        self.assertEqual([call[0] for call in calls], ["GET", "POST"])
+        self.assertEqual(fetched["status"], "filled")
+        self.assertEqual(fetched_by_client_id["id"], "alpaca-1")
+        self.assertEqual([call[0] for call in calls], ["GET", "POST", "GET", "GET"])
 
     def test_nested_orders_include_parent_and_children(self):
         def fake_open(req, timeout):

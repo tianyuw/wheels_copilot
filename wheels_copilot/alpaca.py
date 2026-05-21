@@ -106,6 +106,19 @@ class AlpacaTradingClient:
     def fetch_clock(self) -> dict[str, Any]:
         return self._get_json("/v2/clock")
 
+    def fetch_order(self, order_id: str) -> dict[str, Any]:
+        if not order_id:
+            raise AlpacaRequestError("missing Alpaca order id")
+        return self._get_json(f"/v2/orders/{parse.quote(order_id, safe='')}")
+
+    def fetch_order_by_client_order_id(self, client_order_id: str) -> dict[str, Any]:
+        if not client_order_id:
+            raise AlpacaRequestError("missing Alpaca client_order_id")
+        return self._get_json(
+            "/v2/orders:by_client_order_id",
+            {"client_order_id": client_order_id},
+        )
+
     def submit_order(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post_json("/v2/orders", payload)
 

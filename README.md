@@ -15,13 +15,15 @@ Current implementation scope:
 - Alpaca paper order executor for submit-ready cash-secured puts, guarded by
   paper-only config, market clock, portfolio risk, and idempotent client order
   IDs.
+- SQLite-backed OMS ledger and Alpaca paper reconciliation for submitted CSP
+  orders.
 - Unit tests for support scoring, delta policy, fundamentals, and earnings.
 
 Normal scans do not submit orders. `shadow_orders.json` and
 `validated_shadow_orders.json` remain auditable dry-run artifacts unless the CLI
 is run with `--execute-paper` or `scripts/execute_validated_orders.py` is called
-explicitly. Live trading is not implemented. Covered-call selection, assignment
-lifecycle, and persistent OMS/reconciliation are not implemented yet.
+explicitly. Live trading is not implemented. Covered-call selection and
+assignment lifecycle are not implemented yet.
 
 All stock and option price data is fetched from Alpaca. The scan fails closed
 unless the stock feed is `sip` and the option feed is `opra`; it does not
@@ -44,6 +46,7 @@ python3 scripts/scan_watchlist.py
 python3 scripts/scan_watchlist.py --tickers AAPL,UPS --output /tmp/wheels-scan --overwrite
 python3 scripts/scan_watchlist.py --with-alpaca
 python3 scripts/scan_watchlist.py --with-alpaca --execute-paper
+python3 scripts/reconcile_orders.py
 ```
 
 `--date` controls the report date and option DTE calculation. It does not
@@ -89,11 +92,37 @@ re-fetches the Alpaca paper portfolio before each order, accounts for orders
 submitted earlier in the same run, and blocks any portfolio gate warning or
 rejection.
 
+When `oms.enabled` is true, execution writes a persistent SQLite ledger before
+the broker POST, then updates it with the Alpaca order ID and status. The default
+database path is:
+
+```text
+workspace/oms/wheels_oms.sqlite
+```
+
 Existing validated orders can also be submitted directly:
 
 ```bash
 python3 scripts/execute_validated_orders.py --input workspace/scans/YYYY-MM-DD/validated_shadow_orders.json
 ```
+
+Reconcile submitted orders against Alpaca paper:
+
+```bash
+python3 scripts/reconcile_orders.py --output workspace/oms/reconciliation.json
+```
+
+Reconciliation updates OMS-submitted orders to `FILLED`, `PARTIAL`,
+`CANCELED`, `EXPIRED`, `DONE_FOR_DAY`, `REJECTED`, or `ERROR`. It also recovers
+ambiguous submit failures by looking up Alpaca orders with the original
+`client_order_id`. Filled short-put orders create or update an `OPEN` OMS
+position with assignment cash recorded. This reconciliation layer tracks orders
+submitted through Wheels Copilot; externally created broker positions are a
+separate follow-up sync task.
+
+The first paper executor supports one-contract CSP orders only. Multi-contract
+and partial-fill position accounting will be added after the single-contract
+workflow has run cleanly.
 
 ## Tests
 

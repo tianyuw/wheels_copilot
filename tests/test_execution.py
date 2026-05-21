@@ -200,7 +200,7 @@ class ExecutionTests(unittest.TestCase):
             client=client,
         )
 
-        self.assertEqual(result["summary"], {"ERROR": 1})
+        self.assertEqual(result["summary"], {"SUBMIT_ERROR": 1})
         self.assertIn("network error", result["orders"][0]["error"])
 
     def test_unexpected_broker_status_is_error(self):
