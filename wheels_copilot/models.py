@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 
@@ -83,6 +83,9 @@ class OptionQuote:
     open_interest: int | None = None
     volume: int | None = None
     delta: float | None = None
+    quote_timestamp: datetime | None = None
+    trade_timestamp: datetime | None = None
+    data_feed: str | None = None
 
     @property
     def mid(self) -> float:

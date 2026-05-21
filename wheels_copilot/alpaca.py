@@ -17,6 +17,7 @@ from .models import (
 
 
 DEFAULT_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+DEFAULT_DATA_BASE_URL = "https://data.alpaca.markets"
 OPEN_ORDER_LIMIT = 500
 OCC_TAIL_RE = re.compile(r"^(?P<date>\d{6})(?P<type>[CP])(?P<strike>\d{8})$")
 
@@ -129,7 +130,197 @@ class AlpacaTradingClient:
                 + (f" request_id={request_id}" if request_id else "")
             ) from exc
         except error.URLError as exc:
-            raise AlpacaRequestError(f"Alpaca GET {path} failed: {exc.reason}") from exc
+            raise AlpacaRequestError(f"Alpaca GET {path} failed due to network error") from exc
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise AlpacaRequestError(f"Alpaca GET {path} returned invalid JSON") from exc
+
+
+class AlpacaMarketDataClient:
+    def __init__(
+        self,
+        api_key: str,
+        secret_key: str,
+        data_base_url: str = DEFAULT_DATA_BASE_URL,
+        trading_base_url: str = DEFAULT_PAPER_BASE_URL,
+        stock_feed: str = "sip",
+        option_feed: str = "opra",
+        timeout: float = 20.0,
+        opener=request.urlopen,
+    ) -> None:
+        if not api_key or not secret_key:
+            raise AlpacaConfigError("missing Alpaca API credentials")
+        stock_feed = stock_feed.lower()
+        option_feed = option_feed.lower()
+        if stock_feed != "sip":
+            raise AlpacaConfigError("Alpaca stock price feed must be sip")
+        if option_feed != "opra":
+            raise AlpacaConfigError("Alpaca option price feed must be opra")
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.data_base_url = data_base_url.rstrip("/")
+        self.trading_base_url = trading_base_url.rstrip("/")
+        self.stock_feed = stock_feed
+        self.option_feed = option_feed
+        self.timeout = timeout
+        self.opener = opener
+
+    @classmethod
+    def from_config(
+        cls,
+        config: dict[str, Any],
+        env: dict[str, str] | None = None,
+    ) -> AlpacaMarketDataClient:
+        env = _merged_env(env)
+        cfg = config.get("alpaca", {})
+        api_key_env = str(cfg.get("api_key_env") or "ALPACA_API_KEY")
+        secret_key_env = str(cfg.get("secret_key_env") or "ALPACA_SECRET_KEY")
+        api_key = env.get(api_key_env) or env.get("APCA_API_KEY_ID")
+        secret_key = env.get(secret_key_env) or env.get("APCA_API_SECRET_KEY")
+        timeout = float(cfg.get("request_timeout_seconds") or 20.0)
+        return cls(
+            api_key=api_key or "",
+            secret_key=secret_key or "",
+            data_base_url=str(cfg.get("data_base_url") or DEFAULT_DATA_BASE_URL),
+            trading_base_url=str(cfg.get("paper_base_url") or DEFAULT_PAPER_BASE_URL),
+            stock_feed=str(cfg.get("stock_feed") or "sip"),
+            option_feed=str(cfg.get("option_feed") or "opra"),
+            timeout=timeout,
+        )
+
+    def fetch_stock_bars(
+        self,
+        symbol: str,
+        *,
+        timeframe: str,
+        start: str,
+        end: str | None = None,
+        adjustment: str = "raw",
+        limit: int = 10000,
+    ) -> list[dict[str, Any]]:
+        query = {
+            "symbols": symbol.upper(),
+            "timeframe": timeframe,
+            "start": start,
+            "adjustment": adjustment,
+            "feed": self.stock_feed,
+            "limit": str(limit),
+        }
+        if end:
+            query["end"] = end
+        bars: list[dict[str, Any]] = []
+        page_token = None
+        while True:
+            page_query = dict(query)
+            if page_token:
+                page_query["page_token"] = page_token
+            payload = self._get_data_json("/v2/stocks/bars", page_query)
+            bars.extend((payload.get("bars") or {}).get(symbol.upper()) or [])
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                return bars
+
+    def fetch_option_contracts(
+        self,
+        underlying_symbol: str,
+        *,
+        option_type: str,
+        expiration_date_gte: date,
+        expiration_date_lte: date,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        query = {
+            "underlying_symbols": underlying_symbol.upper(),
+            "type": option_type,
+            "status": "active",
+            "expiration_date_gte": expiration_date_gte.isoformat(),
+            "expiration_date_lte": expiration_date_lte.isoformat(),
+            "limit": str(limit),
+        }
+        contracts: list[dict[str, Any]] = []
+        page_token = None
+        while True:
+            page_query = dict(query)
+            if page_token:
+                page_query["page_token"] = page_token
+            payload = self._get_trading_json("/v2/options/contracts", page_query)
+            contracts.extend(payload.get("option_contracts") or [])
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                return contracts
+
+    def fetch_option_snapshots(
+        self,
+        symbols: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        if not symbols:
+            return {}
+        snapshots: dict[str, dict[str, Any]] = {}
+        query = {"symbols": ",".join(symbols), "feed": self.option_feed}
+        page_token = None
+        while True:
+            page_query = dict(query)
+            if page_token:
+                page_query["page_token"] = page_token
+            payload = self._get_data_json("/v1beta1/options/snapshots", page_query)
+            if "snapshots" in payload:
+                snapshots.update(payload.get("snapshots") or {})
+            else:
+                snapshots.update(
+                    {
+                        key: value
+                        for key, value in payload.items()
+                        if isinstance(value, dict)
+                    }
+                )
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                return snapshots
+
+    def _get_data_json(
+        self,
+        path: str,
+        query: dict[str, str] | None = None,
+    ) -> Any:
+        return self._get_json(self.data_base_url, path, query)
+
+    def _get_trading_json(
+        self,
+        path: str,
+        query: dict[str, str] | None = None,
+    ) -> Any:
+        return self._get_json(self.trading_base_url, path, query)
+
+    def _get_json(
+        self,
+        base_url: str,
+        path: str,
+        query: dict[str, str] | None = None,
+    ) -> Any:
+        url = base_url + path
+        if query:
+            url += "?" + parse.urlencode(query)
+        req = request.Request(
+            url,
+            method="GET",
+            headers={
+                "APCA-API-KEY-ID": self.api_key,
+                "APCA-API-SECRET-KEY": self.secret_key,
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with self.opener(req, timeout=self.timeout) as response:
+                body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            request_id = exc.headers.get("X-Request-ID") if exc.headers else None
+            raise AlpacaRequestError(
+                f"Alpaca GET {path} failed with HTTP {exc.code}"
+                + (f" request_id={request_id}" if request_id else "")
+            ) from exc
+        except error.URLError as exc:
+            raise AlpacaRequestError(f"Alpaca GET {path} failed due to network error") from exc
         try:
             return json.loads(body)
         except json.JSONDecodeError as exc:

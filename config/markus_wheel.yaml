@@ -10,9 +10,15 @@ account:
 
 alpaca:
   paper_base_url: https://paper-api.alpaca.markets
+  data_base_url: https://data.alpaca.markets
+  stock_feed: sip
+  option_feed: opra
   api_key_env: ALPACA_API_KEY
   secret_key_env: ALPACA_SECRET_KEY
   request_timeout_seconds: 20
+
+market_data:
+  max_option_quote_age_seconds: 30
 
 watchlist:
   tickers:

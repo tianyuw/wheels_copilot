@@ -1,22 +1,35 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+import calendar
+from datetime import date, datetime, timedelta, timezone
 import logging
 import re
+from typing import Any
 
 import pandas as pd
 import yfinance as yf
 
+from .alpaca import AlpacaMarketDataClient
 from .models import FundamentalSnapshot, OptionQuote, PriceBar
 
 logger = logging.getLogger(__name__)
 
 
-def fetch_daily_bars(ticker: str, period: str = "1y") -> list[PriceBar]:
-    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
-    if df.empty:
-        return []
-    return _bars_from_frame(df)
+def fetch_daily_bars(
+    ticker: str,
+    period: str = "1y",
+    config: dict[str, Any] | None = None,
+    client: AlpacaMarketDataClient | None = None,
+) -> list[PriceBar]:
+    client = client or AlpacaMarketDataClient.from_config(config or {})
+    start = _period_start(period, date.today())
+    payload = client.fetch_stock_bars(
+        ticker,
+        timeframe="1Day",
+        start=_rfc3339_start(start),
+        adjustment="raw",
+    )
+    return _bars_from_alpaca(payload)
 
 
 def fetch_fundamental_snapshot(
@@ -60,40 +73,58 @@ def fetch_put_chain(
     dte_min: int,
     dte_max: int,
     as_of: date | None = None,
+    config: dict[str, Any] | None = None,
+    client: AlpacaMarketDataClient | None = None,
 ) -> list[OptionQuote]:
     as_of = as_of or date.today()
-    tk = yf.Ticker(ticker)
-    expirations = []
-    for raw in tk.options:
-        exp = datetime.strptime(raw, "%Y-%m-%d").date()
-        dte = (exp - as_of).days
-        if dte_min <= dte <= dte_max:
-            expirations.append((exp, dte, raw))
-    if not expirations:
+    client = client or AlpacaMarketDataClient.from_config(config or {})
+    max_quote_age_seconds = _max_option_quote_age_seconds(config)
+    contracts = client.fetch_option_contracts(
+        ticker,
+        option_type="put",
+        expiration_date_gte=as_of + timedelta(days=dte_min),
+        expiration_date_lte=as_of + timedelta(days=dte_max),
+    )
+    contracts = [
+        contract
+        for contract in contracts
+        if _str_or_none(contract.get("symbol"))
+        and str(contract.get("type") or "").lower() == "put"
+        and contract.get("tradable") is not False
+    ]
+    if not contracts:
         return []
     options: list[OptionQuote] = []
-    for exp, dte, raw in sorted(expirations, key=lambda item: item[1]):
-        try:
-            chain = tk.option_chain(raw).puts
-        except Exception as exc:
-            logger.warning("Failed to fetch %s option chain %s: %s", ticker, raw, exc)
-            continue
-        options.extend(_puts_from_frame(chain, exp, dte))
+    snapshot_by_symbol: dict[str, dict[str, Any]] = {}
+    for chunk in _chunks([str(c["symbol"]) for c in contracts], 100):
+        snapshot_by_symbol.update(client.fetch_option_snapshots(chunk))
+    for contract in sorted(contracts, key=_contract_sort_key):
+        option = _option_from_alpaca_contract(
+            contract,
+            snapshot_by_symbol.get(str(contract["symbol"])) or {},
+            as_of,
+            client.option_feed,
+            max_quote_age_seconds,
+        )
+        if option:
+            options.append(option)
     return options
 
 
-def _bars_from_frame(df: pd.DataFrame) -> list[PriceBar]:
+def _bars_from_alpaca(payload: list[dict[str, Any]]) -> list[PriceBar]:
     bars: list[PriceBar] = []
-    for idx, row in df.iterrows():
-        d = idx.date() if hasattr(idx, "date") else datetime.strptime(str(idx)[:10], "%Y-%m-%d").date()
+    for row in payload:
+        bar_date = _date_from_timestamp(row.get("t"))
+        if bar_date is None:
+            continue
         bars.append(
             PriceBar(
-                date=d,
-                open=float(row["Open"]),
-                high=float(row["High"]),
-                low=float(row["Low"]),
-                close=float(row["Close"]),
-                volume=float(row.get("Volume", 0) or 0),
+                date=bar_date,
+                open=_num(row.get("o")),
+                high=_num(row.get("h")),
+                low=_num(row.get("l")),
+                close=_num(row.get("c")),
+                volume=_num(row.get("v")),
             )
         )
     return bars
@@ -265,30 +296,125 @@ def _recent_move_pct(bars: list[PriceBar], lookback: int = 60) -> float | None:
     return (peak - baseline) / baseline * 100.0
 
 
-def _puts_from_frame(df: pd.DataFrame, expiration: date, dte: int) -> list[OptionQuote]:
-    options: list[OptionQuote] = []
-    for _, row in df.iterrows():
-        bid = _num(row.get("bid"))
-        ask = _num(row.get("ask"))
-        last = _num(row.get("lastPrice"))
-        strike = _num(row.get("strike"))
-        if strike <= 0:
-            continue
-        options.append(
-            OptionQuote(
-                symbol=str(row.get("contractSymbol") or ""),
-                expiration=expiration,
-                dte=dte,
-                strike=strike,
-                bid=bid,
-                ask=ask,
-                last=last,
-                implied_volatility=_positive_num(row.get("impliedVolatility")),
-                open_interest=_nullable_int(row.get("openInterest")),
-                volume=_nullable_int(row.get("volume")),
+def _option_from_alpaca_contract(
+    contract: dict[str, Any],
+    snapshot: dict[str, Any],
+    as_of: date,
+    feed: str,
+    max_quote_age_seconds: int | None = None,
+) -> OptionQuote | None:
+    symbol = str(contract.get("symbol") or "").upper()
+    expiration = _date_from_iso(contract.get("expiration_date"))
+    strike = _positive_num(contract.get("strike_price"))
+    if not symbol or expiration is None or strike is None:
+        return None
+    quote = _snapshot_child(snapshot, "latestQuote")
+    trade = _snapshot_child(snapshot, "latestTrade")
+    greeks = snapshot.get("greeks") or {}
+    daily_bar = _snapshot_child(snapshot, "dailyBar")
+    bid = _num(quote.get("bp"))
+    ask = _num(quote.get("ap"))
+    quote_timestamp = _datetime_from_timestamp(quote.get("t"))
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    if max_quote_age_seconds is not None:
+        if quote_timestamp is None:
+            return None
+        age_seconds = (datetime.now(timezone.utc) - quote_timestamp).total_seconds()
+        if age_seconds > max_quote_age_seconds:
+            return None
+    return OptionQuote(
+        symbol=symbol,
+        expiration=expiration,
+        dte=(expiration - as_of).days,
+        strike=strike,
+        bid=bid,
+        ask=ask,
+        last=_num(trade.get("p")),
+        implied_volatility=_positive_num(
+            _first_present(
+                snapshot.get("impliedVolatility"),
+                snapshot.get("implied_volatility"),
             )
-        )
-    return options
+        ),
+        open_interest=_nullable_int(
+            _first_present(contract.get("open_interest"), snapshot.get("openInterest"))
+        ),
+        volume=_nullable_int(_first_present(daily_bar.get("v"), snapshot.get("volume"))),
+        delta=_nullable_num(greeks.get("delta")),
+        quote_timestamp=quote_timestamp,
+        trade_timestamp=_datetime_from_timestamp(trade.get("t")),
+        data_feed=feed,
+    )
+
+
+def _snapshot_child(snapshot: dict[str, Any], camel_name: str) -> dict[str, Any]:
+    snake_name = re.sub(r"(?<!^)([A-Z])", r"_\1", camel_name).lower()
+    value = snapshot.get(camel_name) or snapshot.get(snake_name) or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _contract_sort_key(contract: dict[str, Any]) -> tuple[date, float, str]:
+    expiration = _date_from_iso(contract.get("expiration_date")) or date.max
+    return (
+        expiration,
+        _num(contract.get("strike_price")),
+        str(contract.get("symbol") or ""),
+    )
+
+
+def _chunks(values: list[str], size: int):
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def _period_start(period: str, today: date) -> date:
+    text = period.strip().lower()
+    match = re.fullmatch(r"(\d+)(d|mo|y)", text)
+    if not match:
+        raise ValueError(f"unsupported period: {period}")
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit == "d":
+        return today - timedelta(days=amount)
+    if unit == "mo":
+        return _subtract_months(today, amount)
+    return _subtract_months(today, amount * 12)
+
+
+def _subtract_months(day: date, months: int) -> date:
+    zero_based_month = day.month - 1 - months
+    year = day.year + zero_based_month // 12
+    month = zero_based_month % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(day.day, last_day))
+
+
+def _rfc3339_start(day: date) -> str:
+    return datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc).isoformat()
+
+
+def _date_from_iso(value) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _date_from_timestamp(value) -> date | None:
+    parsed = _datetime_from_timestamp(value)
+    return parsed.date() if parsed else None
+
+
+def _datetime_from_timestamp(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _num(value) -> float:
@@ -328,6 +454,27 @@ def _nullable_int(value) -> int | None:
         return int(value)
     except Exception:
         return None
+
+
+def _first_present(*values):
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _max_option_quote_age_seconds(config: dict[str, Any] | None) -> int | None:
+    if not config:
+        return None
+    market_data_cfg = config.get("market_data") or {}
+    value = market_data_cfg.get("max_option_quote_age_seconds")
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _str_or_none(value) -> str | None:

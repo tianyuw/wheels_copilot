@@ -6,7 +6,7 @@ Current implementation scope:
 
 - TradingView-style support-zone engine.
 - Dynamic CSP delta policy based on support strength.
-- Yahoo Finance market-data adapter for dry runs.
+- Alpaca SIP/OPRA market-data adapter for stock bars and option quotes.
 - Markus fundamental quality gate.
 - Earnings gate that keeps CSP expirations before the next earnings date.
 - CSP candidate selector.
@@ -18,8 +18,12 @@ is an auditable dry-run artifact only.
 Covered-call selection, assignment lifecycle, persistence, and Alpaca order
 submission are not implemented yet.
 
-The current Yahoo Finance option-chain adapter is for research dry runs only.
-Broker-grade quotes are required before Alpaca paper execution.
+All stock and option price data is fetched from Alpaca. The scan fails closed
+unless the stock feed is `sip` and the option feed is `opra`; it does not
+fallback to delayed or indicative feeds. Option quotes must have a valid
+positive bid/ask and must be no older than `market_data.max_option_quote_age_seconds`.
+Yahoo Finance is retained only for fundamental fields that Alpaca does not
+provide, such as profitability history, P/E, dividend yield, and earnings date.
 
 ## Dry Run
 
@@ -40,10 +44,10 @@ python3 scripts/scan_watchlist.py --with-alpaca
 perform a historical market-data replay; the current Yahoo Finance bars and
 option chains are still fetched.
 
-`--with-alpaca` performs read-only calls against the Alpaca paper Trading API
-for account, positions, and open orders, then applies portfolio risk gates. It
-requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in the environment or local
-`.env`. It does not submit or cancel orders.
+The scan requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in the environment or
+local `.env` for Alpaca market data. `--with-alpaca` also performs read-only
+calls against the Alpaca paper Trading API for account, positions, and open
+orders, then applies portfolio risk gates. It does not submit or cancel orders.
 
 Default output:
 

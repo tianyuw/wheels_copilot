@@ -86,7 +86,7 @@ def scan_ticker(
     as_of = as_of or date.today()
     ticker = ticker.strip().upper()
     try:
-        bars = fetch_daily_bars(ticker, period=period)
+        bars = fetch_daily_bars(ticker, period=period, config=config)
         if not bars:
             return _error_payload(ticker, "no_daily_bars")
         fundamental_snapshot = fetch_fundamental_snapshot(ticker, bars=bars, as_of=as_of)
@@ -109,6 +109,7 @@ def scan_ticker(
             int(config["csp_selector"]["dte_min"]),
             int(config["csp_selector"]["dte_max"]),
             as_of=as_of,
+            config=config,
         )
         earnings_gate, earnings_allowed_options = evaluate_earnings_gate(
             fundamental_snapshot, options, as_of=as_of

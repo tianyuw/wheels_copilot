@@ -4,8 +4,15 @@ import json
 import unittest
 from datetime import date
 from io import BytesIO
+from urllib.parse import parse_qs, urlparse
 
-from wheels_copilot.alpaca import AlpacaRequestError, AlpacaTradingClient, parse_occ_option_symbol
+from wheels_copilot.alpaca import (
+    AlpacaConfigError,
+    AlpacaMarketDataClient,
+    AlpacaRequestError,
+    AlpacaTradingClient,
+    parse_occ_option_symbol,
+)
 
 
 class AlpacaAdapterTests(unittest.TestCase):
@@ -154,6 +161,101 @@ class AlpacaAdapterTests(unittest.TestCase):
 
         with self.assertRaises(AlpacaRequestError):
             client.fetch_portfolio_snapshot()
+
+    def test_market_data_client_requires_realtime_feeds(self):
+        with self.assertRaises(AlpacaConfigError):
+            AlpacaMarketDataClient("key", "secret", stock_feed="iex", option_feed="opra")
+        with self.assertRaises(AlpacaConfigError):
+            AlpacaMarketDataClient("key", "secret", stock_feed="sip", option_feed="indicative")
+
+    def test_market_data_client_fetches_sip_bars_and_opra_snapshots(self):
+        calls = []
+
+        def fake_open(req, timeout):
+            calls.append(req.full_url)
+            if "/v2/stocks/bars?" in req.full_url:
+                self.assertIn("feed=sip", req.full_url)
+                return _Response({"bars": {"AAPL": [{"t": "2026-05-20T04:00:00Z", "c": 1}]}})
+            if "/v2/options/contracts?" in req.full_url:
+                return _Response(
+                    {
+                        "option_contracts": [
+                            {"symbol": "AAPL260522P00275000", "expiration_date": "2026-05-22"}
+                        ]
+                    }
+                )
+            if "/v1beta1/options/snapshots?" in req.full_url:
+                self.assertIn("feed=opra", req.full_url)
+                return _Response({"snapshots": {"AAPL260522P00275000": {}}})
+            raise AssertionError(req.full_url)
+
+        client = AlpacaMarketDataClient("key", "secret", opener=fake_open)
+
+        bars = client.fetch_stock_bars(
+            "AAPL",
+            timeframe="1Day",
+            start="2026-05-20T00:00:00+00:00",
+        )
+        contracts = client.fetch_option_contracts(
+            "AAPL",
+            option_type="put",
+            expiration_date_gte=date(2026, 5, 21),
+            expiration_date_lte=date(2026, 5, 29),
+        )
+        snapshots = client.fetch_option_snapshots(["AAPL260522P00275000"])
+
+        self.assertEqual(bars, [{"t": "2026-05-20T04:00:00Z", "c": 1}])
+        self.assertEqual(contracts[0]["symbol"], "AAPL260522P00275000")
+        self.assertEqual(snapshots, {"AAPL260522P00275000": {}})
+        self.assertEqual(len(calls), 3)
+
+    def test_market_data_client_paginates_and_preserves_empty_snapshots(self):
+        def fake_open(req, timeout):
+            parsed = urlparse(req.full_url)
+            query = parse_qs(parsed.query)
+            page_token = query.get("page_token", [None])[0]
+            if parsed.path == "/v2/stocks/bars":
+                if page_token is None:
+                    return _Response(
+                        {
+                            "bars": {"AAPL": [{"t": "2026-05-20T04:00:00Z"}]},
+                            "next_page_token": "bars-page-2",
+                        }
+                    )
+                return _Response({"bars": {"AAPL": [{"t": "2026-05-21T04:00:00Z"}]}})
+            if parsed.path == "/v2/options/contracts":
+                if page_token is None:
+                    return _Response(
+                        {
+                            "option_contracts": [{"symbol": "AAPL260522P00275000"}],
+                            "next_page_token": "contracts-page-2",
+                        }
+                    )
+                return _Response(
+                    {"option_contracts": [{"symbol": "AAPL260529P00270000"}]}
+                )
+            if parsed.path == "/v1beta1/options/snapshots":
+                return _Response({"snapshots": {}})
+            raise AssertionError(req.full_url)
+
+        client = AlpacaMarketDataClient("key", "secret", opener=fake_open)
+
+        bars = client.fetch_stock_bars(
+            "AAPL",
+            timeframe="1Day",
+            start="2026-05-20T00:00:00+00:00",
+        )
+        contracts = client.fetch_option_contracts(
+            "AAPL",
+            option_type="put",
+            expiration_date_gte=date(2026, 5, 21),
+            expiration_date_lte=date(2026, 5, 29),
+        )
+        snapshots = client.fetch_option_snapshots(["AAPL260522P00275000"])
+
+        self.assertEqual(len(bars), 2)
+        self.assertEqual([c["symbol"] for c in contracts], ["AAPL260522P00275000", "AAPL260529P00270000"])
+        self.assertEqual(snapshots, {})
 
 
 class _Response:
