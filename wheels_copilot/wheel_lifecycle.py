@@ -83,13 +83,24 @@ def _ticker_lifecycle(
     )
     short_call_contracts = _abs_contracts(short_call_positions)
     open_sell_call_contracts = _order_contracts(open_sell_call_orders)
-    covered_contracts = short_call_contracts + open_sell_call_contracts
+    ledger_open_short_call_contracts = _ledger_open_contracts(
+        ticker,
+        ledger_rows,
+        "call",
+    )
+    effective_short_call_contracts = max(
+        short_call_contracts,
+        ledger_open_short_call_contracts,
+    )
+    covered_contracts = (
+        effective_short_call_contracts + open_sell_call_contracts
+    )
     available_shares_for_cc = max(0.0, long_shares - covered_contracts * 100.0)
     state = _wheel_state(
         long_shares=long_shares,
         short_put_contracts=_abs_contracts(short_put_positions),
         open_sell_put_contracts=_order_contracts(open_sell_put_orders),
-        short_call_contracts=short_call_contracts,
+        short_call_contracts=effective_short_call_contracts,
         open_sell_call_contracts=open_sell_call_contracts,
     )
     return {
@@ -106,6 +117,9 @@ def _ticker_lifecycle(
             _order_contracts(open_sell_put_orders)
         ),
         "open_short_call_contracts": _round_or_none(short_call_contracts),
+        "ledger_open_short_call_contracts": _round_or_none(
+            ledger_open_short_call_contracts
+        ),
         "open_sell_call_order_contracts": _round_or_none(open_sell_call_contracts),
         "stock_positions": [_position_summary(position) for position in stock_positions],
         "short_put_positions": [
@@ -121,6 +135,7 @@ def _ticker_lifecycle(
             long_shares=long_shares,
             adjusted_cost_basis=adjusted_cost_basis,
             available_shares_for_cc=available_shares_for_cc,
+            ledger_open_short_call_contracts=ledger_open_short_call_contracts,
             ledger_context=ledger_context,
         ),
     }
@@ -195,6 +210,7 @@ def _ledger_context(
 ) -> dict[str, Any]:
     csp_credit = 0.0
     cc_credit = 0.0
+    called_away_cc_credit = 0.0
     unattributed_csp_credit = 0.0
     assignment_strikes = []
     csp_contracts = 0.0
@@ -219,6 +235,9 @@ def _ledger_context(
             else:
                 unattributed_csp_credit += entry_price * qty * 100.0
         elif option_type == "call":
+            if status == "CALLED_AWAY":
+                called_away_cc_credit += entry_price * qty * 100.0
+                continue
             cc_credit += entry_price * qty * 100.0
             cc_contracts += qty
     share_denominator = max(csp_contracts * 100.0, 100.0) if csp_contracts else 100.0
@@ -237,6 +256,7 @@ def _ledger_context(
             else "none"
         ),
         "cc_credit_total": round(cc_credit, 2),
+        "called_away_cc_credit_total": round(called_away_cc_credit, 2),
         "cc_credit_per_share": round(cc_credit / call_share_denominator, 4)
         if cc_credit
         else 0.0,
@@ -262,6 +282,23 @@ def _adjusted_cost_basis(
     )
 
 
+def _ledger_open_contracts(
+    ticker: str,
+    ledger_rows: list[Mapping[str, Any]],
+    option_type: str,
+) -> float:
+    total = 0.0
+    for row in ledger_rows:
+        row_ticker = _str_or_none(_row_get(row, "ticker"))
+        if not row_ticker or row_ticker.upper() != ticker:
+            continue
+        row_option_type = (_str_or_none(_row_get(row, "option_type")) or "").lower()
+        status = (_str_or_none(_row_get(row, "status")) or "").upper()
+        if row_option_type == option_type and status == "OPEN":
+            total += abs(_num(_row_get(row, "qty")) or 0.0)
+    return total
+
+
 def _abs_contracts(positions: list[BrokerPosition]) -> float:
     return sum(abs(position.qty) for position in positions)
 
@@ -276,6 +313,7 @@ def _state_reasons(
     long_shares: float,
     adjusted_cost_basis: float | None,
     available_shares_for_cc: float,
+    ledger_open_short_call_contracts: float,
     ledger_context: dict[str, Any],
 ) -> list[str]:
     if state == "ASSIGNED":
@@ -289,6 +327,8 @@ def _state_reasons(
         return reasons
     if state == "CC_OPEN":
         reasons = ["long_stock_already_covered_by_call"]
+        if ledger_open_short_call_contracts > 0:
+            reasons.append("ledger_open_short_call_reconciliation_required")
         if available_shares_for_cc >= 100:
             reasons.append("additional_uncovered_share_lot_detected")
         return reasons

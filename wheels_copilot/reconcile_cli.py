@@ -11,7 +11,7 @@ from .oms import reconcile_orders
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Reconcile Wheels Copilot OMS orders against Alpaca paper"
+        description="Reconcile Wheels Copilot OMS orders and positions against Alpaca paper"
     )
     parser.add_argument("--config", default="config/markus_wheel.yaml")
     parser.add_argument(
@@ -48,4 +48,4 @@ def main(argv: list[str] | None = None) -> int:
         if args.output:
             print(f"reconciliation_results: {args.output}")
         print(f"Summary: {result['summary']}")
-    return 0
+    return 1 if result.get("errors") else 0

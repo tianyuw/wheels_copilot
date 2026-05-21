@@ -101,6 +101,42 @@ class WheelLifecycleTests(unittest.TestCase):
         )
         self.assertIn("csp_credit_attribution_unavailable", position["reasons"])
 
+    def test_called_away_call_credit_does_not_reduce_remaining_stock_basis(self):
+        portfolio = PortfolioSnapshot(
+            account=BrokerAccountSnapshot(status="ACTIVE", equity=500000, cash=490000),
+            positions=[
+                BrokerPosition(
+                    symbol="AAPL",
+                    qty=100,
+                    asset_class="us_equity",
+                    market_value=10000,
+                    cost_basis=9000,
+                )
+            ],
+            open_orders=[],
+            source="test",
+        )
+        lifecycle = build_wheel_lifecycle_snapshot(
+            portfolio,
+            ledger_positions=[
+                {
+                    "ticker": "AAPL",
+                    "symbol": "AAPL260529C00095000",
+                    "option_type": "call",
+                    "strike": 95,
+                    "qty": 1,
+                    "entry_price": 2.0,
+                    "status": "CALLED_AWAY",
+                }
+            ],
+            as_of=date(2026, 5, 30),
+        )
+
+        position = lifecycle["positions"][0]
+        self.assertEqual(position["adjusted_cost_basis"], 90)
+        self.assertEqual(position["premium_context"]["cc_credit_total"], 0)
+        self.assertEqual(position["premium_context"]["called_away_cc_credit_total"], 200)
+
     def test_open_call_marks_assigned_stock_as_cc_open(self):
         portfolio = PortfolioSnapshot(
             account=BrokerAccountSnapshot(status="ACTIVE", equity=500000, cash=490000),
@@ -136,6 +172,44 @@ class WheelLifecycleTests(unittest.TestCase):
         self.assertEqual(position["state"], "CC_OPEN")
         self.assertFalse(position["covered_call_eligible"])
         self.assertEqual(position["available_shares_for_cc"], 0)
+
+    def test_unresolved_ledger_call_blocks_new_covered_call(self):
+        portfolio = PortfolioSnapshot(
+            account=BrokerAccountSnapshot(status="ACTIVE", equity=500000, cash=490000),
+            positions=[
+                BrokerPosition(
+                    symbol="AAPL",
+                    qty=100,
+                    asset_class="us_equity",
+                    market_value=10000,
+                    cost_basis=9000,
+                )
+            ],
+            open_orders=[],
+            source="test",
+        )
+
+        lifecycle = build_wheel_lifecycle_snapshot(
+            portfolio,
+            ledger_positions=[
+                {
+                    "ticker": "AAPL",
+                    "symbol": "AAPL260529C00095000",
+                    "option_type": "call",
+                    "strike": 95,
+                    "qty": 1,
+                    "entry_price": 1.0,
+                    "status": "OPEN",
+                }
+            ],
+            as_of=date(2026, 5, 21),
+        )
+
+        position = lifecycle["positions"][0]
+        self.assertEqual(position["state"], "CC_OPEN")
+        self.assertFalse(position["covered_call_eligible"])
+        self.assertEqual(position["ledger_open_short_call_contracts"], 1)
+        self.assertIn("ledger_open_short_call_reconciliation_required", position["reasons"])
 
     def test_partially_covered_stock_remains_eligible_for_uncovered_lot(self):
         portfolio = PortfolioSnapshot(
