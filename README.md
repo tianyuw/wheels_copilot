@@ -7,8 +7,10 @@ Current implementation scope:
 - TradingView-style support-zone engine.
 - Dynamic CSP delta policy based on support strength.
 - Yahoo Finance market-data adapter for dry runs.
+- Markus fundamental quality gate.
+- Earnings gate that keeps CSP expirations before the next earnings date.
 - CSP candidate selector.
-- Unit tests for support scoring and delta policy.
+- Unit tests for support scoring, delta policy, fundamentals, and earnings.
 
 No live or paper orders are submitted by the current code.
 Covered-call selection, assignment lifecycle, persistence, and Alpaca order

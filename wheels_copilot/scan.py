@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from .csp_selector import evaluate_csp_candidates
-from .market_data import fetch_daily_bars, fetch_put_chain
+from .gates import evaluate_earnings_gate, evaluate_fundamentals
+from .market_data import fetch_daily_bars, fetch_fundamental_snapshot, fetch_put_chain
+from .models import GateResult
 from .support import analyze_support
 
 
@@ -68,6 +70,17 @@ def scan_ticker(
         bars = fetch_daily_bars(ticker, period=period)
         if not bars:
             return _error_payload(ticker, "no_daily_bars")
+        fundamental_snapshot = fetch_fundamental_snapshot(ticker, bars=bars, as_of=as_of)
+        fundamental_gate = evaluate_fundamentals(fundamental_snapshot, config)
+        if fundamental_gate.status == "REJECT":
+            return _gate_reject_payload(
+                ticker=ticker,
+                current_price=bars[-1].close,
+                fundamental_snapshot=fundamental_snapshot,
+                fundamental_gate=fundamental_gate,
+                earnings_gate=None,
+                status_reason="fundamental gate rejected",
+            )
 
         support = analyze_support(bars, config)
         options = fetch_put_chain(
@@ -76,8 +89,34 @@ def scan_ticker(
             int(config["csp_selector"]["dte_max"]),
             as_of=as_of,
         )
-        selection = evaluate_csp_candidates(options, support, config)
-        payload = _payload(ticker, support, selection, len(options))
+        earnings_gate, earnings_allowed_options = evaluate_earnings_gate(
+            fundamental_snapshot, options, as_of=as_of
+        )
+        if earnings_gate.status == "REJECT":
+            payload = _payload(
+                ticker,
+                support,
+                evaluate_csp_candidates([], support, config),
+                len(options),
+                fundamental_snapshot=fundamental_snapshot,
+                fundamental_gate=fundamental_gate,
+                earnings_gate=earnings_gate,
+                earnings_filtered_option_count=0,
+            )
+            payload["status"] = "REJECT"
+            payload["status_reason"] = "earnings gate rejected"
+            return payload
+        selection = evaluate_csp_candidates(earnings_allowed_options, support, config)
+        payload = _payload(
+            ticker,
+            support,
+            selection,
+            len(options),
+            fundamental_snapshot=fundamental_snapshot,
+            fundamental_gate=fundamental_gate,
+            earnings_gate=earnings_gate,
+            earnings_filtered_option_count=len(earnings_allowed_options),
+        )
         payload["status"] = classify_scan_result(payload)
         payload["status_reason"] = _status_reason(payload)
         return payload
@@ -88,8 +127,10 @@ def scan_ticker(
 def classify_scan_result(payload: dict[str, Any]) -> str:
     if payload.get("error"):
         return "ERROR"
+    if _gate_rejected(payload):
+        return "REJECT"
     candidate = payload.get("candidate")
-    if candidate and candidate.get("auto_trade"):
+    if candidate and candidate.get("auto_trade") and not payload.get("manual_review_required"):
         return "AUTO_TRADE"
     if candidate:
         return "WATCH"
@@ -130,8 +171,8 @@ def render_markdown_report(scan: dict[str, Any]) -> str:
         f"- Tickers: `{scan['ticker_count']}`",
         f"- Summary: `{scan['summary']}`",
         "",
-        "| Status | Ticker | Price | Support Score | Support Zone | CSP Candidate | Rejection Summary |",
-        "|---|---:|---:|---:|---|---|---|",
+        "| Status | Ticker | Price | Fundamental | Earnings | Support Score | CSP Candidate | Rejection Summary |",
+        "|---|---:|---:|---|---|---:|---|---|",
     ]
     for row in scan["results"]:
         lines.append(_markdown_table_row(row))
@@ -142,7 +183,16 @@ def render_markdown_report(scan: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _payload(ticker: str, support, selection, option_count: int) -> dict[str, Any]:
+def _payload(
+    ticker: str,
+    support,
+    selection,
+    option_count: int,
+    fundamental_snapshot=None,
+    fundamental_gate: GateResult | None = None,
+    earnings_gate: GateResult | None = None,
+    earnings_filtered_option_count: int | None = None,
+) -> dict[str, Any]:
     selected = support.selected_zone
     candidate = selection.candidate
     candidate_payload = None
@@ -165,9 +215,14 @@ def _payload(ticker: str, support, selection, option_count: int) -> dict[str, An
         "selected_support": selected_payload,
         "top_support_zones": [asdict(z) for z in support.zones[:5]],
         "option_count": option_count,
+        "earnings_filtered_option_count": earnings_filtered_option_count,
         "candidate": candidate_payload,
         "csp_policy": selection.policy_name,
         "rejection_summary": selection.rejection_summary,
+        "fundamental_snapshot": asdict(fundamental_snapshot) if fundamental_snapshot else None,
+        "fundamental_gate": asdict(fundamental_gate) if fundamental_gate else None,
+        "earnings_gate": asdict(earnings_gate) if earnings_gate else None,
+        "manual_review_required": _manual_review_required(fundamental_gate, earnings_gate),
         "reasons": support.reasons,
         "error": None,
     }
@@ -187,9 +242,14 @@ def _error_payload(ticker: str, error: str) -> dict[str, Any]:
         "selected_support": None,
         "top_support_zones": [],
         "option_count": 0,
+        "earnings_filtered_option_count": None,
         "candidate": None,
         "csp_policy": None,
         "rejection_summary": {},
+        "fundamental_snapshot": None,
+        "fundamental_gate": None,
+        "earnings_gate": None,
+        "manual_review_required": False,
         "reasons": [],
         "error": error,
     }
@@ -198,9 +258,13 @@ def _error_payload(ticker: str, error: str) -> dict[str, Any]:
 def _status_reason(payload: dict[str, Any]) -> str:
     if payload.get("error"):
         return payload["error"]
+    if _gate_rejected(payload):
+        return _gate_reason(payload)
     candidate = payload.get("candidate")
     if candidate and candidate.get("auto_trade"):
         option = candidate["option"]
+        if payload.get("manual_review_required"):
+            return "candidate found but gates require manual review"
         return f"auto CSP candidate {option['expiration']} {option['strike']}P"
     if candidate:
         return "candidate found but not auto-tradable"
@@ -211,14 +275,7 @@ def _status_reason(payload: dict[str, Any]) -> str:
 
 
 def _markdown_table_row(row: dict[str, Any]) -> str:
-    support = row.get("selected_support")
     candidate = row.get("candidate")
-    support_text = "-"
-    if support:
-        support_text = (
-            f"{support['method']} "
-            f"{_fmt(support['bottom'])}-{_fmt(support['top'])}"
-        )
     candidate_text = "-"
     if candidate:
         option = candidate["option"]
@@ -229,7 +286,9 @@ def _markdown_table_row(row: dict[str, Any]) -> str:
         )
     return (
         f"| {_md_cell(row['status'])} | {_md_cell(row['ticker'])} | {_fmt(row.get('current_price'))} | "
-        f"{_fmt(row.get('support_score'), 1)} | {support_text} | "
+        f"{_md_cell(_gate_status(row.get('fundamental_gate')))} | "
+        f"{_md_cell(_gate_status(row.get('earnings_gate')))} | "
+        f"{_fmt(row.get('support_score'), 1)} | "
         f"{candidate_text} | {_md_cell(_top_rejections(row.get('rejection_summary') or {}))} |"
     )
 
@@ -244,6 +303,23 @@ def _detail_section(row: dict[str, Any]) -> list[str]:
         f"- Support tradable: `{row.get('support_tradable')}`",
         f"- Option contracts checked: `{row.get('option_count')}`",
     ]
+    if row.get("fundamental_gate"):
+        lines.append(
+            f"- Fundamental gate: `{_gate_status(row['fundamental_gate'])}`"
+        )
+    if row.get("earnings_gate"):
+        lines.append(f"- Earnings gate: `{_gate_status(row['earnings_gate'])}`")
+    if row.get("manual_review_required"):
+        lines.append("- Manual review required: `True`")
+    snapshot = row.get("fundamental_snapshot")
+    if snapshot:
+        lines.append(
+            "- Fundamentals: "
+            f"`market_cap={_fmt(snapshot.get('market_cap'), 0)}, "
+            f"pe={_fmt(snapshot.get('pe_ratio'), 2)}, "
+            f"dividend_yield={_fmt(snapshot.get('dividend_yield'), 4)}, "
+            f"next_earnings={snapshot.get('next_earnings_date') or '-'}`"
+        )
     support = row.get("selected_support")
     if support:
         lines.append(
@@ -282,6 +358,10 @@ def _write_csv(scan: dict[str, Any], path: Path) -> None:
         "support_method",
         "support_bottom",
         "support_top",
+        "fundamental_status",
+        "earnings_status",
+        "manual_review_required",
+        "next_earnings_date",
         "candidate_expiration",
         "candidate_strike",
         "candidate_delta",
@@ -294,6 +374,7 @@ def _write_csv(scan: dict[str, Any], path: Path) -> None:
         writer.writeheader()
         for row in scan["results"]:
             support = row.get("selected_support") or {}
+            snapshot = row.get("fundamental_snapshot") or {}
             candidate = row.get("candidate") or {}
             option = candidate.get("option") or {}
             writer.writerow(
@@ -305,6 +386,10 @@ def _write_csv(scan: dict[str, Any], path: Path) -> None:
                     "support_method": support.get("method"),
                     "support_bottom": support.get("bottom"),
                     "support_top": support.get("top"),
+                    "fundamental_status": (row.get("fundamental_gate") or {}).get("status"),
+                    "earnings_status": (row.get("earnings_gate") or {}).get("status"),
+                    "manual_review_required": row.get("manual_review_required"),
+                    "next_earnings_date": snapshot.get("next_earnings_date"),
                     "candidate_expiration": option.get("expiration"),
                     "candidate_strike": option.get("strike"),
                     "candidate_delta": candidate.get("delta"),
@@ -335,3 +420,76 @@ def _fmt(value: Any, digits: int = 2) -> str:
 def _md_cell(value: Any) -> str:
     text = _fmt(value)
     return text.replace("\\", "\\\\").replace("|", "\\|").replace("`", "\\`")
+
+
+def _gate_reject_payload(
+    ticker: str,
+    current_price: float,
+    fundamental_snapshot,
+    fundamental_gate: GateResult,
+    earnings_gate: GateResult | None,
+    status_reason: str,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "status": "REJECT",
+        "status_reason": status_reason,
+        "current_price": round(current_price, 2),
+        "trend_passed": None,
+        "trend_reasons": [],
+        "atr14": None,
+        "support_tradable": False,
+        "support_score": None,
+        "selected_support": None,
+        "top_support_zones": [],
+        "option_count": 0,
+        "earnings_filtered_option_count": None,
+        "candidate": None,
+        "csp_policy": None,
+        "rejection_summary": {},
+        "fundamental_snapshot": asdict(fundamental_snapshot),
+        "fundamental_gate": asdict(fundamental_gate),
+        "earnings_gate": asdict(earnings_gate) if earnings_gate else None,
+        "manual_review_required": fundamental_gate.manual_review_required,
+        "reasons": fundamental_gate.reasons,
+        "error": None,
+    }
+
+
+def _manual_review_required(
+    fundamental_gate: GateResult | None,
+    earnings_gate: GateResult | None,
+) -> bool:
+    return any(
+        gate.manual_review_required
+        for gate in (fundamental_gate, earnings_gate)
+        if gate is not None
+    )
+
+
+def _gate_status(gate: dict[str, Any] | None) -> str:
+    if not gate:
+        return "-"
+    parts = [str(gate.get("status") or "-")]
+    warnings = gate.get("warnings") or []
+    reasons = gate.get("reasons") or []
+    detail = warnings or reasons
+    if detail:
+        parts.append(": " + "; ".join(str(x) for x in detail[:2]))
+    return "".join(parts)
+
+
+def _gate_rejected(payload: dict[str, Any]) -> bool:
+    return any(
+        (payload.get(name) or {}).get("status") == "REJECT"
+        for name in ("fundamental_gate", "earnings_gate")
+    )
+
+
+def _gate_reason(payload: dict[str, Any]) -> str:
+    for name in ("fundamental_gate", "earnings_gate"):
+        gate = payload.get(name) or {}
+        if gate.get("status") == "REJECT":
+            reasons = gate.get("reasons") or []
+            return "; ".join(str(r) for r in reasons) or f"{name} rejected"
+    return "gate rejected"

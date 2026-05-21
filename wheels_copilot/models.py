@@ -106,6 +106,48 @@ class OptionQuote:
 
 
 @dataclass
+class FundamentalSnapshot:
+    ticker: str
+    quote_type: str | None = None
+    short_name: str | None = None
+    long_name: str | None = None
+    sector: str | None = None
+    industry: str | None = None
+    country: str | None = None
+    market_cap: float | None = None
+    pe_ratio: float | None = None
+    dividend_yield: float | None = None
+    quarterly_net_income: list[float] = field(default_factory=list)
+    annual_net_income: list[float] = field(default_factory=list)
+    next_earnings_date: date | None = None
+    recent_move_pct: float | None = None
+
+    @property
+    def is_etf(self) -> bool:
+        if self.quote_type:
+            return self.quote_type.strip().upper() == "ETF"
+        text = " ".join(
+            str(x or "") for x in (self.short_name, self.long_name)
+        ).lower()
+        return "etf" in text or "exchange traded fund" in text
+
+
+@dataclass
+class GateResult:
+    status: str
+    reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return self.status != "REJECT"
+
+    @property
+    def manual_review_required(self) -> bool:
+        return self.status == "WARN" or bool(self.warnings)
+
+
+@dataclass
 class CspCandidate:
     option: OptionQuote
     support_zone: SupportZone

@@ -3,9 +3,19 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
+from wheels_copilot.config import load_config
+from wheels_copilot.models import (
+    FundamentalSnapshot,
+    OptionQuote,
+    PriceBar,
+    SupportAnalysis,
+    SupportZone,
+    TrendCheck,
+)
 from wheels_copilot.scan import (
     classify_scan_result,
     render_markdown_report,
@@ -21,6 +31,18 @@ class ScanWorkflowTests(unittest.TestCase):
         self.assertEqual(
             classify_scan_result({"candidate": {"auto_trade": True}}),
             "AUTO_TRADE",
+        )
+        self.assertEqual(
+            classify_scan_result(
+                {"candidate": {"auto_trade": True}, "manual_review_required": True}
+            ),
+            "WATCH",
+        )
+        self.assertEqual(
+            classify_scan_result(
+                {"fundamental_gate": {"status": "REJECT"}, "support_tradable": True}
+            ),
+            "REJECT",
         )
         self.assertEqual(
             classify_scan_result({"candidate": {"auto_trade": False}}),
@@ -110,6 +132,77 @@ class ScanWorkflowTests(unittest.TestCase):
 
         self.assertEqual([row["ticker"] for row in scan["results"]], ["AAA", "BBB"])
 
+    def test_scan_ticker_stops_on_fundamental_reject(self):
+        from wheels_copilot.scan import scan_ticker
+
+        bars = [
+            _price_bar(100),
+            _price_bar(101),
+        ]
+        snapshot = FundamentalSnapshot(
+            ticker="BAD",
+            quote_type="EQUITY",
+            market_cap=1,
+            pe_ratio=10,
+            quarterly_net_income=[1, 1, 1, 1, 1],
+            annual_net_income=[1, 1, 1, 1, 1],
+            recent_move_pct=0,
+        )
+
+        with (
+            patch("wheels_copilot.scan.fetch_daily_bars", return_value=bars),
+            patch("wheels_copilot.scan.fetch_fundamental_snapshot", return_value=snapshot),
+            patch("wheels_copilot.scan.analyze_support") as analyze_support,
+        ):
+            row = scan_ticker("BAD", load_config_like(), as_of=date_like())
+
+        self.assertEqual(row["status"], "REJECT")
+        self.assertEqual(row["fundamental_gate"]["status"], "REJECT")
+        analyze_support.assert_not_called()
+
+    def test_scan_ticker_auto_trade_when_gates_pass(self):
+        from wheels_copilot.scan import scan_ticker
+
+        config = load_config("config/markus_wheel.yaml")
+        bars = [_price_bar(100), _price_bar(101)]
+        snapshot = _snapshot(next_earnings_date=date(2026, 8, 1))
+        support = _tradable_support()
+        option = _option(date(2026, 5, 22))
+
+        with (
+            patch("wheels_copilot.scan.fetch_daily_bars", return_value=bars),
+            patch("wheels_copilot.scan.fetch_fundamental_snapshot", return_value=snapshot),
+            patch("wheels_copilot.scan.analyze_support", return_value=support),
+            patch("wheels_copilot.scan.fetch_put_chain", return_value=[option]),
+        ):
+            row = scan_ticker("GOOD", config, as_of=date(2026, 5, 20))
+
+        self.assertEqual(row["status"], "AUTO_TRADE")
+        self.assertFalse(row["manual_review_required"])
+        self.assertEqual(row["fundamental_gate"]["status"], "PASS")
+        self.assertEqual(row["earnings_gate"]["status"], "PASS")
+
+    def test_scan_ticker_rejects_when_all_options_hit_earnings_window(self):
+        from wheels_copilot.scan import scan_ticker
+
+        config = load_config("config/markus_wheel.yaml")
+        bars = [_price_bar(100), _price_bar(101)]
+        snapshot = _snapshot(next_earnings_date=date(2026, 5, 22))
+        support = _tradable_support()
+        options = [_option(date(2026, 5, 22)), _option(date(2026, 5, 29))]
+
+        with (
+            patch("wheels_copilot.scan.fetch_daily_bars", return_value=bars),
+            patch("wheels_copilot.scan.fetch_fundamental_snapshot", return_value=snapshot),
+            patch("wheels_copilot.scan.analyze_support", return_value=support),
+            patch("wheels_copilot.scan.fetch_put_chain", return_value=options),
+        ):
+            row = scan_ticker("GOOD", config, as_of=date(2026, 5, 20))
+
+        self.assertEqual(row["status"], "REJECT")
+        self.assertEqual(row["earnings_gate"]["status"], "REJECT")
+        self.assertIsNone(row["candidate"])
+
 
 def _sample_scan(
     status: str = "AUTO_TRADE",
@@ -148,6 +241,15 @@ def _sample_scan(
                     "top": 92.0,
                     "score": 88.0,
                 },
+                "fundamental_snapshot": {
+                    "market_cap": 10_000_000_000,
+                    "pe_ratio": 20,
+                    "dividend_yield": 0.01,
+                    "next_earnings_date": "2026-08-01",
+                },
+                "fundamental_gate": {"status": "PASS", "reasons": ["ok"], "warnings": []},
+                "earnings_gate": {"status": "PASS", "reasons": ["ok"], "warnings": []},
+                "manual_review_required": False,
                 "candidate": candidate,
                 "option_count": 3,
                 "rejection_summary": rejection_summary or {},
@@ -157,6 +259,94 @@ def _sample_scan(
             }
         ],
     }
+
+
+def _price_bar(close: float):
+    return PriceBar(
+        date=date(2026, 5, 20),
+        open=close,
+        high=close + 1,
+        low=close - 1,
+        close=close,
+        volume=1_000_000,
+    )
+
+
+def load_config_like():
+    return {
+        "fundamental_filters": {
+            "market_cap_min_hard": 2_000_000_000,
+            "market_cap_preferred": 5_000_000_000,
+            "pe_max": 50,
+            "min_positive_quarters_out_of_5": 4,
+            "min_positive_years_out_of_5": 4,
+            "prefer_dividend": True,
+            "reject_biotech": True,
+            "reject_chinese_adr": True,
+            "reject_leveraged_etf": True,
+            "reject_recent_100pct_movers": True,
+        }
+    }
+
+
+def _snapshot(next_earnings_date: date) -> FundamentalSnapshot:
+    return FundamentalSnapshot(
+        ticker="GOOD",
+        quote_type="EQUITY",
+        market_cap=10_000_000_000,
+        pe_ratio=20,
+        dividend_yield=0.01,
+        quarterly_net_income=[1, 1, 1, 1],
+        annual_net_income=[1, 1, 1, 1],
+        next_earnings_date=next_earnings_date,
+        recent_move_pct=0,
+    )
+
+
+def _tradable_support() -> SupportAnalysis:
+    zone = SupportZone(
+        method="pivot_cluster",
+        center=91,
+        bottom=90,
+        top=92,
+        touches=3,
+        score=90,
+    )
+    return SupportAnalysis(
+        trend=TrendCheck(
+            passed=True,
+            current_price=100,
+            sma200=90,
+            sma200_slope=0.1,
+            reasons=[],
+        ),
+        zones=[zone],
+        selected_zone=zone,
+        atr14=2,
+        current_price=100,
+        min_score_to_trade=70,
+        reasons=[],
+    )
+
+
+def _option(expiration: date) -> OptionQuote:
+    return OptionQuote(
+        symbol=f"GOOD{expiration.isoformat()}P85",
+        expiration=expiration,
+        dte=max((expiration - date(2026, 5, 20)).days, 1),
+        strike=85,
+        bid=1,
+        ask=1.08,
+        last=1,
+        implied_volatility=0.3,
+        open_interest=500,
+        volume=50,
+        delta=-0.2,
+    )
+
+
+def date_like():
+    return date(2026, 5, 20)
 
 
 if __name__ == "__main__":
