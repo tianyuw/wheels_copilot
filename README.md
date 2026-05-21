@@ -10,9 +10,11 @@ Current implementation scope:
 - Markus fundamental quality gate.
 - Earnings gate that keeps CSP expirations before the next earnings date.
 - CSP candidate selector.
+- Trade proposal and shadow order planner for dry-run Alpaca order payloads.
 - Unit tests for support scoring, delta policy, fundamentals, and earnings.
 
-No live or paper orders are submitted by the current code.
+No live or paper orders are submitted by the current code. `shadow_orders.json`
+is an auditable dry-run artifact only.
 Covered-call selection, assignment lifecycle, persistence, and Alpaca order
 submission are not implemented yet.
 
@@ -50,7 +52,16 @@ workspace/scans/YYYY-MM-DD/
   scan_results.json
   scan_report.md
   scan_summary.csv
+  trade_proposals.json
+  shadow_orders.json
 ```
+
+`trade_proposals.json` records candidate decisions (`PROPOSED`, `WATCH`,
+`REJECTED_BY_GATE`, or `REJECTED_BY_ALLOCATION`) after sequential cash
+allocation. Planner allocation is deterministic: AUTO_TRADE candidates are
+prioritized by support score, then weekly return, then ticker. `shadow_orders.json`
+contains only `PROPOSED` trades as dry-run Alpaca limit-order payloads with
+`dry_run_only: true`; the CLI does not submit them.
 
 ## Tests
 

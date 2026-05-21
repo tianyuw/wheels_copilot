@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         portfolio_required=args.with_alpaca,
         portfolio_error=portfolio_error,
     )
-    paths = write_scan_outputs(scan, output_dir)
+    paths = write_scan_outputs(scan, output_dir, config=cfg)
 
     if args.json_stdout:
         print(json.dumps(scan, indent=2, ensure_ascii=False, default=str))

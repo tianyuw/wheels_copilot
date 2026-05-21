@@ -14,6 +14,7 @@ from .market_data import fetch_daily_bars, fetch_fundamental_snapshot, fetch_put
 from .models import GateResult, PortfolioSnapshot
 from .portfolio_risk import evaluate_portfolio_risk, summarize_portfolio_snapshot
 from .support import analyze_support
+from .trade_planner import build_shadow_orders, build_trade_proposals
 
 
 STATUS_ORDER = {
@@ -171,12 +172,20 @@ def classify_scan_result(payload: dict[str, Any]) -> str:
     return "REJECT"
 
 
-def write_scan_outputs(scan: dict[str, Any], output_dir: Path) -> dict[str, Path]:
+def write_scan_outputs(
+    scan: dict[str, Any],
+    output_dir: Path,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    trade_proposals = build_trade_proposals(scan, config)
+    shadow_orders = build_shadow_orders(trade_proposals, config)
     paths = {
         "json": output_dir / "scan_results.json",
         "markdown": output_dir / "scan_report.md",
         "csv": output_dir / "scan_summary.csv",
+        "trade_proposals": output_dir / "trade_proposals.json",
+        "shadow_orders": output_dir / "shadow_orders.json",
     }
     paths["json"].write_text(
         json.dumps(scan, indent=2, ensure_ascii=False, default=str),
@@ -184,6 +193,14 @@ def write_scan_outputs(scan: dict[str, Any], output_dir: Path) -> dict[str, Path
     )
     paths["markdown"].write_text(render_markdown_report(scan), encoding="utf-8")
     _write_csv(scan, paths["csv"])
+    paths["trade_proposals"].write_text(
+        json.dumps(trade_proposals, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    paths["shadow_orders"].write_text(
+        json.dumps(shadow_orders, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
     return paths
 
 

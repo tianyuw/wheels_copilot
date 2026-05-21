@@ -136,6 +136,14 @@ csp_selector:
   min_open_interest: 100
   min_weekly_return_on_strike_pct: 0.25
 
+trade_planner:
+  default_contract_quantity: 1
+  shadow_order:
+    broker: alpaca
+    type: limit
+    time_in_force: day
+    position_intent: sell_to_open
+
 cc_selector:
   dte_min: 1
   dte_max: 9
