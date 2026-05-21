@@ -109,6 +109,53 @@ class AlpacaAdapterTests(unittest.TestCase):
         self.assertEqual(snapshot.open_orders[0].underlying_symbol, "MSFT")
         self.assertEqual(snapshot.open_orders[0].assignment_cash_required, 30000)
 
+    def test_trading_client_fetches_clock_and_submits_order(self):
+        calls = []
+
+        def fake_open(req, timeout):
+            calls.append((req.get_method(), req.full_url, req.data))
+            if req.full_url.endswith("/v2/clock"):
+                return _Response(
+                    {
+                        "is_open": True,
+                        "timestamp": "2026-05-20T17:00:00Z",
+                        "next_close": "2026-05-20T20:00:00Z",
+                    }
+                )
+            if req.full_url.endswith("/v2/orders"):
+                body = json.loads(req.data.decode("utf-8"))
+                self.assertEqual(body["symbol"], "AAPL260529P00090000")
+                self.assertEqual(body["client_order_id"], "client-1")
+                self.assertEqual(req.headers["Content-type"], "application/json")
+                return _Response(
+                    {
+                        "id": "alpaca-1",
+                        "status": "accepted",
+                        "client_order_id": body["client_order_id"],
+                    }
+                )
+            raise AssertionError(req.full_url)
+
+        client = AlpacaTradingClient("key", "secret", opener=fake_open)
+
+        clock = client.fetch_clock()
+        order = client.submit_order(
+            {
+                "symbol": "AAPL260529P00090000",
+                "qty": "1",
+                "side": "sell",
+                "type": "limit",
+                "time_in_force": "day",
+                "limit_price": "1.10",
+                "position_intent": "sell_to_open",
+                "client_order_id": "client-1",
+            }
+        )
+
+        self.assertTrue(clock["is_open"])
+        self.assertEqual(order["id"], "alpaca-1")
+        self.assertEqual([call[0] for call in calls], ["GET", "POST"])
+
     def test_nested_orders_include_parent_and_children(self):
         def fake_open(req, timeout):
             if req.full_url.endswith("/v2/account"):

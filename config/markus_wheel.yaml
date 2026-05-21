@@ -1,6 +1,11 @@
 mode: paper
 broker: alpaca
 
+execution:
+  max_orders_per_run: 3
+  max_validated_order_age_seconds: 120
+  no_open_minutes_before_close: 30
+
 account:
   broker: alpaca
   account_type: paper

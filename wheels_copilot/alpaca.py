@@ -103,6 +103,12 @@ class AlpacaTradingClient:
             fetched_at=datetime.now().isoformat(timespec="seconds"),
         )
 
+    def fetch_clock(self) -> dict[str, Any]:
+        return self._get_json("/v2/clock")
+
+    def submit_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post_json("/v2/orders", payload)
+
     def _get_json(
         self,
         path: str,
@@ -135,6 +141,40 @@ class AlpacaTradingClient:
             return json.loads(body)
         except json.JSONDecodeError as exc:
             raise AlpacaRequestError(f"Alpaca GET {path} returned invalid JSON") from exc
+
+    def _post_json(self, path: str, payload: dict[str, Any]) -> Any:
+        body = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            self.base_url + path,
+            method="POST",
+            data=body,
+            headers={
+                "APCA-API-KEY-ID": self.api_key,
+                "APCA-API-SECRET-KEY": self.secret_key,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with self.opener(req, timeout=self.timeout) as response:
+                response_body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            request_id = exc.headers.get("X-Request-ID") if exc.headers else None
+            try:
+                details = exc.read().decode("utf-8")
+            except Exception:
+                details = ""
+            raise AlpacaRequestError(
+                f"Alpaca POST {path} failed with HTTP {exc.code}"
+                + (f" request_id={request_id}" if request_id else "")
+                + (f" body={details}" if details else "")
+            ) from exc
+        except error.URLError as exc:
+            raise AlpacaRequestError(f"Alpaca POST {path} failed due to network error") from exc
+        try:
+            return json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise AlpacaRequestError(f"Alpaca POST {path} returned invalid JSON") from exc
 
 
 class AlpacaMarketDataClient:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .alpaca import fetch_alpaca_portfolio_snapshot
 from .config import load_config
+from .execution import execute_validated_shadow_orders
 from .scan import resolve_output_dir, scan_watchlist, write_scan_outputs
 
 
@@ -45,6 +46,14 @@ def main(argv: list[str] | None = None) -> int:
             "apply portfolio risk gates."
         ),
     )
+    parser.add_argument(
+        "--execute-paper",
+        action="store_true",
+        help=(
+            "After the scan, submit submit-ready validated CSP orders to the "
+            "Alpaca paper account. No interactive confirmation is requested."
+        ),
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -54,6 +63,8 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = resolve_output_dir(base_output, overwrite=args.overwrite)
     portfolio_snapshot = None
     portfolio_error = None
+    if args.execute_paper:
+        args.with_alpaca = True
     if args.with_alpaca:
         try:
             portfolio_snapshot = fetch_alpaca_portfolio_snapshot(cfg)
@@ -70,6 +81,23 @@ def main(argv: list[str] | None = None) -> int:
         portfolio_error=portfolio_error,
     )
     paths = write_scan_outputs(scan, output_dir, config=cfg)
+    execution_result = None
+    execution_path = None
+    if args.execute_paper:
+        validated = json.loads(paths["validated_shadow_orders"].read_text(encoding="utf-8"))
+        execution_path = output_dir / "execution_results.json"
+        previous = None
+        if execution_path.exists():
+            previous = json.loads(execution_path.read_text(encoding="utf-8"))
+        execution_result = execute_validated_shadow_orders(
+            validated,
+            cfg,
+            previous_execution_results=previous,
+        )
+        execution_path.write_text(
+            json.dumps(execution_result, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     if args.json_stdout:
         print(json.dumps(scan, indent=2, ensure_ascii=False, default=str))
@@ -77,7 +105,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Output directory: {output_dir}")
         for name, path in paths.items():
             print(f"{name}: {path}")
+        if execution_path:
+            print(f"execution_results: {execution_path}")
         print(f"Summary: {scan['summary']}")
+        if execution_result:
+            print(f"Execution summary: {execution_result['summary']}")
     return 0
 
 
