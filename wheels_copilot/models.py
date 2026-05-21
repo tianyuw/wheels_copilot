@@ -159,6 +159,8 @@ class BrokerAccountSnapshot:
     options_trading_level: int | None = None
     trading_blocked: bool = False
     account_blocked: bool = False
+    account_id: str | None = None
+    account_number: str | None = None
 
 
 @dataclass(frozen=True)

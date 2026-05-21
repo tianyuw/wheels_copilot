@@ -11,6 +11,8 @@ from wheels_copilot.alpaca import (
     AlpacaMarketDataClient,
     AlpacaRequestError,
     AlpacaTradingClient,
+    account_identity_reasons,
+    fetch_alpaca_portfolio_snapshot,
     parse_occ_option_symbol,
 )
 
@@ -46,6 +48,8 @@ class AlpacaAdapterTests(unittest.TestCase):
             if req.full_url.endswith("/v2/account"):
                 return _Response(
                     {
+                        "id": "acct-1",
+                        "account_number": "PA123",
                         "status": "ACTIVE",
                         "equity": "500000",
                         "cash": "425000",
@@ -99,6 +103,8 @@ class AlpacaAdapterTests(unittest.TestCase):
         snapshot = client.fetch_portfolio_snapshot()
 
         self.assertEqual(len(calls), 3)
+        self.assertEqual(snapshot.account.account_id, "acct-1")
+        self.assertEqual(snapshot.account.account_number, "PA123")
         self.assertEqual(snapshot.account.status, "ACTIVE")
         self.assertEqual(snapshot.account.cash, 425000)
         self.assertEqual(snapshot.positions[0].underlying_symbol, "AAPL")
@@ -178,6 +184,86 @@ class AlpacaAdapterTests(unittest.TestCase):
         self.assertEqual(fetched["status"], "filled")
         self.assertEqual(fetched_by_client_id["id"], "alpaca-1")
         self.assertEqual([call[0] for call in calls], ["GET", "POST", "GET", "GET"])
+
+    def test_account_identity_reasons_use_expected_env_values(self):
+        account = AlpacaTradingClient(
+            "key",
+            "secret",
+            opener=lambda req, timeout: _Response(
+                {
+                    "id": "acct-1",
+                    "account_number": "PA123",
+                    "status": "ACTIVE",
+                    "equity": "500000",
+                    "cash": "500000",
+                }
+            ),
+        ).fetch_account_snapshot()
+        cfg = {
+            "alpaca": {
+                "expected_account_id_env": "EXPECTED_ACCOUNT_ID",
+                "expected_account_number_env": "EXPECTED_ACCOUNT_NUMBER",
+            }
+        }
+
+        self.assertEqual(
+            account_identity_reasons(
+                cfg,
+                account,
+                env={
+                    "EXPECTED_ACCOUNT_ID": "acct-1",
+                    "EXPECTED_ACCOUNT_NUMBER": "PA123",
+                },
+            ),
+            [],
+        )
+        reasons = account_identity_reasons(
+            cfg,
+            account,
+            env={
+                "EXPECTED_ACCOUNT_ID": "other",
+                "EXPECTED_ACCOUNT_NUMBER": "PA999",
+            },
+        )
+        self.assertIn("account_id_mismatch:actual=acct-1", reasons)
+        self.assertIn("account_number_mismatch:actual=PA123", reasons)
+
+    def test_fetch_portfolio_snapshot_fails_on_account_identity_mismatch(self):
+        def fake_open(req, timeout):
+            if req.full_url.endswith("/v2/account"):
+                return _Response(
+                    {
+                        "id": "acct-1",
+                        "account_number": "PA123",
+                        "status": "ACTIVE",
+                        "equity": "500000",
+                        "cash": "500000",
+                    }
+                )
+            if req.full_url.endswith("/v2/positions"):
+                return _Response([])
+            if "/v2/orders?" in req.full_url:
+                return _Response([])
+            raise AssertionError(req.full_url)
+
+        cfg = {
+            "alpaca": {
+                "api_key_env": "K",
+                "secret_key_env": "S",
+                "expected_account_id_env": "EXPECTED_ACCOUNT_ID",
+            }
+        }
+        client = AlpacaTradingClient("key", "secret", opener=fake_open)
+        with self.assertRaises(AlpacaConfigError):
+            fetch_alpaca_portfolio_snapshot(
+                cfg,
+                env={
+                    "K": "key",
+                    "S": "secret",
+                    "EXPECTED_ACCOUNT_ID": "wrong",
+                },
+                client=client,
+            )
 
     def test_nested_orders_include_parent_and_children(self):
         def fake_open(req, timeout):

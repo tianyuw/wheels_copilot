@@ -102,6 +102,34 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn("portfolio:existing_short_put_position", reasons)
         self.assertEqual(client.submitted_payloads, [])
 
+    def test_account_identity_mismatch_blocks_submission(self):
+        cfg = _config()
+        cfg["alpaca"]["expected_account_id"] = "expected-account"
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(
+                account=BrokerAccountSnapshot(
+                    status="ACTIVE",
+                    equity=500000,
+                    cash=500000,
+                    buying_power=500000,
+                    account_id="other-account",
+                )
+            )
+        )
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_order()]),
+            cfg,
+            client=client,
+        )
+
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn(
+            "account_identity:account_id_mismatch:actual=other-account",
+            result["orders"][0]["blocking_reasons"],
+        )
+        self.assertEqual(client.submitted_payloads, [])
+
     def test_previous_execution_result_blocks_duplicate_client_order_id(self):
         client = _FakeExecutionClient()
         previous = {
@@ -322,11 +350,13 @@ def _order(
 
 def _portfolio(
     *,
+    account: BrokerAccountSnapshot | None = None,
     positions: list[BrokerPosition] | None = None,
     open_orders: list[BrokerOrder] | None = None,
 ) -> PortfolioSnapshot:
     return PortfolioSnapshot(
-        account=BrokerAccountSnapshot(
+        account=account
+        or BrokerAccountSnapshot(
             status="ACTIVE",
             equity=500000,
             cash=500000,

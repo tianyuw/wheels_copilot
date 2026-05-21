@@ -11,6 +11,7 @@ from .alpaca import (
     AlpacaConfigError,
     AlpacaRequestError,
     AlpacaTradingClient,
+    account_identity_reasons,
     parse_occ_option_symbol,
 )
 
@@ -274,6 +275,12 @@ def reconcile_orders(
     ledger = ledger or OrderLedger.from_config(config)
     try:
         client = client or AlpacaTradingClient.from_config(config)
+        account = client.fetch_account_snapshot()
+        identity_reasons = account_identity_reasons(config, account)
+        if identity_reasons:
+            raise AlpacaConfigError(
+                "Alpaca account identity mismatch: " + "; ".join(identity_reasons)
+            )
         orders = ledger.list_open_orders()
         results = []
         stats: dict[str, int] = {}

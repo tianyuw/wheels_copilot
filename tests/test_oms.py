@@ -7,6 +7,7 @@ from pathlib import Path
 
 from wheels_copilot.execution import execute_validated_shadow_orders
 from wheels_copilot.models import BrokerAccountSnapshot, PortfolioSnapshot
+from wheels_copilot.alpaca import AlpacaConfigError
 from wheels_copilot.oms import OrderLedger, reconcile_orders
 
 
@@ -169,6 +170,20 @@ class OmsTests(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_reconcile_fails_closed_on_account_identity_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(Path(tmp) / "oms.sqlite")
+            cfg["alpaca"]["expected_account_id"] = "expected-account"
+            client = _FakeOmsClient(account_id="other-account")
+            execute_validated_shadow_orders(
+                _validated_orders([_order()]),
+                _config(Path(tmp) / "submit.sqlite"),
+                client=client,
+            )
+
+            with self.assertRaises(AlpacaConfigError):
+                reconcile_orders(cfg, client=client)
+
 
 def _config(db_path: Path) -> dict:
     return {
@@ -231,8 +246,16 @@ def _order() -> dict:
 
 
 class _FakeOmsClient:
-    def __init__(self, fetch_order_status: str = "filled"):
+    def __init__(
+        self,
+        fetch_order_status: str = "filled",
+        *,
+        account_id: str | None = None,
+        account_number: str | None = None,
+    ):
         self.fetch_order_status = fetch_order_status
+        self.account_id = account_id
+        self.account_number = account_number
         self.submitted_payloads = []
 
     def fetch_clock(self):
@@ -250,11 +273,16 @@ class _FakeOmsClient:
                 equity=500000,
                 cash=500000,
                 buying_power=500000,
+                account_id=self.account_id,
+                account_number=self.account_number,
             ),
             positions=[],
             open_orders=[],
             source="test",
         )
+
+    def fetch_account_snapshot(self):
+        return self.fetch_portfolio_snapshot().account
 
     def submit_order(self, payload):
         self.submitted_payloads.append(dict(payload))

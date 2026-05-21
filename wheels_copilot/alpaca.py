@@ -33,9 +33,14 @@ class AlpacaRequestError(RuntimeError):
 def fetch_alpaca_portfolio_snapshot(
     config: dict[str, Any],
     env: dict[str, str] | None = None,
+    client: AlpacaTradingClient | None = None,
 ) -> PortfolioSnapshot:
-    client = AlpacaTradingClient.from_config(config, env=env)
-    return client.fetch_portfolio_snapshot()
+    client = client or AlpacaTradingClient.from_config(config, env=env)
+    snapshot = client.fetch_portfolio_snapshot()
+    reasons = account_identity_reasons(config, snapshot.account, env=env)
+    if reasons:
+        raise AlpacaConfigError("Alpaca account identity mismatch: " + "; ".join(reasons))
+    return snapshot
 
 
 class AlpacaTradingClient:
@@ -77,7 +82,7 @@ class AlpacaTradingClient:
         )
 
     def fetch_portfolio_snapshot(self) -> PortfolioSnapshot:
-        account = _account_from_payload(self._get_json("/v2/account"))
+        account = self.fetch_account_snapshot()
         positions = [
             _position_from_payload(item)
             for item in self._get_json("/v2/positions")
@@ -102,6 +107,9 @@ class AlpacaTradingClient:
             source="alpaca_paper",
             fetched_at=datetime.now().isoformat(timespec="seconds"),
         )
+
+    def fetch_account_snapshot(self) -> BrokerAccountSnapshot:
+        return _account_from_payload(self._get_json("/v2/account"))
 
     def fetch_clock(self) -> dict[str, Any]:
         return self._get_json("/v2/clock")
@@ -428,7 +436,62 @@ def _account_from_payload(payload: dict[str, Any]) -> BrokerAccountSnapshot:
         options_trading_level=_int_or_none(payload.get("options_trading_level")),
         trading_blocked=bool(payload.get("trading_blocked")),
         account_blocked=bool(payload.get("account_blocked")),
+        account_id=_str_or_none(payload.get("id")),
+        account_number=_str_or_none(payload.get("account_number")),
     )
+
+
+def account_identity_reasons(
+    config: dict[str, Any],
+    account: BrokerAccountSnapshot,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    cfg = config.get("alpaca", {})
+    env_values = _merged_env(env)
+    reasons = []
+    expected_id = _expected_identity_value(
+        cfg,
+        env_values,
+        direct_key="expected_account_id",
+        env_key="expected_account_id_env",
+    )
+    expected_number = _expected_identity_value(
+        cfg,
+        env_values,
+        direct_key="expected_account_number",
+        env_key="expected_account_number_env",
+    )
+    if cfg.get("expected_account_id_env") and expected_id is None:
+        reasons.append(f"missing_expected_account_id_env:{cfg['expected_account_id_env']}")
+    if cfg.get("expected_account_number_env") and expected_number is None:
+        reasons.append(
+            f"missing_expected_account_number_env:{cfg['expected_account_number_env']}"
+        )
+    if expected_id and account.account_id != expected_id:
+        reasons.append(
+            f"account_id_mismatch:actual={account.account_id or 'missing'}"
+        )
+    if expected_number and account.account_number != expected_number:
+        reasons.append(
+            f"account_number_mismatch:actual={account.account_number or 'missing'}"
+        )
+    return reasons
+
+
+def _expected_identity_value(
+    cfg: dict[str, Any],
+    env_values: dict[str, str],
+    *,
+    direct_key: str,
+    env_key: str,
+) -> str | None:
+    direct = _str_or_none(cfg.get(direct_key))
+    if direct:
+        return direct
+    env_name = _str_or_none(cfg.get(env_key))
+    if env_name:
+        return _str_or_none(env_values.get(env_name))
+    return None
 
 
 def _position_from_payload(payload: dict[str, Any]) -> BrokerPosition:

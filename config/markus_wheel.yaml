@@ -24,6 +24,8 @@ alpaca:
   option_feed: opra
   api_key_env: ALPACA_API_KEY
   secret_key_env: ALPACA_SECRET_KEY
+  expected_account_id_env: ALPACA_EXPECTED_ACCOUNT_ID
+  expected_account_number_env: ALPACA_EXPECTED_ACCOUNT_NUMBER
   request_timeout_seconds: 20
 
 market_data:

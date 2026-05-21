@@ -123,7 +123,12 @@ class ShadowOrderValidationTests(unittest.TestCase):
     def test_missing_client_fails_closed(self):
         validated = build_validated_shadow_orders(
             _shadow_orders([_order()]),
-            config={},
+            config={
+                "alpaca": {
+                    "api_key_env": "__MISSING_ALPACA_KEY__",
+                    "secret_key_env": "__MISSING_ALPACA_SECRET__",
+                }
+            },
         )
 
         order = validated["orders"][0]

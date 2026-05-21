@@ -9,6 +9,7 @@ from .alpaca import (
     AlpacaRequestError,
     AlpacaTradingClient,
     DEFAULT_PAPER_BASE_URL,
+    account_identity_reasons,
     parse_occ_option_symbol,
 )
 from .models import BrokerOrder, CspCandidate, OptionQuote, PortfolioSnapshot, SupportZone
@@ -185,6 +186,13 @@ def _execute_one_order(
             portfolio_snapshot = _with_in_run_open_orders(
                 portfolio_snapshot,
                 in_run_open_orders,
+            )
+            identity_reasons = account_identity_reasons(
+                config,
+                portfolio_snapshot.account,
+            )
+            blocking_reasons.extend(
+                f"account_identity:{reason}" for reason in identity_reasons
             )
             portfolio_gate, portfolio_risk = _portfolio_gate_for_order(
                 order, payload, portfolio_snapshot, config
