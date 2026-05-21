@@ -54,6 +54,12 @@ class CoveredCallPlannerTests(unittest.TestCase):
         self.assertEqual(payload["side"], "sell")
         self.assertEqual(payload["position_intent"], "sell_to_open")
         self.assertTrue(payload["client_order_id"].startswith("whcc-"))
+        self.assertEqual(orders["orders"][0]["adjusted_cost_basis"], 88.8)
+        self.assertEqual(orders["orders"][0]["available_shares_for_cc"], 100)
+        self.assertEqual(
+            orders["orders"][0]["unchecked_risks"],
+            ["earnings_not_checked", "ex_dividend_not_checked"],
+        )
 
     def test_no_eligible_call_keeps_position_on_watch(self):
         proposals = build_covered_call_proposals(

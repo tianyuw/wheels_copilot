@@ -172,6 +172,75 @@ class ShadowOrderValidationTests(unittest.TestCase):
             "2026-05-22",
         )
 
+    def test_covered_call_shadow_order_validates_and_preserves_risk_metadata(self):
+        client = _FakeValidationClient(
+            bid=0.5,
+            ask=0.6,
+            contract_symbol="AAPL260529C00090000",
+        )
+
+        validated = build_validated_shadow_orders(
+            _shadow_orders(
+                [
+                    _order(
+                        symbol="AAPL260529C00090000",
+                        limit_price="0.55",
+                        strategy="covered_call",
+                        extra={
+                            "adjusted_cost_basis": 88.8,
+                            "available_shares_for_cc": 100,
+                            "unchecked_risks": [
+                                "earnings_not_checked",
+                                "ex_dividend_not_checked",
+                            ],
+                        },
+                    )
+                ]
+            ),
+            config=_config(),
+            client=client,
+        )
+
+        order = validated["orders"][0]
+        self.assertTrue(order["submit_ready"])
+        self.assertEqual(order["validated_limit_price"], 0.55)
+        self.assertEqual(order["adjusted_cost_basis"], 88.8)
+        self.assertEqual(order["available_shares_for_cc"], 100)
+        self.assertEqual(
+            order["unchecked_risks"],
+            ["earnings_not_checked", "ex_dividend_not_checked"],
+        )
+        self.assertEqual(client.contract_calls[0]["option_type"], "call")
+        self.assertEqual(
+            client.contract_calls[0]["expiration_date_gte"].isoformat(),
+            "2026-05-29",
+        )
+
+    def test_strategy_symbol_mismatch_blocks_submit_ready_at_validation(self):
+        validated = build_validated_shadow_orders(
+            _shadow_orders([_order(strategy="covered_call")]),
+            config=_config(),
+            client=_FakeValidationClient(bid=1.0, ask=1.1),
+        )
+
+        order = validated["orders"][0]
+        self.assertFalse(order["submit_ready"])
+        self.assertIn(
+            "strategy_option_type_mismatch:covered_call:put",
+            order["blocking_reasons"],
+        )
+
+    def test_missing_strategy_blocks_submit_ready_at_validation(self):
+        validated = build_validated_shadow_orders(
+            _shadow_orders([_order(strategy="")]),
+            config=_config(),
+            client=_FakeValidationClient(bid=1.0, ask=1.1),
+        )
+
+        order = validated["orders"][0]
+        self.assertFalse(order["submit_ready"])
+        self.assertIn("unsupported_strategy:missing", order["blocking_reasons"])
+
     def test_expected_alpaca_errors_fail_closed_but_programming_errors_raise(self):
         http_client = _FakeValidationClient(
             raise_error=AlpacaRequestError("Alpaca GET failed with HTTP 429")
@@ -223,15 +292,18 @@ def _order(
     qty: str = "1",
     order_type: str = "limit",
     limit_price: str = "1.10",
+    strategy: str = "cash_secured_put",
+    ticker: str = "AAPL",
+    extra: dict | None = None,
 ) -> dict:
-    return {
+    order = {
         "shadow_order_id": "order-1",
         "proposal_id": "proposal-1",
         "created_at": "2026-05-20T10:00:00+00:00",
         "dry_run_only": True,
         "broker": "alpaca",
-        "strategy": "cash_secured_put",
-        "ticker": "AAPL",
+        "strategy": strategy,
+        "ticker": ticker,
         "payload": {
             "symbol": symbol,
             "qty": qty,
@@ -243,6 +315,9 @@ def _order(
             "client_order_id": "client-order-1",
         },
     }
+    if extra:
+        order.update(extra)
+    return order
 
 
 class _FakeValidationClient:
@@ -255,6 +330,7 @@ class _FakeValidationClient:
         ask: float = 1.2,
         quote_timestamp: str | None = None,
         contract: dict | None = None,
+        contract_symbol: str = "AAPL260522P00275000",
         raise_error: Exception | None = None,
     ):
         self.bid = bid
@@ -265,6 +341,7 @@ class _FakeValidationClient:
             else quote_timestamp
         )
         self.contract = contract or {"status": "active", "tradable": True}
+        self.contract_symbol = contract_symbol
         self.raise_error = raise_error
         self.quote_calls = []
         self.contract_calls = []
@@ -290,11 +367,11 @@ class _FakeValidationClient:
         self.contract_calls.append({"underlying_symbol": underlying_symbol, **kwargs})
         return [
             {
-                "symbol": "AAPL260522P00275000",
-                "expiration_date": "2026-05-22",
+                "symbol": self.contract_symbol,
+                "expiration_date": kwargs["expiration_date_gte"].isoformat(),
                 "strike_price": "275",
-                "type": "put",
-                "underlying_symbol": "AAPL",
+                "type": kwargs["option_type"],
+                "underlying_symbol": underlying_symbol,
                 **self.contract,
             }
         ]

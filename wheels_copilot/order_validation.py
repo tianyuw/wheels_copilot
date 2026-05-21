@@ -16,6 +16,15 @@ DEFAULT_MAX_QUOTE_AGE_SECONDS = 30
 DEFAULT_MAX_SPREAD_PCT_OF_MID = 0.12
 MONEY_EPSILON = 0.005
 FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 1.0
+VALIDATED_ORDER_METADATA_KEYS = (
+    "estimated_premium_credit",
+    "share_quantity",
+    "available_shares_for_cc",
+    "adjusted_cost_basis",
+    "min_acceptable_strike",
+    "unchecked_risks",
+    "warnings",
+)
 
 
 def build_validated_shadow_orders(
@@ -85,7 +94,7 @@ def _validate_order(
     validator_error: str | None,
 ) -> dict[str, Any]:
     payload = order.get("payload") or {}
-    blocking_reasons = _payload_reasons(payload)
+    blocking_reasons = _payload_reasons(order, payload)
     if validator_error:
         blocking_reasons.append("alpaca_validation_unavailable")
     blocking_reasons.extend(_contract_reasons(contract))
@@ -114,7 +123,7 @@ def _validate_order(
         validated_payload["limit_price"] = f"{float(validated_limit_price):.2f}"
     elif "limit_price" in validated_payload:
         validated_payload["limit_price"] = None
-    return {
+    validated_order = {
         "shadow_order_id": order.get("shadow_order_id"),
         "proposal_id": order.get("proposal_id"),
         "validated_at": generated_at,
@@ -133,6 +142,10 @@ def _validate_order(
         ),
         "validated_payload": validated_payload,
     }
+    for key in VALIDATED_ORDER_METADATA_KEYS:
+        if key in order:
+            validated_order[key] = order.get(key)
+    return validated_order
 
 
 def _fetch_latest_quotes(
@@ -179,13 +192,24 @@ def _fetch_contracts(
     return contracts
 
 
-def _payload_reasons(payload: dict[str, Any]) -> list[str]:
+def _payload_reasons(order: dict[str, Any], payload: dict[str, Any]) -> list[str]:
     reasons = []
     symbol = str(payload.get("symbol") or "").upper()
+    parsed = None
     if not symbol:
         reasons.append("missing_symbol")
-    elif parse_occ_option_symbol(symbol) is None:
+    else:
+        parsed = parse_occ_option_symbol(symbol)
+    if symbol and parsed is None:
         reasons.append("invalid_occ_option_symbol")
+    expected_option_type = _expected_option_type(order)
+    if expected_option_type is None:
+        reasons.append(f"unsupported_strategy:{_order_strategy(order) or 'missing'}")
+    elif parsed and parsed.get("option_type") != expected_option_type:
+        reasons.append(
+            "strategy_option_type_mismatch:"
+            f"{_order_strategy(order)}:{parsed.get('option_type')}"
+        )
     if str(payload.get("side") or "").lower() != "sell":
         reasons.append("unsupported_side")
     if str(payload.get("type") or "").lower() != "limit":
@@ -196,6 +220,19 @@ def _payload_reasons(payload: dict[str, Any]) -> list[str]:
     if qty is None or qty <= 0:
         reasons.append("invalid_quantity")
     return reasons
+
+
+def _order_strategy(order: dict[str, Any]) -> str:
+    return str(order.get("strategy") or "").strip().lower()
+
+
+def _expected_option_type(order: dict[str, Any]) -> str | None:
+    strategy = _order_strategy(order)
+    if strategy in {"cash_secured_put", "csp"}:
+        return "put"
+    if strategy in {"covered_call", "cc"}:
+        return "call"
+    return None
 
 
 def _contract_reasons(contract: dict[str, Any] | None) -> list[str]:

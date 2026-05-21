@@ -312,6 +312,291 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(len(client.submitted_payloads), 1)
         self.assertIn("max_orders_per_run_reached", result["orders"][1]["blocking_reasons"])
 
+    def test_covered_call_with_unchecked_risks_blocks_submission(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(positions=[BrokerPosition(symbol="AAPL", qty=100)])
+        )
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_covered_call_order()]),
+            _config(),
+            client=client,
+        )
+
+        reasons = result["orders"][0]["blocking_reasons"]
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn("portfolio_gate_reject", reasons)
+        self.assertTrue(
+            any(
+                reason.startswith("portfolio:covered_call_unchecked_risks_present")
+                for reason in reasons
+            )
+        )
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_covered_call_requires_broker_verified_long_stock_coverage(self):
+        client = _FakeExecutionClient()
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_covered_call_order(unchecked_risks=[])]),
+            _config(),
+            client=client,
+        )
+
+        reasons = result["orders"][0]["blocking_reasons"]
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn(
+            "portfolio:covered_call_insufficient_long_shares:0<100",
+            reasons,
+        )
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_covered_call_submit_ready_order_is_submitted_when_risks_clear(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(positions=[BrokerPosition(symbol="AAPL", qty=100)])
+        )
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_covered_call_order(unchecked_risks=[])]),
+            _config(),
+            client=client,
+        )
+
+        self.assertEqual(result["summary"], {"SUBMITTED": 1})
+        submitted = client.submitted_payloads[0]
+        self.assertEqual(submitted["symbol"], "AAPL260529C00090000")
+        self.assertEqual(submitted["side"], "sell")
+        self.assertEqual(submitted["position_intent"], "sell_to_open")
+
+    def test_covered_call_below_cost_basis_blocks_submission(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(positions=[BrokerPosition(symbol="AAPL", qty=100)])
+        )
+
+        result = execute_validated_shadow_orders(
+            _validated_orders(
+                [_covered_call_order(symbol="AAPL260529C00085000", unchecked_risks=[])]
+            ),
+            _config(),
+            client=client,
+        )
+
+        reasons = result["orders"][0]["blocking_reasons"]
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn(
+            "portfolio:covered_call_strike_below_adjusted_cost_basis:85.00<88.80",
+            reasons,
+        )
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_covered_call_existing_short_call_consumes_share_coverage(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(
+                positions=[
+                    BrokerPosition(symbol="AAPL", qty=100),
+                    BrokerPosition(
+                        symbol="AAPL260529C00090000",
+                        qty=-1,
+                        underlying_symbol="AAPL",
+                        option_type="call",
+                        expiration=date(2026, 5, 29),
+                        strike=90,
+                    ),
+                ]
+            )
+        )
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_covered_call_order(unchecked_risks=[])]),
+            _config(),
+            client=client,
+        )
+
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn(
+            "portfolio:covered_call_insufficient_long_shares:0<100",
+            result["orders"][0]["blocking_reasons"],
+        )
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_covered_call_open_sell_call_order_consumes_share_coverage(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(
+                positions=[BrokerPosition(symbol="AAPL", qty=100)],
+                open_orders=[
+                    BrokerOrder(
+                        id="open-call",
+                        symbol="AAPL260529C00090000",
+                        side="sell",
+                        qty=1,
+                        underlying_symbol="AAPL",
+                        option_type="call",
+                        expiration=date(2026, 5, 29),
+                        strike=90,
+                    )
+                ],
+            )
+        )
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_covered_call_order(unchecked_risks=[])]),
+            _config(),
+            client=client,
+        )
+
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn(
+            "portfolio:covered_call_insufficient_long_shares:0<100",
+            result["orders"][0]["blocking_reasons"],
+        )
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_covered_call_open_equity_sell_order_consumes_share_coverage(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(
+                positions=[BrokerPosition(symbol="AAPL", qty=100)],
+                open_orders=[
+                    BrokerOrder(
+                        id="open-stock-sale",
+                        symbol="AAPL",
+                        side="sell",
+                        qty=100,
+                        asset_class="us_equity",
+                    )
+                ],
+            )
+        )
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_covered_call_order(unchecked_risks=[])]),
+            _config(),
+            client=client,
+        )
+
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn(
+            "portfolio:covered_call_insufficient_long_shares:0<100",
+            result["orders"][0]["blocking_reasons"],
+        )
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_covered_call_min_acceptable_strike_is_required_and_enforced(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(positions=[BrokerPosition(symbol="AAPL", qty=100)])
+        )
+
+        missing = execute_validated_shadow_orders(
+            _validated_orders(
+                [_covered_call_order(unchecked_risks=[], min_acceptable_strike=None)]
+            ),
+            _config(),
+            client=client,
+        )
+        self.assertIn(
+            "portfolio:covered_call_min_acceptable_strike_missing",
+            missing["orders"][0]["blocking_reasons"],
+        )
+
+        below_floor = execute_validated_shadow_orders(
+            _validated_orders(
+                [_covered_call_order(unchecked_risks=[], min_acceptable_strike=95.0)]
+            ),
+            _config(),
+            client=client,
+        )
+        self.assertIn(
+            "portfolio:covered_call_strike_below_min_acceptable:90.00<95.00",
+            below_floor["orders"][0]["blocking_reasons"],
+        )
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_covered_call_multi_contract_order_requires_matching_shares(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(positions=[BrokerPosition(symbol="AAPL", qty=200)])
+        )
+
+        result = execute_validated_shadow_orders(
+            _validated_orders(
+                [
+                    _covered_call_order(
+                        qty="2",
+                        unchecked_risks=[],
+                        available_shares_for_cc=200,
+                    )
+                ]
+            ),
+            _config(),
+            client=client,
+        )
+
+        self.assertEqual(result["summary"], {"SUBMITTED": 1})
+        self.assertEqual(client.submitted_payloads[0]["qty"], "2")
+
+    def test_covered_call_inactive_account_blocks_submission(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(
+                account=BrokerAccountSnapshot(
+                    status="INACTIVE",
+                    equity=500000,
+                    cash=500000,
+                    buying_power=500000,
+                    account_id="acct-test",
+                ),
+                positions=[BrokerPosition(symbol="AAPL", qty=100)],
+            )
+        )
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_covered_call_order(unchecked_risks=[])]),
+            _config(),
+            client=client,
+        )
+
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn("portfolio:account_status_INACTIVE", result["orders"][0]["blocking_reasons"])
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_covered_call_previous_execution_blocks_duplicate_client_order_id(self):
+        client = _FakeExecutionClient(
+            portfolio=_portfolio(positions=[BrokerPosition(symbol="AAPL", qty=100)])
+        )
+        previous = {
+            "orders": [
+                {
+                    "status": "SUBMITTED",
+                    "client_order_id": "whcc-260520-AAPL-260529-9000000-test",
+                }
+            ]
+        }
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([_covered_call_order(unchecked_risks=[])]),
+            _config(),
+            client=client,
+            previous_execution_results=previous,
+        )
+
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn(
+            "duplicate_client_order_id_previous_execution",
+            result["orders"][0]["blocking_reasons"],
+        )
+        self.assertEqual(client.submitted_payloads, [])
+
+    def test_missing_strategy_fails_closed_in_executor(self):
+        order = _order(strategy="")
+        client = _FakeExecutionClient()
+
+        result = execute_validated_shadow_orders(
+            _validated_orders([order]),
+            _config(),
+            client=client,
+        )
+
+        self.assertEqual(result["summary"], {"BLOCKED": 1})
+        self.assertIn("unsupported_strategy:missing", result["orders"][0]["blocking_reasons"])
+        self.assertEqual(client.submitted_payloads, [])
+
 
 def _config() -> dict:
     return {
@@ -349,9 +634,12 @@ def _order(
     ticker: str = "AAPL",
     symbol: str = "AAPL260529P00090000",
     client_order_id: str = "wheel-20260520-AAPL-90P",
+    qty: str = "1",
     submit_ready: bool = True,
+    strategy: str = "cash_secured_put",
+    extra: dict | None = None,
 ) -> dict:
-    return {
+    order = {
         "shadow_order_id": client_order_id,
         "proposal_id": client_order_id,
         "validated_at": "2026-05-20T17:00:00+00:00",
@@ -359,12 +647,12 @@ def _order(
         "submit_ready": submit_ready,
         "blocking_reasons": [],
         "ticker": ticker,
-        "strategy": "cash_secured_put",
+        "strategy": strategy,
         "latest_quote": {"bid": 1.0, "ask": 1.2, "mid": 1.1},
         "validated_limit_price": 1.1,
         "validated_payload": {
             "symbol": symbol,
-            "qty": "1",
+            "qty": qty,
             "side": "sell",
             "type": "limit",
             "time_in_force": "day",
@@ -373,6 +661,36 @@ def _order(
             "client_order_id": client_order_id,
         },
     }
+    if extra:
+        order.update(extra)
+    return order
+
+
+def _covered_call_order(
+    *,
+    symbol: str = "AAPL260529C00090000",
+    qty: str = "1",
+    unchecked_risks: list[str] | None = None,
+    available_shares_for_cc: int = 100,
+    min_acceptable_strike: float | None = 88.8,
+) -> dict:
+    return _order(
+        ticker="AAPL",
+        symbol=symbol,
+        client_order_id="whcc-260520-AAPL-260529-9000000-test",
+        qty=qty,
+        strategy="covered_call",
+        extra={
+            "adjusted_cost_basis": 88.8,
+            "available_shares_for_cc": available_shares_for_cc,
+            "min_acceptable_strike": min_acceptable_strike,
+            "unchecked_risks": (
+                ["earnings_not_checked", "ex_dividend_not_checked"]
+                if unchecked_risks is None
+                else unchecked_risks
+            ),
+        },
+    )
 
 
 def _portfolio(

@@ -12,7 +12,9 @@ from .covered_call_planner import (
     build_covered_call_shadow_orders,
     render_covered_call_report,
 )
+from .execution import execute_validated_shadow_orders
 from .oms import OrderLedger, oms_enabled
+from .order_validation import build_validated_shadow_orders
 from .scan import resolve_output_dir
 from .wheel_lifecycle import build_wheel_lifecycle_snapshot
 
@@ -34,12 +36,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--json-stdout", action="store_true")
+    parser.add_argument(
+        "--execute-paper",
+        action="store_true",
+        help=(
+            "After planning, submit submit-ready covered-call orders to the "
+            "Alpaca paper account. No interactive confirmation is requested."
+        ),
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     as_of = date.fromisoformat(args.scan_date) if args.scan_date else date.today()
     base_output = args.output or Path("workspace/covered_calls") / as_of.isoformat()
     output_dir = resolve_output_dir(base_output, overwrite=args.overwrite)
+    execution_output_path = output_dir / "covered_call_execution_results.json"
+    previous_execution_result = None
+    if args.execute_paper and execution_output_path.exists():
+        previous_execution_result = json.loads(
+            execution_output_path.read_text(encoding="utf-8")
+        )
     try:
         portfolio = fetch_alpaca_portfolio_snapshot(cfg)
         ledger_positions = _ledger_positions(cfg)
@@ -51,6 +67,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         proposals = build_covered_call_proposals(lifecycle, cfg, as_of=as_of)
         shadow_orders = build_covered_call_shadow_orders(proposals, cfg)
+        validated_orders = build_validated_shadow_orders(shadow_orders, cfg)
+        execution_result = None
+        if args.execute_paper:
+            execution_result = execute_validated_shadow_orders(
+                validated_orders,
+                cfg,
+                previous_execution_results=previous_execution_result,
+            )
     except (AlpacaConfigError, AlpacaRequestError) as exc:
         result = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -68,8 +92,12 @@ def main(argv: list[str] | None = None) -> int:
         "lifecycle": output_dir / "wheel_lifecycle.json",
         "covered_call_proposals": output_dir / "covered_call_proposals.json",
         "covered_call_shadow_orders": output_dir / "covered_call_shadow_orders.json",
+        "validated_covered_call_shadow_orders": output_dir
+        / "validated_covered_call_shadow_orders.json",
         "markdown": output_dir / "covered_call_report.md",
     }
+    if execution_result is not None:
+        paths["covered_call_execution_results"] = execution_output_path
     paths["lifecycle"].write_text(
         json.dumps(lifecycle, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8",
@@ -82,6 +110,15 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(shadow_orders, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8",
     )
+    paths["validated_covered_call_shadow_orders"].write_text(
+        json.dumps(validated_orders, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    if execution_result is not None:
+        paths["covered_call_execution_results"].write_text(
+            json.dumps(execution_result, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     paths["markdown"].write_text(
         render_covered_call_report(lifecycle, proposals),
         encoding="utf-8",
@@ -95,6 +132,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Lifecycle summary: {lifecycle['summary']}")
         print(f"Proposal summary: {proposals['summary']}")
         print(f"Shadow orders: {shadow_orders['order_count']}")
+        print(f"Validated shadow orders: {validated_orders['summary']}")
+        if execution_result is not None:
+            print(f"Execution summary: {execution_result['summary']}")
     return 0
 
 

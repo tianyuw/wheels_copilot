@@ -107,6 +107,11 @@ def build_covered_call_shadow_orders(
                 "strategy": "covered_call",
                 "ticker": proposal.get("ticker"),
                 "estimated_premium_credit": proposal.get("estimated_premium_credit"),
+                "share_quantity": proposal.get("share_quantity"),
+                "available_shares_for_cc": proposal.get("available_shares_for_cc"),
+                "adjusted_cost_basis": proposal.get("adjusted_cost_basis"),
+                "min_acceptable_strike": proposal.get("min_acceptable_strike"),
+                "unchecked_risks": proposal.get("unchecked_risks") or [],
                 "payload": {
                     "symbol": option.get("symbol"),
                     "qty": str(proposal.get("quantity", 1)),

@@ -12,7 +12,14 @@ from .alpaca import (
     account_identity_reasons,
     parse_occ_option_symbol,
 )
-from .models import BrokerOrder, CspCandidate, OptionQuote, PortfolioSnapshot, SupportZone
+from .models import (
+    BrokerOrder,
+    CspCandidate,
+    GateResult,
+    OptionQuote,
+    PortfolioSnapshot,
+    SupportZone,
+)
 from .oms import OrderLedger, oms_enabled
 from .portfolio_risk import evaluate_portfolio_risk
 
@@ -49,12 +56,12 @@ def execute_validated_shadow_orders(
     ledger: OrderLedger | None = None,
     previous_execution_results: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Submit validated CSP shadow orders to the Alpaca paper account.
+    """Submit validated wheel shadow orders to the Alpaca paper account.
 
-    The function is intentionally narrow: it only submits single-leg,
-    sell-to-open cash-secured puts that already passed the fresh OPRA quote
-    validator. It still re-checks paper-only config, market clock, portfolio
-    risk, and idempotency immediately before each broker POST.
+    The function only submits single-leg, sell-to-open option payloads that
+    already passed the fresh OPRA quote validator. It still re-checks
+    paper-only config, market clock, strategy-specific portfolio gates, and
+    idempotency immediately before each broker POST.
     """
 
     generated_at = _now_iso()
@@ -146,7 +153,7 @@ def execute_validated_shadow_orders(
             "executor": {
                 "version": 1,
                 "mode": "paper",
-                "strategy": "cash_secured_put",
+                "strategy": "wheel_options",
                 "max_orders_per_run": max_orders,
                 "max_validated_order_age_seconds": _max_validated_order_age_seconds(config),
                 "no_open_minutes_before_close": int(
@@ -156,6 +163,7 @@ def execute_validated_shadow_orders(
                 "paper_only_guard": True,
                 "account_identity_gate": True,
                 "portfolio_risk_gate": True,
+                "portfolio_gate": True,
                 "market_clock_gate": True,
                 "oms_enabled": ledger is not None,
             },
@@ -191,7 +199,7 @@ def _execute_one_order(
             f"validation:{reason}" for reason in (order.get("blocking_reasons") or [])
         )
 
-    blocking_reasons.extend(_payload_blocking_reasons(payload))
+    blocking_reasons.extend(_payload_blocking_reasons(order, payload))
     if client_order_id in previously_submitted:
         blocking_reasons.append("duplicate_client_order_id_previous_execution")
 
@@ -405,6 +413,11 @@ def _portfolio_gate_for_order(
     portfolio: PortfolioSnapshot,
     config: dict[str, Any],
 ):
+    strategy = _order_strategy(order)
+    symbol = str(payload.get("symbol") or "").upper()
+    parsed = parse_occ_option_symbol(symbol) if symbol else None
+    if strategy == "covered_call" or (parsed and parsed.get("option_type") == "call"):
+        return _covered_call_gate_for_order(order, payload, portfolio)
     candidate = _candidate_from_order(order, payload)
     if candidate is None:
         return None, None
@@ -415,6 +428,119 @@ def _portfolio_gate_for_order(
         portfolio,
         config,
         required=True,
+    )
+
+
+def _covered_call_gate_for_order(
+    order: dict[str, Any],
+    payload: dict[str, Any],
+    portfolio: PortfolioSnapshot,
+) -> tuple[GateResult, dict[str, Any]]:
+    reasons: list[str] = []
+    warnings: list[str] = []
+    account = portfolio.account
+    if account.status and account.status.upper() != "ACTIVE":
+        reasons.append(f"account_status_{account.status}")
+    if account.trading_blocked:
+        reasons.append("trading_blocked")
+    if account.account_blocked:
+        reasons.append("account_blocked")
+
+    symbol = str(payload.get("symbol") or "").upper()
+    parsed = parse_occ_option_symbol(symbol) if symbol else None
+    ticker = str(order.get("ticker") or "").upper()
+    strike = None
+    if not parsed or parsed.get("option_type") != "call":
+        reasons.append("covered_call_invalid_call_symbol")
+    else:
+        ticker = str(parsed["underlying_symbol"]).upper()
+        strike = float(parsed["strike"])
+
+    qty = _number(payload.get("qty"))
+    contract_qty = int(qty) if qty is not None and qty > 0 and int(qty) == qty else 0
+    required_shares = contract_qty * 100.0
+    if required_shares <= 0:
+        reasons.append("covered_call_invalid_quantity")
+
+    long_shares = _long_equity_shares(portfolio, ticker) if ticker else 0.0
+    existing_short_call_contracts = (
+        _short_call_contracts(portfolio, ticker) if ticker else 0.0
+    )
+    open_sell_call_contracts = (
+        _open_sell_call_contracts(portfolio, ticker) if ticker else 0.0
+    )
+    open_sell_equity_shares = _open_sell_equity_shares(portfolio, ticker) if ticker else 0.0
+    covered_shares = (existing_short_call_contracts + open_sell_call_contracts) * 100.0
+    available_shares = long_shares - covered_shares - open_sell_equity_shares
+    if required_shares > 0 and available_shares + MONEY_EPSILON < required_shares:
+        reasons.append(
+            "covered_call_insufficient_long_shares:"
+            f"{available_shares:g}<{required_shares:g}"
+        )
+
+    adjusted_cost_basis = _number(order.get("adjusted_cost_basis"))
+    if adjusted_cost_basis is None:
+        reasons.append("covered_call_adjusted_cost_basis_missing")
+    elif strike is not None and strike + MONEY_EPSILON < adjusted_cost_basis:
+        reasons.append(
+            "covered_call_strike_below_adjusted_cost_basis:"
+            f"{strike:.2f}<{adjusted_cost_basis:.2f}"
+        )
+
+    min_acceptable_strike = _number(order.get("min_acceptable_strike"))
+    if min_acceptable_strike is None:
+        reasons.append("covered_call_min_acceptable_strike_missing")
+    elif strike is not None and strike + MONEY_EPSILON < min_acceptable_strike:
+        reasons.append(
+            "covered_call_strike_below_min_acceptable:"
+            f"{strike:.2f}<{min_acceptable_strike:.2f}"
+        )
+
+    unchecked_risks = [str(risk) for risk in (order.get("unchecked_risks") or []) if risk]
+    if unchecked_risks:
+        reasons.append(
+            "covered_call_unchecked_risks_present:" + ",".join(sorted(unchecked_risks))
+        )
+
+    planned_available = _number(order.get("available_shares_for_cc"))
+    if planned_available is not None and available_shares + MONEY_EPSILON < planned_available:
+        warnings.append(
+            "covered_call_available_shares_below_plan:"
+            f"{available_shares:g}<{planned_available:g}"
+        )
+
+    diagnostics = {
+        "gate": "covered_call",
+        "ticker": ticker,
+        "symbol": symbol,
+        "contract_quantity": contract_qty,
+        "required_shares": required_shares,
+        "long_shares": long_shares,
+        "existing_short_call_contracts": existing_short_call_contracts,
+        "open_sell_call_contracts": open_sell_call_contracts,
+        "open_sell_equity_shares": open_sell_equity_shares,
+        "available_shares": available_shares,
+        "planned_available_shares": planned_available,
+        "strike": strike,
+        "adjusted_cost_basis": adjusted_cost_basis,
+        "min_acceptable_strike": min_acceptable_strike,
+        "unchecked_risks": unchecked_risks,
+    }
+
+    if reasons:
+        return GateResult(status="REJECT", reasons=reasons, warnings=warnings), diagnostics
+    if warnings:
+        return (
+            GateResult(
+                status="WARN",
+                reasons=["covered_call_review_required"],
+                warnings=warnings,
+            ),
+            diagnostics,
+        )
+    return (
+        GateResult(status="PASS", reasons=["covered_call_portfolio_gate_passed"]),
+        diagnostics,
     )
 
 
@@ -463,8 +589,9 @@ def _candidate_from_order(
     )
 
 
-def _payload_blocking_reasons(payload: dict[str, Any]) -> list[str]:
+def _payload_blocking_reasons(order: dict[str, Any], payload: dict[str, Any]) -> list[str]:
     reasons = []
+    expected_option_type = _expected_option_type(order)
     unexpected_keys = sorted(set(payload) - BROKER_PAYLOAD_KEYS)
     if unexpected_keys:
         reasons.append(f"unexpected_payload_keys:{','.join(unexpected_keys)}")
@@ -472,8 +599,14 @@ def _payload_blocking_reasons(payload: dict[str, Any]) -> list[str]:
     parsed = parse_occ_option_symbol(symbol) if symbol else None
     if not parsed:
         reasons.append("invalid_occ_option_symbol")
-    elif parsed.get("option_type") != "put":
-        reasons.append("unsupported_option_type")
+    else:
+        if expected_option_type is None:
+            reasons.append(f"unsupported_strategy:{_order_strategy(order) or 'missing'}")
+        elif parsed.get("option_type") != expected_option_type:
+            reasons.append(
+                "strategy_option_type_mismatch:"
+                f"{_order_strategy(order) or 'missing'}:{parsed.get('option_type')}"
+            )
     if str(payload.get("side") or "").lower() != "sell":
         reasons.append("unsupported_side")
     if str(payload.get("type") or "").lower() != "limit":
@@ -485,7 +618,7 @@ def _payload_blocking_reasons(payload: dict[str, Any]) -> list[str]:
     qty = _number(payload.get("qty"))
     if qty is None or qty <= 0 or int(qty) != qty:
         reasons.append("invalid_quantity")
-    elif int(qty) != 1:
+    elif int(qty) != 1 and expected_option_type != "call":
         reasons.append("unsupported_quantity_gt_one")
     limit = _number(payload.get("limit_price"))
     if limit is None or limit <= MONEY_EPSILON:
@@ -493,6 +626,54 @@ def _payload_blocking_reasons(payload: dict[str, Any]) -> list[str]:
     if not str(payload.get("client_order_id") or ""):
         reasons.append("missing_client_order_id")
     return reasons
+
+
+def _order_strategy(order: dict[str, Any]) -> str:
+    return str(order.get("strategy") or "").strip().lower()
+
+
+def _expected_option_type(order: dict[str, Any]) -> str | None:
+    strategy = _order_strategy(order)
+    if strategy in {"cash_secured_put", "csp"}:
+        return "put"
+    if strategy in {"covered_call", "cc"}:
+        return "call"
+    return None
+
+
+def _long_equity_shares(portfolio: PortfolioSnapshot, ticker: str) -> float:
+    return sum(
+        position.qty
+        for position in portfolio.positions
+        if position.is_long_equity and position.symbol.upper() == ticker
+    )
+
+
+def _short_call_contracts(portfolio: PortfolioSnapshot, ticker: str) -> float:
+    return sum(
+        abs(position.qty)
+        for position in portfolio.positions
+        if position.active_underlying == ticker and position.is_short_call
+    )
+
+
+def _open_sell_call_contracts(portfolio: PortfolioSnapshot, ticker: str) -> float:
+    return sum(
+        order.qty
+        for order in portfolio.open_orders
+        if order.active_underlying == ticker and order.is_sell_call
+    )
+
+
+def _open_sell_equity_shares(portfolio: PortfolioSnapshot, ticker: str) -> float:
+    return sum(
+        order.qty
+        for order in portfolio.open_orders
+        if order.option_type is None
+        and order.active_underlying == ticker
+        and (order.side or "").lower() == "sell"
+        and order.parent_order_id is None
+    )
 
 
 def _broker_payload(payload: dict[str, Any]) -> dict[str, Any]:
