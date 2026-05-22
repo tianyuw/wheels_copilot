@@ -17,6 +17,22 @@ account:
   currency: USD
   live_trading_enabled: false
 
+backtest_execution:
+  model: day_agg_synthetic_spread
+  scan_timing: previous_close_signal_next_open_fill
+  fill_policy: mid
+  reference_price_source: option_day_agg_open
+  calibration_status: v0_uncalibrated
+  synthetic_spread:
+    min_spread_pct_of_mid: 0.08
+    max_spread_pct_of_mid: 0.40
+    low_premium_threshold: 0.50
+    low_premium_extra_pct: 0.05
+    low_volume_threshold: 50
+    low_volume_extra_pct: 0.05
+    wide_otm_pct_threshold: 0.15
+    wide_otm_extra_pct: 0.03
+
 alpaca:
   paper_base_url: https://paper-api.alpaca.markets
   data_base_url: https://data.alpaca.markets

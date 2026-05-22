@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .csp_selector import evaluate_csp_candidates
+from .execution_price import (
+    BacktestExecutionModel,
+    build_backtest_execution_model,
+    entry_fill_diagnostics,
+    entry_fill_price,
+)
 from .gates import (
     evaluate_covered_call_earnings_gate,
     evaluate_covered_call_ex_dividend_gate,
@@ -36,7 +42,7 @@ from .portfolio_risk import evaluate_portfolio_risk
 from .support import analyze_support
 
 
-BACKTEST_VERSION = "phase_two_csp_cc_v1"
+BACKTEST_VERSION = "phase_two_csp_cc_execution_v2"
 DEFAULT_LOOKBACK_CALENDAR_DAYS = 430
 DEFAULT_SLIPPAGE_PCT = 0.05
 DEFAULT_OPTION_FEE_PER_CONTRACT = 0.10
@@ -239,6 +245,7 @@ def run_backtest(
     quantity = max(1, int(config.get("trade_planner", {}).get("default_contract_quantity", 1)))
     if max_orders_per_day is None:
         max_orders_per_day = int(config.get("execution", {}).get("max_orders_per_run", 3))
+    execution_model = build_backtest_execution_model(config, slippage_pct=slippage_pct)
 
     for day in run_days:
         todays_bars = bars_by_day.get(day, {})
@@ -305,6 +312,7 @@ def run_backtest(
                 risk_free_rate=risk_free_rate,
                 option_fee_per_contract=option_fee_per_contract,
                 max_orders=max_orders_per_day,
+                execution_model=execution_model,
                 trades=trades,
                 events=events,
                 rejected_reason_counts=rejected_reason_counts,
@@ -372,6 +380,7 @@ def run_backtest(
                     dte_max=dte_max,
                     slippage_pct=slippage_pct,
                     risk_free_rate=risk_free_rate,
+                    execution_model=execution_model,
                 )
                 if candidate is None:
                     reason = _primary_rejection_reason(rejection_summary)
@@ -490,6 +499,7 @@ def run_backtest(
                     ticker=ticker,
                     contracts=quantity,
                     option_fee_per_contract=option_fee_per_contract,
+                    execution_model=execution_model,
                     support_summary=support_summary,
                     trades=trades,
                     events=events,
@@ -557,6 +567,10 @@ def run_backtest(
         "would_reject_count"
     ]
     summary["fundamental_warn_count"] = fundamental_diagnostics["warn_count"]
+    summary["execution_model"] = execution_model.model
+    summary["execution_fill_policy"] = execution_model.fill_policy
+    summary["execution_reference_price_source"] = execution_model.reference_price_source
+    summary["execution_calibration_status"] = execution_model.calibration_status
     return {
         "version": BACKTEST_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -566,8 +580,8 @@ def run_backtest(
         "assumptions": [
             "Phase 2 opens cash-secured puts, assigns ITM puts, and sells covered calls against uncovered 100-share lots on the next eligible trading day.",
             "Support/trend signals use only bars strictly before the scan date.",
-            "Short put entry assumes the prior-close signal can be executed at the scan-day option day-aggregate open price with a slippage haircut.",
-            "Covered call entry also uses scan-day option day-aggregate open price with a slippage haircut.",
+            "Short put entry uses the configured backtest execution model; default v2 uses a synthetic bid/ask spread around the slippage-adjusted option day-aggregate reference price and fills at modeled mid.",
+            "Covered call entry uses the same configured backtest execution model as short puts.",
             "Day-aggregate option volume above zero is treated as necessary but not sufficient fillability evidence.",
             "Delta filters inferred from day-aggregate option prices are approximate in Phase 1.",
             "No early assignment, early profit-taking, rolling, or 21-DTE management is modeled in Phase 1.",
@@ -591,6 +605,7 @@ def run_backtest(
                 if fundamental_profile != "technical_only"
                 else None
             ),
+            "backtest_execution": execution_model.metadata(),
         },
         "config_snapshot": config,
         "fundamental_diagnostics": fundamental_diagnostics,
@@ -667,6 +682,7 @@ def _select_candidate_for_day(
     dte_max: int,
     slippage_pct: float,
     risk_free_rate: float,
+    execution_model: BacktestExecutionModel,
 ) -> tuple[CspCandidate | None, dict[str, Any] | None, dict[str, int]]:
     support_bars = [bar for bar in bars if bar.date < day]
     if len(support_bars) < 30:
@@ -712,6 +728,7 @@ def _select_candidate_for_day(
         slippage_pct=slippage_pct,
         risk_free_rate=risk_free_rate,
         stock_price=support.current_price,
+        execution_model=execution_model,
     )
     if not options:
         return None, support_summary, {"no_fillable_put_options": 1}
@@ -730,15 +747,19 @@ def _open_short_put(
     ticker: str,
     contracts: int,
     option_fee_per_contract: float,
+    execution_model: BacktestExecutionModel,
     support_summary: dict[str, Any] | None,
     trades: list[dict[str, Any]],
     events: list[dict[str, Any]],
     diagnostics: dict[str, Any],
 ) -> bool:
     option = candidate.option
-    entry_price = option.mid
-    if entry_price <= 0:
+    entry_price = entry_fill_price(option, execution_model, side="sell")
+    if entry_price is None or entry_price <= 0:
         return False
+    execution_diagnostics = entry_fill_diagnostics(
+        option, execution_model, side="sell"
+    )
     fees = option_fee_per_contract * contracts
     gross_credit = entry_price * 100.0 * contracts
     trade_id = f"{day.isoformat()}-{ticker}-{len(trades) + 1}"
@@ -777,6 +798,21 @@ def _open_short_put(
             "strike": option.strike,
             "contracts": contracts,
             "entry_price": entry_price,
+            "entry_market_bid": execution_diagnostics["market_bid"],
+            "entry_market_ask": execution_diagnostics["market_ask"],
+            "entry_market_mid": execution_diagnostics["market_mid"],
+            "entry_spread_pct_of_mid": execution_diagnostics["spread_pct_of_mid"],
+            "entry_fill_discount_pct_of_mid": execution_diagnostics[
+                "fill_discount_pct_of_mid"
+            ],
+            "execution_model": execution_diagnostics["execution_model"],
+            "execution_fill_policy": execution_diagnostics["fill_policy"],
+            "execution_reference_price_source": execution_diagnostics[
+                "reference_price_source"
+            ],
+            "execution_calibration_status": execution_diagnostics[
+                "calibration_status"
+            ],
             "gross_credit": gross_credit,
             "fees": fees,
             "net_credit": gross_credit - fees,
@@ -797,6 +833,7 @@ def _open_short_put(
             "expiration": option.expiration.isoformat(),
             "contracts": contracts,
             "entry_price": entry_price,
+            "execution": execution_diagnostics,
             "gross_credit": gross_credit,
             "fees": fees,
             "support": support_summary,
@@ -825,6 +862,7 @@ def _open_covered_calls_for_day(
     risk_free_rate: float,
     option_fee_per_contract: float,
     max_orders: int,
+    execution_model: BacktestExecutionModel,
     trades: list[dict[str, Any]],
     events: list[dict[str, Any]],
     rejected_reason_counts: Counter[str],
@@ -850,6 +888,7 @@ def _open_covered_calls_for_day(
             slippage_pct=slippage_pct,
             risk_free_rate=risk_free_rate,
             stock_price=latest_close.get(ticker),
+            execution_model=execution_model,
         )
         if option is None:
             _reject(
@@ -935,6 +974,7 @@ def _open_covered_calls_for_day(
             ticker=ticker,
             contracts=contracts,
             option_fee_per_contract=option_fee_per_contract,
+            execution_model=execution_model,
             trades=trades,
             events=events,
             adjusted_cost_basis=stock.adjusted_average_cost,
@@ -972,6 +1012,7 @@ def _select_covered_call_for_day(
     slippage_pct: float,
     risk_free_rate: float,
     stock_price: float | None,
+    execution_model: BacktestExecutionModel,
 ) -> tuple[OptionQuote | None, dict[str, int]]:
     options = data.option_chain(
         ticker,
@@ -983,6 +1024,7 @@ def _select_covered_call_for_day(
         slippage_pct=slippage_pct,
         risk_free_rate=risk_free_rate,
         stock_price=stock_price,
+        execution_model=execution_model,
     )
     if not options:
         return None, {"no_fillable_call_options": 1}
@@ -1041,14 +1083,18 @@ def _open_short_call(
     ticker: str,
     contracts: int,
     option_fee_per_contract: float,
+    execution_model: BacktestExecutionModel,
     trades: list[dict[str, Any]],
     events: list[dict[str, Any]],
     adjusted_cost_basis: float | None,
     diagnostics: dict[str, Any] | None = None,
 ) -> bool:
-    entry_price = option.mid
-    if entry_price <= 0:
+    entry_price = entry_fill_price(option, execution_model, side="sell")
+    if entry_price is None or entry_price <= 0:
         return False
+    execution_diagnostics = entry_fill_diagnostics(
+        option, execution_model, side="sell"
+    )
     fees = option_fee_per_contract * contracts
     gross_credit = entry_price * 100.0 * contracts
     trade_id = f"{day.isoformat()}-{ticker}-{len(trades) + 1}"
@@ -1081,6 +1127,21 @@ def _open_short_call(
             "strike": option.strike,
             "contracts": contracts,
             "entry_price": entry_price,
+            "entry_market_bid": execution_diagnostics["market_bid"],
+            "entry_market_ask": execution_diagnostics["market_ask"],
+            "entry_market_mid": execution_diagnostics["market_mid"],
+            "entry_spread_pct_of_mid": execution_diagnostics["spread_pct_of_mid"],
+            "entry_fill_discount_pct_of_mid": execution_diagnostics[
+                "fill_discount_pct_of_mid"
+            ],
+            "execution_model": execution_diagnostics["execution_model"],
+            "execution_fill_policy": execution_diagnostics["fill_policy"],
+            "execution_reference_price_source": execution_diagnostics[
+                "reference_price_source"
+            ],
+            "execution_calibration_status": execution_diagnostics[
+                "calibration_status"
+            ],
             "gross_credit": gross_credit,
             "fees": fees,
             "net_credit": gross_credit - fees,
@@ -1099,6 +1160,7 @@ def _open_short_call(
             "expiration": option.expiration.isoformat(),
             "contracts": contracts,
             "entry_price": entry_price,
+            "execution": execution_diagnostics,
             "gross_credit": gross_credit,
             "fees": fees,
             "adjusted_cost_basis": adjusted_cost_basis,
@@ -1893,6 +1955,16 @@ def _summarize_backtest(
         for row in equity_curve
         if row.get("capital_utilization_pct") is not None
     ]
+    entry_spreads = [
+        float(trade["entry_spread_pct_of_mid"])
+        for trade in trades
+        if trade.get("entry_spread_pct_of_mid") is not None
+    ]
+    entry_fill_discounts = [
+        float(trade["entry_fill_discount_pct_of_mid"])
+        for trade in trades
+        if trade.get("entry_fill_discount_pct_of_mid") is not None
+    ]
     return {
         "starting_equity": round(starting_equity, 2),
         "ending_equity": round(ending_equity, 2),
@@ -1929,6 +2001,16 @@ def _summarize_backtest(
         ),
         "max_capital_utilization_pct": (
             round(max(utilization_values), 4) if utilization_values else 0.0
+        ),
+        "average_entry_spread_pct_of_mid": (
+            round(sum(entry_spreads) / len(entry_spreads), 6)
+            if entry_spreads
+            else None
+        ),
+        "average_entry_fill_discount_pct_of_mid": (
+            round(sum(entry_fill_discounts) / len(entry_fill_discounts), 6)
+            if entry_fill_discounts
+            else None
         ),
     }
 
@@ -2015,6 +2097,10 @@ def _render_report(result: dict[str, Any]) -> str:
         f"- Fundamental profile: {summary.get('fundamental_profile', 'technical_only')}",
         f"- Fundamental would-rejects: {summary.get('fundamental_would_reject_count', 0)}",
         f"- Fundamental warnings: {summary.get('fundamental_warn_count', 0)}",
+        f"- Execution model: {summary.get('execution_model', 'unknown')}",
+        f"- Execution fill policy: {summary.get('execution_fill_policy', 'unknown')}",
+        f"- Avg entry spread pct of mid: {summary.get('average_entry_spread_pct_of_mid')}",
+        f"- Avg entry fill discount pct of mid: {summary.get('average_entry_fill_discount_pct_of_mid')}",
         "",
         "## Assumptions",
         "",

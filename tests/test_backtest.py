@@ -44,6 +44,35 @@ class BacktestRunnerTests(unittest.TestCase):
         self.assertGreater(result["summary"]["ending_equity"], 500000)
         self.assertEqual(result["trades"][0]["status"], "EXPIRED_WORTHLESS")
 
+    def test_backtest_records_execution_model_and_mid_fill(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        data = _FakeData(
+            bars={"AAPL": _bars(start, end, close=110)},
+            options={("AAPL", start): [_put(expiration=end, strike=95, bid=0.90, ask=1.10)]},
+            marks={},
+        )
+        config = _config()
+        config["csp_selector"]["max_spread_pct_of_mid"] = 0.25
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=config,
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+            )
+
+        trade = result["trades"][0]
+        self.assertEqual(result["summary"]["execution_model"], "day_agg_synthetic_spread")
+        self.assertEqual(result["summary"]["execution_fill_policy"], "mid")
+        self.assertAlmostEqual(trade["entry_price"], 1.0)
+        self.assertAlmostEqual(trade["entry_market_bid"], 0.90)
+        self.assertAlmostEqual(trade["entry_market_ask"], 1.10)
+        self.assertAlmostEqual(trade["entry_spread_pct_of_mid"], 0.20)
+
     def test_short_put_assignment_creates_stock_position(self):
         start = date(2026, 1, 5)
         end = date(2026, 1, 9)
@@ -760,6 +789,7 @@ class _FakeData:
         slippage_pct: float = 0.0,
         risk_free_rate: float = 0.04,
         stock_price: float | None = None,
+        execution_model=None,
     ) -> list[OptionQuote]:
         options = self.options.get((underlying, as_of), [])
         return [

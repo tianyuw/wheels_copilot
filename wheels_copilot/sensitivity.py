@@ -554,6 +554,18 @@ def flatten_run_metrics(
         "average_capital_utilization_pct": summary.get("average_capital_utilization_pct"),
         "max_capital_utilization_pct": summary.get("max_capital_utilization_pct"),
         "data_issue_count": summary.get("data_issue_count"),
+        "execution_model": summary.get("execution_model"),
+        "execution_fill_policy": summary.get("execution_fill_policy"),
+        "execution_reference_price_source": summary.get(
+            "execution_reference_price_source"
+        ),
+        "execution_calibration_status": summary.get("execution_calibration_status"),
+        "average_entry_spread_pct_of_mid": summary.get(
+            "average_entry_spread_pct_of_mid"
+        ),
+        "average_entry_fill_discount_pct_of_mid": summary.get(
+            "average_entry_fill_discount_pct_of_mid"
+        ),
         "sample_size_flag": opened_csp < 30,
     }
     for reason, count in (summary.get("rejected_reason_counts") or {}).items():
@@ -669,6 +681,12 @@ def write_leaderboard_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "average_capital_utilization_pct",
         "max_capital_utilization_pct",
         "data_issue_count",
+        "execution_model",
+        "execution_fill_policy",
+        "execution_reference_price_source",
+        "execution_calibration_status",
+        "average_entry_spread_pct_of_mid",
+        "average_entry_fill_discount_pct_of_mid",
         "sample_size_flag",
         "parameter_patch",
     ]
@@ -703,8 +721,8 @@ def render_sensitivity_report(rows: list[dict[str, Any]]) -> str:
         "- Ranking is diagnostic, not an automatic live-trading parameter choice.",
         "- Single-window results can overfit one market regime; validate on more windows before adopting.",
         "",
-        "| Run | Experiment | Return | Max DD | Return/DD | CSPs | Assigned | CCs | Called Away | Avg Util | Data Issues | Sample |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| Run | Experiment | Return | Max DD | Return/DD | CSPs | Assigned | CCs | Called Away | Avg Util | Avg Spread | Exec | Data Issues | Sample |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|",
     ]
     for row in rows[:50]:
         sample = "LOW" if row.get("sample_size_flag") else "OK"
@@ -717,6 +735,8 @@ def render_sensitivity_report(rows: list[dict[str, Any]]) -> str:
             f"{row.get('opened_short_puts')} | {row.get('assigned')} | "
             f"{row.get('opened_covered_calls')} | {row.get('called_away')} | "
             f"{_fmt(row.get('average_capital_utilization_pct'))}% | "
+            f"{_fmt(row.get('average_entry_spread_pct_of_mid'))} | "
+            f"{row.get('execution_model') or ''}/{row.get('execution_fill_policy') or ''} | "
             f"{row.get('data_issue_count')} | {sample} |"
         )
     return "\n".join(lines) + "\n"
@@ -770,7 +790,7 @@ def default_data_source_metadata() -> dict[str, Any]:
         "provider": "massive_flatfiles",
         "datasets": {
             "stocks": "us_stocks_sip/day_aggs_v1",
-            "options": "us_options_opra/day_aggs_v1",
+            "options": "us_options_opra/day_aggs_v1 with backtest execution model",
         },
     }
 

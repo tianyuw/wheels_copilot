@@ -17,6 +17,7 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
+from .execution_price import BacktestExecutionModel, modeled_quote_from_reference
 from .models import OptionQuote, PriceBar
 from .option_math import black_scholes_call_delta, black_scholes_put_delta, norm_cdf
 
@@ -61,6 +62,7 @@ class HistoricalDataStore(Protocol):
         slippage_pct: float = 0.0,
         risk_free_rate: float = 0.04,
         stock_price: float | None = None,
+        execution_model: BacktestExecutionModel | None = None,
     ) -> list[OptionQuote]:
         ...
 
@@ -233,6 +235,7 @@ class FlatFilesStore:
         slippage_pct: float = 0.0,
         risk_free_rate: float = 0.04,
         stock_price: float | None = None,
+        execution_model: BacktestExecutionModel | None = None,
     ) -> list[OptionQuote]:
         underlying = underlying.upper()
         chains = self.option_day_rows(as_of, {underlying}, option_type=option_type)
@@ -251,10 +254,21 @@ class FlatFilesStore:
             raw_price = to_float(row.get(price_field))
             if raw_price <= 0:
                 continue
-            executable_price = raw_price * max(0.0, 1.0 - slippage_pct)
+            if execution_model is None:
+                bid = ask = raw_price * max(0.0, 1.0 - slippage_pct)
+            else:
+                bid, ask, _spread_pct = modeled_quote_from_reference(
+                    reference_price=raw_price,
+                    option_type=option_type,
+                    strike=parsed.strike,
+                    stock_price=stock_price,
+                    volume=volume,
+                    execution_model=execution_model,
+                )
+            executable_mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
             iv = _infer_iv(
                 option_type=option_type,
-                price=executable_price,
+                price=executable_mid,
                 stock_price=stock_price,
                 strike=parsed.strike,
                 dte=dte,
@@ -274,8 +288,8 @@ class FlatFilesStore:
                     expiration=parsed.expiration,
                     dte=dte,
                     strike=parsed.strike,
-                    bid=executable_price,
-                    ask=executable_price,
+                    bid=bid,
+                    ask=ask,
                     last=to_float(row.get("close")) or raw_price,
                     implied_volatility=iv,
                     volume=volume,

@@ -5,6 +5,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 
+from wheels_copilot.execution_price import build_backtest_execution_model
 from wheels_copilot.historical_data import (
     FlatFilesStore,
     black_scholes_call_price,
@@ -92,6 +93,46 @@ class HistoricalDataTests(unittest.TestCase):
         self.assertEqual(len(options), 1)
         self.assertEqual(options[0].symbol, "AAPL260109P00090000")
         self.assertEqual(options[0].volume, 10)
+
+    def test_option_chain_applies_synthetic_spread_execution_model(self):
+        store = _MemoryFlatFilesStore(
+            rows=[
+                {
+                    "ticker": "O:AAPL260109P00090000",
+                    "open": "1.00",
+                    "close": "1.10",
+                    "volume": "100",
+                },
+            ]
+        )
+        execution_model = build_backtest_execution_model(
+            {
+                "backtest_execution": {
+                    "model": "day_agg_synthetic_spread",
+                    "fill_policy": "mid",
+                    "synthetic_spread": {
+                        "min_spread_pct_of_mid": 0.10,
+                        "max_spread_pct_of_mid": 0.10,
+                    },
+                }
+            },
+            slippage_pct=0.0,
+        )
+
+        options = store.option_chain(
+            "AAPL",
+            date(2026, 1, 5),
+            dte_min=1,
+            dte_max=9,
+            stock_price=110,
+            execution_model=execution_model,
+        )
+
+        self.assertEqual(len(options), 1)
+        self.assertAlmostEqual(options[0].bid, 0.95)
+        self.assertAlmostEqual(options[0].ask, 1.05)
+        self.assertAlmostEqual(options[0].mid, 1.0)
+        self.assertAlmostEqual(options[0].spread_pct_of_mid or 0.0, 0.10)
 
     def test_option_day_memory_cache_keeps_only_current_day(self):
         store = FlatFilesStore(cache_dir=Path(tempfile.gettempdir()))
