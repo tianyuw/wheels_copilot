@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from wheels_copilot.backtest import run_backtest, write_backtest_outputs
+from wheels_copilot.config import load_config
+from wheels_copilot.historical_data import DEFAULT_FLATFILES_CACHE_DIR, FlatFilesStore
+
+
+def main() -> int:
+    args = parse_args()
+    config = load_config(args.config)
+    universe = resolve_universe(config, args)
+    if not universe:
+        raise SystemExit("No tickers selected for backtest.")
+
+    store = FlatFilesStore(cache_dir=Path(args.cache_dir))
+    if not args.skip_cache_preflight:
+        store.require_writable_cache()
+
+    result = run_backtest(
+        config=config,
+        data=store,
+        universe=universe,
+        start=parse_date(args.start),
+        end=parse_date(args.end),
+        schedule=args.schedule,
+        lookback_calendar_days=args.lookback_calendar_days,
+        slippage_pct=args.slippage_pct,
+        option_fee_per_contract=args.option_fee_per_contract,
+        risk_free_rate=args.risk_free_rate,
+        max_orders_per_day=args.max_orders_per_day,
+        split_ratio_low=args.split_ratio_low,
+        split_ratio_high=args.split_ratio_high,
+    )
+    output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(args)
+    paths = write_backtest_outputs(result, output_dir)
+    print(json.dumps({name: str(path) for name, path in paths.items()}, indent=2))
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the phase-one Wheel Copilot historical backtest."
+    )
+    parser.add_argument("--start", required=True, help="Backtest start date, YYYY-MM-DD.")
+    parser.add_argument("--end", required=True, help="Backtest end date, YYYY-MM-DD.")
+    parser.add_argument("--config", default="config/markus_wheel.yaml")
+    parser.add_argument(
+        "--universe",
+        choices=["watchlist", "tickers", "file"],
+        default="watchlist",
+        help="Ticker universe source.",
+    )
+    parser.add_argument("--tickers", help="Comma-separated tickers when --universe tickers.")
+    parser.add_argument("--universe-file", help="One ticker per line or JSON list.")
+    parser.add_argument(
+        "--cache-dir",
+        default=str(DEFAULT_FLATFILES_CACHE_DIR),
+        help="Massive FlatFiles filtered cache directory.",
+    )
+    parser.add_argument("--output-dir", help="Directory for JSON/CSV/Markdown outputs.")
+    parser.add_argument("--schedule", choices=["daily"], default="daily")
+    parser.add_argument("--lookback-calendar-days", type=int, default=430)
+    parser.add_argument("--slippage-pct", type=float, default=0.05)
+    parser.add_argument("--option-fee-per-contract", type=float, default=0.10)
+    parser.add_argument("--risk-free-rate", type=float, default=0.04)
+    parser.add_argument("--max-orders-per-day", type=int)
+    parser.add_argument("--split-ratio-low", type=float, default=0.75)
+    parser.add_argument("--split-ratio-high", type=float, default=1.25)
+    parser.add_argument(
+        "--skip-cache-preflight",
+        action="store_true",
+        help="Skip Data volume write/read/delete preflight. Intended for tests only.",
+    )
+    return parser.parse_args()
+
+
+def resolve_universe(config: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    if args.universe == "watchlist":
+        tickers = config.get("watchlist", {}).get("tickers", [])
+        return normalize_tickers(tickers)
+    if args.universe == "tickers":
+        if not args.tickers:
+            raise SystemExit("--tickers is required when --universe tickers")
+        return normalize_tickers(args.tickers.split(","))
+    if args.universe == "file":
+        if not args.universe_file:
+            raise SystemExit("--universe-file is required when --universe file")
+        return normalize_tickers(read_universe_file(Path(args.universe_file)))
+    raise SystemExit(f"Unsupported universe source: {args.universe}")
+
+
+def read_universe_file(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        payload = json.loads(text)
+        if not isinstance(payload, list):
+            raise ValueError(f"Universe JSON must be a list: {path}")
+        return [str(item) for item in payload]
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def normalize_tickers(values: list[str]) -> list[str]:
+    return sorted({str(value).strip().upper() for value in values if str(value).strip()})
+
+
+def parse_date(value: str) -> date:
+    return date.fromisoformat(value)
+
+
+def default_output_dir(args: argparse.Namespace) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return ROOT / "workspace" / "backtests" / f"phase1_{args.start}_{args.end}_{stamp}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
