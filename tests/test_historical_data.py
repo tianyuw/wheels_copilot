@@ -13,6 +13,8 @@ from wheels_copilot.historical_data import (
     infer_put_iv,
     infer_call_iv,
     parse_option_symbol,
+    read_json_if_exists,
+    write_json_atomic,
 )
 from wheels_copilot.models import PriceBar
 
@@ -47,6 +49,19 @@ class HistoricalDataTests(unittest.TestCase):
 
             self.assertTrue(result.ok, result.reason)
             self.assertFalse((Path(tmp) / ".preflight" / "write_probe.txt").exists())
+
+    def test_cache_json_writer_cleans_temp_and_corrupt_reader_quarantines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cache.json"
+
+            write_json_atomic(path, {"ok": True})
+            self.assertEqual(read_json_if_exists(path), {"ok": True})
+            self.assertFalse(list(Path(tmp).glob("cache.json.tmp.*")))
+
+            path.write_text("{not json", encoding="utf-8")
+            self.assertIsNone(read_json_if_exists(path))
+            self.assertFalse(path.exists())
+            self.assertEqual(len(list(Path(tmp).glob("cache.json.corrupt.*"))), 1)
 
     def test_option_chain_filters_zero_volume_contracts(self):
         store = _MemoryFlatFilesStore(

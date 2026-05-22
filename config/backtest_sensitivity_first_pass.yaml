@@ -1,0 +1,31 @@
+name: phase2_first_pass_parameter_pressure
+description: >
+  First-pass sensitivity matrix for Phase 2 CSP plus covered-call backtests.
+  Each experiment changes one related family of parameters while keeping the
+  rest of the Markus-style wheel configuration fixed.
+
+experiments:
+  - name: capital_utilization
+    matrix:
+      portfolio.max_active_tickers: [5, 8, 10]
+      execution.max_orders_per_run: [3, 5]
+
+  - name: csp_delta_normal
+    matrix:
+      csp_selector.delta_policy.normal_support.target_delta_min: [0.10, 0.12, 0.15]
+      csp_selector.delta_policy.normal_support.target_delta_max: [0.25, 0.30]
+
+  - name: csp_dte_window
+    matrix:
+      csp_selector.dte_min: [1, 7]
+      csp_selector.dte_max: [9, 14, 21]
+
+  - name: csp_distance_pressure
+    matrix:
+      csp_selector.min_strike_distance_pct: [3.0, 2.0, 1.5]
+      csp_selector.min_strike_distance_atr_multiple: [1.0, 0.75]
+
+  - name: covered_call_delta
+    matrix:
+      cc_selector.target_delta_min: [0.08, 0.10, 0.15]
+      cc_selector.target_delta_max: [0.30, 0.35, 0.40]

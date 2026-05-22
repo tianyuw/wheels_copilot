@@ -5,20 +5,31 @@ import gzip
 import io
 import json
 import math
+import os
 import subprocess
 import sys
+import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 from .models import OptionQuote, PriceBar
 from .option_math import black_scholes_call_delta, black_scholes_put_delta, norm_cdf
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms.
+    fcntl = None  # type: ignore[assignment]
+
 
 DEFAULT_FLATFILES_CACHE_DIR = Path("/Volumes/Data/wheels_copilot/flatfiles_cache")
 DEFAULT_ENDPOINT_URL = "https://files.massive.com"
 DEFAULT_BUCKET = "flatfiles"
+DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS = 300.0
 
 
 class BacktestDataError(RuntimeError):
@@ -179,25 +190,36 @@ class FlatFilesStore:
         if cached is not None:
             return {} if cached.get("missing") else cached.get("rows", {})
 
-        rows: dict[str, dict[str, Any]] = {}
-        try:
-            for row in self.iter_dataset_rows("stocks-day-aggs", day):
-                ticker = str(row.get("ticker") or "").upper()
-                if ticker in tickers:
-                    rows[ticker] = row
-        except FlatFileMissing:
+        with cache_file_lock(
+            cache_path,
+            timeout_seconds=max(
+                self.cache_timeout_seconds,
+                DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS,
+            ),
+        ):
+            cached = read_json_if_exists(cache_path)
+            if cached is not None:
+                return {} if cached.get("missing") else cached.get("rows", {})
+
+            rows: dict[str, dict[str, Any]] = {}
+            try:
+                for row in self.iter_dataset_rows("stocks-day-aggs", day):
+                    ticker = str(row.get("ticker") or "").upper()
+                    if ticker in tickers:
+                        rows[ticker] = row
+            except FlatFileMissing:
+                write_json_atomic(
+                    cache_path,
+                    {"missing": True, "rows": {}},
+                    timeout_seconds=self.cache_timeout_seconds,
+                )
+                return {}
             write_json_atomic(
                 cache_path,
-                {"missing": True, "rows": {}},
+                {"missing": False, "rows": rows},
                 timeout_seconds=self.cache_timeout_seconds,
             )
-            return {}
-        write_json_atomic(
-            cache_path,
-            {"missing": False, "rows": rows},
-            timeout_seconds=self.cache_timeout_seconds,
-        )
-        return rows
+            return rows
 
     def option_chain(
         self,
@@ -353,52 +375,70 @@ class FlatFilesStore:
             )
             return chains
 
-        chains: dict[str, list[dict[str, Any]]] = {
-            ticker: [] for ticker in normalized_underlyings
-        }
-        try:
-            for row in self.iter_dataset_rows("options-day-aggs", day):
-                parsed = parse_option_symbol(str(row.get("ticker") or ""))
-                if parsed is None or parsed.option_type != option_type:
-                    continue
-                if parsed.underlying not in normalized_underlyings:
-                    continue
-                normalized = dict(row)
-                normalized.update(
-                    {
-                        "underlying": parsed.underlying,
-                        "expiration": parsed.expiration.isoformat(),
-                        "option_type": parsed.option_type,
-                        "strike": parsed.strike,
-                        "normalized_ticker": normalize_option_symbol(parsed.raw_symbol),
-                    }
+        with cache_file_lock(
+            cache_path,
+            timeout_seconds=max(
+                self.cache_timeout_seconds,
+                DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS,
+            ),
+        ):
+            cached = read_json_if_exists(cache_path)
+            if cached is not None:
+                chains = {} if cached.get("missing") else cached.get("chains", {})
+                self._remember_option_day_rows(
+                    day,
+                    normalized_underlyings,
+                    option_type=option_type,
+                    chains=chains,
                 )
-                chains[parsed.underlying].append(normalized)
-        except FlatFileMissing:
+                return chains
+
+            chains: dict[str, list[dict[str, Any]]] = {
+                ticker: [] for ticker in normalized_underlyings
+            }
+            try:
+                for row in self.iter_dataset_rows("options-day-aggs", day):
+                    parsed = parse_option_symbol(str(row.get("ticker") or ""))
+                    if parsed is None or parsed.option_type != option_type:
+                        continue
+                    if parsed.underlying not in normalized_underlyings:
+                        continue
+                    normalized = dict(row)
+                    normalized.update(
+                        {
+                            "underlying": parsed.underlying,
+                            "expiration": parsed.expiration.isoformat(),
+                            "option_type": parsed.option_type,
+                            "strike": parsed.strike,
+                            "normalized_ticker": normalize_option_symbol(parsed.raw_symbol),
+                        }
+                    )
+                    chains[parsed.underlying].append(normalized)
+            except FlatFileMissing:
+                write_json_atomic(
+                    cache_path,
+                    {"missing": True, "chains": {}},
+                    timeout_seconds=self.cache_timeout_seconds,
+                )
+                self._remember_option_day_rows(
+                    day,
+                    normalized_underlyings,
+                    option_type=option_type,
+                    chains={},
+                )
+                return {}
             write_json_atomic(
                 cache_path,
-                {"missing": True, "chains": {}},
+                {"missing": False, "chains": chains},
                 timeout_seconds=self.cache_timeout_seconds,
             )
             self._remember_option_day_rows(
                 day,
                 normalized_underlyings,
                 option_type=option_type,
-                chains={},
+                chains=chains,
             )
-            return {}
-        write_json_atomic(
-            cache_path,
-            {"missing": False, "chains": chains},
-            timeout_seconds=self.cache_timeout_seconds,
-        )
-        self._remember_option_day_rows(
-            day,
-            normalized_underlyings,
-            option_type=option_type,
-            chains=chains,
-        )
-        return chains
+            return chains
 
     def _option_day_memory_hit(
         self,
@@ -585,7 +625,9 @@ def write_json_atomic(
     timeout_seconds: float = 15.0,
 ) -> None:
     ensure_parent_dir(path, timeout_seconds)
-    temp_path = path.with_name(path.name + ".tmp")
+    temp_path = path.with_name(
+        f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
     data = json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n"
     script = (
         "from pathlib import Path\n"
@@ -611,13 +653,58 @@ def write_json_atomic(
         raise BacktestDataError(
             f"failed to write cache file {path}: {(exc.stderr or '').strip()}"
         ) from exc
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def read_json_if_exists(path: Path) -> Any | None:
     if not path.exists():
         return None
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except JSONDecodeError:
+        quarantine_corrupt_json(path)
+        return None
+
+
+@contextmanager
+def cache_file_lock(path: Path, *, timeout_seconds: float = 15.0):
+    if fcntl is None:
+        raise BacktestDataError(
+            "FlatFiles cache locking requires POSIX fcntl; run backtests on macOS or Linux."
+        )
+    ensure_parent_dir(path, timeout_seconds)
+    # Keep lock files stable under .locks/. Unlinking an active lock path can split
+    # waiters across different inodes and allow duplicate writers.
+    lock_path = path.parent / ".locks" / f"{path.name}.lock"
+    ensure_parent_dir(lock_path, timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise BacktestDataError(f"timed out acquiring cache lock {lock_path}") from exc
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def quarantine_corrupt_json(path: Path) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    quarantine = path.with_name(f"{path.name}.corrupt.{stamp}.{os.getpid()}")
+    try:
+        os.replace(path, quarantine)
+    except OSError:
+        pass
 
 
 def infer_put_iv(
