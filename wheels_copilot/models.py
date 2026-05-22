@@ -109,6 +109,21 @@ class OptionQuote:
 
 
 @dataclass
+class FundamentalFieldProvenance:
+    value: Any | None = None
+    source: str | None = None
+    as_of: date | None = None
+    effective_date: date | None = None
+    known_at: date | datetime | None = None
+    quality: str = "unavailable"
+    staleness_days: int | None = None
+    is_stale: bool = False
+    fallback_used: bool = False
+    restatement_status: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
 class FundamentalSnapshot:
     ticker: str
     quote_type: str | None = None
@@ -126,6 +141,7 @@ class FundamentalSnapshot:
     annual_net_income: list[float] = field(default_factory=list)
     next_earnings_date: date | None = None
     recent_move_pct: float | None = None
+    provenance: dict[str, FundamentalFieldProvenance] = field(default_factory=dict)
 
     @property
     def is_etf(self) -> bool:

@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from wheels_copilot.backtest import run_backtest, write_backtest_outputs
 from wheels_copilot.config import load_config
+from wheels_copilot.historical_fundamentals import DEFAULT_FUNDAMENTALS_CACHE_DIR
 from wheels_copilot.historical_data import DEFAULT_FLATFILES_CACHE_DIR, FlatFilesStore
 
 
@@ -42,6 +43,12 @@ def main() -> int:
         max_orders_per_day=args.max_orders_per_day,
         split_ratio_low=args.split_ratio_low,
         split_ratio_high=args.split_ratio_high,
+        fundamental_profile=args.fundamental_profile,
+        fundamentals_cache_dir=Path(args.fundamentals_cache_dir),
+        fundamentals_env_file=Path(args.fundamentals_env_file)
+        if args.fundamentals_env_file
+        else None,
+        fundamentals_timeout_seconds=args.fundamentals_timeout_seconds,
     )
     output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(args)
     paths = write_backtest_outputs(result, output_dir)
@@ -78,6 +85,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-orders-per-day", type=int)
     parser.add_argument("--split-ratio-low", type=float, default=0.75)
     parser.add_argument("--split-ratio-high", type=float, default=1.25)
+    parser.add_argument(
+        "--fundamental-profile",
+        choices=[
+            "technical_only",
+            "fundamentals_warn",
+            "fundamentals_strict_financials",
+            "fundamentals_strict_all",
+        ],
+        default="technical_only",
+        help="Historical fundamental gate profile.",
+    )
+    parser.add_argument(
+        "--fundamentals-cache-dir",
+        default=str(DEFAULT_FUNDAMENTALS_CACHE_DIR),
+        help="Historical fundamentals REST cache directory.",
+    )
+    parser.add_argument(
+        "--fundamentals-env-file",
+        help="Optional .env file containing Massive and Unusual Whales credentials.",
+    )
+    parser.add_argument("--fundamentals-timeout-seconds", type=float, default=30.0)
     parser.add_argument(
         "--skip-cache-preflight",
         action="store_true",

@@ -9,11 +9,25 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .csp_selector import evaluate_csp_candidates
+from .gates import (
+    evaluate_covered_call_earnings_gate,
+    evaluate_covered_call_ex_dividend_gate,
+    evaluate_earnings_gate,
+    evaluate_fundamentals,
+)
 from .historical_data import HistoricalDataStore, detect_price_space_breaks
+from .historical_fundamentals import (
+    DEFAULT_FUNDAMENTALS_CACHE_DIR,
+    HistoricalFundamentalStore,
+    build_historical_fundamental_store,
+    provenance_payload,
+)
 from .models import (
     BrokerAccountSnapshot,
     BrokerPosition,
     CspCandidate,
+    FundamentalSnapshot,
+    GateResult,
     OptionQuote,
     PortfolioSnapshot,
     PriceBar,
@@ -27,6 +41,19 @@ DEFAULT_LOOKBACK_CALENDAR_DAYS = 430
 DEFAULT_SLIPPAGE_PCT = 0.05
 DEFAULT_OPTION_FEE_PER_CONTRACT = 0.10
 DEFAULT_RISK_FREE_RATE = 0.04
+FUNDAMENTAL_PROFILES = {
+    "technical_only",
+    "fundamentals_warn",
+    "fundamentals_strict_financials",
+    "fundamentals_strict_all",
+}
+STRICT_FINANCIAL_REASON_PREFIXES = (
+    "recent_move_",
+    "pe_ratio_non_positive",
+    "pe_ratio_at_or_above_",
+    "positive_quarters_",
+    "positive_years_",
+)
 
 
 @dataclass
@@ -117,11 +144,19 @@ def run_backtest(
     max_orders_per_day: int | None = None,
     split_ratio_low: float = 0.75,
     split_ratio_high: float = 1.25,
+    fundamental_profile: str = "technical_only",
+    historical_fundamentals: HistoricalFundamentalStore | None = None,
+    fundamentals_cache_dir: Path = DEFAULT_FUNDAMENTALS_CACHE_DIR,
+    fundamentals_env_file: Path | None = None,
+    fundamentals_timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
     if schedule != "daily":
         raise ValueError("phase one backtest only supports daily schedule")
     if end < start:
         raise ValueError("end date must be on or after start date")
+    fundamental_profile = _normalize_fundamental_profile(fundamental_profile)
+    if fundamental_profile == "technical_only":
+        historical_fundamentals = None
 
     tickers = sorted({str(ticker).strip().upper() for ticker in universe if str(ticker).strip()})
     if not tickers:
@@ -139,6 +174,16 @@ def run_backtest(
 
     history_start = start - timedelta(days=lookback_calendar_days)
     stock_bars = data.load_stock_bars(tickers, history_start, end)
+    if fundamental_profile != "technical_only" and historical_fundamentals is None:
+        historical_fundamentals = build_historical_fundamental_store(
+            config=config,
+            cache_dir=fundamentals_cache_dir,
+            env_file=fundamentals_env_file,
+            timeout_seconds=fundamentals_timeout_seconds,
+        )
+    if historical_fundamentals is not None and fundamental_profile != "technical_only":
+        historical_fundamentals.preload(tickers, start, end)
+
     bars_by_day = _bars_by_day(stock_bars)
     pre_start_split_issues = _detect_pre_start_split_issues(
         stock_bars,
@@ -172,6 +217,7 @@ def run_backtest(
     trades: list[dict[str, Any]] = []
     equity_curve: list[dict[str, Any]] = []
     rejected_reason_counts: Counter[str] = Counter()
+    fundamental_stats = _new_fundamental_stats(fundamental_profile)
     latest_close: dict[str, float] = {
         ticker: bar.close
         for ticker, bars in stock_bars.items()
@@ -244,9 +290,13 @@ def run_backtest(
             orders_opened_today += _open_covered_calls_for_day(
                 state=state,
                 data=data,
+                historical_fundamentals=historical_fundamentals,
+                fundamental_profile=fundamental_profile,
+                fundamental_stats=fundamental_stats,
                 tickers=tickers,
                 blocked_tickers=blocked_tickers,
                 todays_bars=todays_bars,
+                stock_bars=stock_bars,
                 day=day,
                 config=config,
                 dte_min=cc_dte_min,
@@ -278,6 +328,39 @@ def run_backtest(
                     continue
                 if state.stocks.get(ticker, StockPosition(ticker)).shares >= 100:
                     continue
+
+                fundamental_context = _fundamental_context(
+                    historical_fundamentals=historical_fundamentals,
+                    profile=fundamental_profile,
+                    ticker=ticker,
+                    day=day,
+                    bars=stock_bars.get(ticker, []),
+                    config=config,
+                )
+                if fundamental_context is not None:
+                    _record_fundamental_context(
+                        fundamental_stats,
+                        events,
+                        day,
+                        ticker,
+                        fundamental_context,
+                        phase="csp",
+                    )
+                    fundamental_gate = fundamental_context["fundamental_gate"]
+                    if _should_block_fundamental_gate(
+                        fundamental_profile,
+                        fundamental_gate,
+                        fundamental_context["snapshot"],
+                    ):
+                        _reject(
+                            events,
+                            rejected_reason_counts,
+                            day,
+                            ticker,
+                            _gate_primary_reason("fundamental_gate", fundamental_gate),
+                            diagnostics=_fundamental_context_payload(fundamental_context),
+                        )
+                        continue
 
                 candidate, support_summary, rejection_summary = _select_candidate_for_day(
                     data=data,
@@ -313,6 +396,40 @@ def run_backtest(
                         diagnostics=_candidate_diagnostics(candidate),
                     )
                     continue
+
+                candidate_earnings_gate: GateResult | None = None
+                if fundamental_context is not None:
+                    candidate_earnings_gate, _allowed = evaluate_earnings_gate(
+                        fundamental_context["snapshot"],
+                        [candidate.option],
+                        as_of=day,
+                    )
+                    _record_gate_stats(
+                        fundamental_stats,
+                        "csp_earnings_gate",
+                        candidate_earnings_gate,
+                    )
+                    if _should_block_csp_earnings_gate(
+                        fundamental_profile,
+                        candidate_earnings_gate,
+                    ):
+                        _reject(
+                            events,
+                            rejected_reason_counts,
+                            day,
+                            ticker,
+                            _gate_primary_reason(
+                                "csp_earnings_gate",
+                                candidate_earnings_gate,
+                            ),
+                            support=support_summary,
+                            diagnostics={
+                                **_fundamental_context_payload(fundamental_context),
+                                "earnings_gate": asdict(candidate_earnings_gate),
+                                "candidate": _candidate_diagnostics(candidate),
+                            },
+                        )
+                        continue
 
                 scaled_candidate = _scaled_candidate(candidate, quantity)
                 available_cash_for_assignment = state.cash - state.reserved_assignment_cash
@@ -377,6 +494,16 @@ def run_backtest(
                     trades=trades,
                     events=events,
                     diagnostics={
+                        **(
+                            _fundamental_context_payload(fundamental_context)
+                            if fundamental_context is not None
+                            else {}
+                        ),
+                        **(
+                            {"earnings_gate": asdict(candidate_earnings_gate)}
+                            if candidate_earnings_gate is not None
+                            else {}
+                        ),
                         "portfolio_gate": asdict(portfolio_gate),
                         "portfolio_risk": portfolio_diagnostics,
                     },
@@ -421,6 +548,15 @@ def run_backtest(
         rejected_reason_counts=rejected_reason_counts,
         data_issues=data_issues,
     )
+    fundamental_diagnostics = _finalize_fundamental_stats(
+        fundamental_stats,
+        historical_fundamentals,
+    )
+    summary["fundamental_profile"] = fundamental_profile
+    summary["fundamental_would_reject_count"] = fundamental_diagnostics[
+        "would_reject_count"
+    ]
+    summary["fundamental_warn_count"] = fundamental_diagnostics["warn_count"]
     return {
         "version": BACKTEST_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -449,8 +585,15 @@ def run_backtest(
             "split_ratio_low": split_ratio_low,
             "split_ratio_high": split_ratio_high,
             "contract_quantity": quantity,
+            "fundamental_profile": fundamental_profile,
+            "fundamentals_cache_dir": (
+                str(fundamentals_cache_dir)
+                if fundamental_profile != "technical_only"
+                else None
+            ),
         },
         "config_snapshot": config,
+        "fundamental_diagnostics": fundamental_diagnostics,
         "summary": summary,
         "data_issues": data_issues,
         "trades": trades,
@@ -667,9 +810,13 @@ def _open_covered_calls_for_day(
     *,
     state: BacktestState,
     data: HistoricalDataStore,
+    historical_fundamentals: HistoricalFundamentalStore | None,
+    fundamental_profile: str,
+    fundamental_stats: dict[str, Any],
     tickers: list[str],
     blocked_tickers: set[str],
     todays_bars: dict[str, PriceBar],
+    stock_bars: dict[str, list[PriceBar]],
     day: date,
     config: dict[str, Any],
     dte_min: int,
@@ -714,6 +861,67 @@ def _open_covered_calls_for_day(
                 diagnostics={"cc_rejection_summary": rejection_summary},
             )
             continue
+        fundamental_context = _fundamental_context(
+            historical_fundamentals=historical_fundamentals,
+            profile=fundamental_profile,
+            ticker=ticker,
+            day=day,
+            bars=stock_bars.get(ticker, []),
+            config=config,
+        )
+        cc_earnings_gate: GateResult | None = None
+        cc_ex_dividend_gate: GateResult | None = None
+        if fundamental_context is not None:
+            _record_fundamental_context(
+                fundamental_stats,
+                events,
+                day,
+                ticker,
+                fundamental_context,
+                phase="covered_call",
+            )
+            snapshot = fundamental_context["snapshot"]
+            cc_earnings_gate = evaluate_covered_call_earnings_gate(
+                snapshot,
+                option,
+                as_of=day,
+                config=config,
+            )
+            cc_ex_dividend_gate = evaluate_covered_call_ex_dividend_gate(
+                snapshot,
+                option,
+                as_of=day,
+                config=config,
+            )
+            _record_gate_stats(
+                fundamental_stats,
+                "cc_earnings_gate",
+                cc_earnings_gate,
+            )
+            _record_gate_stats(
+                fundamental_stats,
+                "cc_ex_dividend_gate",
+                cc_ex_dividend_gate,
+            )
+            blocking_gate = _covered_call_blocking_gate(
+                fundamental_profile,
+                cc_earnings_gate,
+                cc_ex_dividend_gate,
+            )
+            if blocking_gate is not None:
+                _reject(
+                    events,
+                    rejected_reason_counts,
+                    day,
+                    ticker,
+                    _gate_primary_reason("covered_call_risk_gate", blocking_gate),
+                    diagnostics={
+                        **_fundamental_context_payload(fundamental_context),
+                        "cc_earnings_gate": asdict(cc_earnings_gate),
+                        "cc_ex_dividend_gate": asdict(cc_ex_dividend_gate),
+                    },
+                )
+                continue
         contracts = min(
             int(_uncovered_shares(state, ticker) // 100),
             max(1, int(config.get("cc_selector", {}).get("default_contract_quantity", 1))),
@@ -730,6 +938,23 @@ def _open_covered_calls_for_day(
             trades=trades,
             events=events,
             adjusted_cost_basis=stock.adjusted_average_cost,
+            diagnostics={
+                **(
+                    _fundamental_context_payload(fundamental_context)
+                    if fundamental_context is not None
+                    else {}
+                ),
+                **(
+                    {"cc_earnings_gate": asdict(cc_earnings_gate)}
+                    if cc_earnings_gate is not None
+                    else {}
+                ),
+                **(
+                    {"cc_ex_dividend_gate": asdict(cc_ex_dividend_gate)}
+                    if cc_ex_dividend_gate is not None
+                    else {}
+                ),
+            },
         ):
             opened += 1
     return opened
@@ -819,6 +1044,7 @@ def _open_short_call(
     trades: list[dict[str, Any]],
     events: list[dict[str, Any]],
     adjusted_cost_basis: float | None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> bool:
     entry_price = option.mid
     if entry_price <= 0:
@@ -876,6 +1102,7 @@ def _open_short_call(
             "gross_credit": gross_credit,
             "fees": fees,
             "adjusted_cost_basis": adjusted_cost_basis,
+            "diagnostics": diagnostics or {},
         }
     )
     return True
@@ -1226,6 +1453,236 @@ def _portfolio_snapshot(state: BacktestState, equity: float) -> PortfolioSnapsho
     )
 
 
+def _normalize_fundamental_profile(profile: str) -> str:
+    normalized = str(profile or "technical_only").strip().lower()
+    if normalized not in FUNDAMENTAL_PROFILES:
+        allowed = ", ".join(sorted(FUNDAMENTAL_PROFILES))
+        raise ValueError(f"unsupported fundamental_profile {profile!r}; expected one of {allowed}")
+    return normalized
+
+
+def _new_fundamental_stats(profile: str) -> dict[str, Any]:
+    return {
+        "profile": profile,
+        "snapshot_count": 0,
+        "diagnostic_event_limit": 5000,
+        "diagnostic_events_emitted": 0,
+        "diagnostic_events_suppressed": 0,
+        "gate_status_counts": Counter(),
+        "fundamental_gate_status_counts": Counter(),
+        "field_quality_counts": defaultdict(Counter),
+        "would_reject_reason_counts": Counter(),
+        "warn_reason_counts": Counter(),
+    }
+
+
+def _fundamental_context(
+    *,
+    historical_fundamentals: HistoricalFundamentalStore | None,
+    profile: str,
+    ticker: str,
+    day: date,
+    bars: list[PriceBar],
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    if profile == "technical_only" or historical_fundamentals is None:
+        return None
+    try:
+        snapshot = historical_fundamentals.snapshot(ticker, day, bars)
+        gate = evaluate_fundamentals(snapshot, config)
+    except Exception as exc:
+        snapshot = FundamentalSnapshot(ticker=ticker.upper())
+        gate = GateResult(
+            status="WARN",
+            reasons=["historical_fundamentals_unavailable"],
+            warnings=[str(exc)],
+        )
+    return {"snapshot": snapshot, "fundamental_gate": gate}
+
+
+def _record_fundamental_context(
+    stats: dict[str, Any],
+    events: list[dict[str, Any]],
+    day: date,
+    ticker: str,
+    context: dict[str, Any],
+    *,
+    phase: str,
+) -> None:
+    snapshot: FundamentalSnapshot = context["snapshot"]
+    gate: GateResult = context["fundamental_gate"]
+    stats["snapshot_count"] += 1
+    _record_gate_stats(stats, "fundamental_gate", gate)
+    stats["fundamental_gate_status_counts"][gate.status] += 1
+    for field, provenance in snapshot.provenance.items():
+        stats["field_quality_counts"][field][provenance.quality] += 1
+    if gate.status != "PASS":
+        if stats["diagnostic_events_emitted"] >= stats["diagnostic_event_limit"]:
+            stats["diagnostic_events_suppressed"] += 1
+            return
+        stats["diagnostic_events_emitted"] += 1
+        events.append(
+            {
+                "date": day.isoformat(),
+                "ticker": ticker,
+                "type": "FUNDAMENTAL_DIAGNOSTIC",
+                "phase": phase,
+                "would_reject": gate.status == "REJECT",
+                "fundamental_gate": asdict(gate),
+                "fundamental_snapshot": _snapshot_payload(snapshot),
+            }
+        )
+
+
+def _record_gate_stats(
+    stats: dict[str, Any],
+    gate_name: str,
+    gate: GateResult,
+) -> None:
+    stats["gate_status_counts"][f"{gate_name}:{gate.status}"] += 1
+    if gate.status == "REJECT":
+        for reason in gate.reasons or ["reject"]:
+            stats["would_reject_reason_counts"][f"{gate_name}:{reason}"] += 1
+    elif gate.status == "WARN" or gate.warnings:
+        for reason in gate.reasons or ["warn"]:
+            stats["warn_reason_counts"][f"{gate_name}:{reason}"] += 1
+
+
+def _should_block_fundamental_gate(
+    profile: str,
+    gate: GateResult,
+    snapshot: FundamentalSnapshot,
+) -> bool:
+    if gate.status != "REJECT":
+        return False
+    if profile == "fundamentals_warn":
+        return False
+    if profile == "fundamentals_strict_all":
+        return True
+    if profile == "fundamentals_strict_financials":
+        return any(
+            _is_strict_financial_reason(reason)
+            and _reason_has_strict_pit_provenance(reason, snapshot)
+            for reason in gate.reasons
+        )
+    return False
+
+
+def _should_block_csp_earnings_gate(profile: str, gate: GateResult) -> bool:
+    return profile == "fundamentals_strict_all" and gate.status == "REJECT"
+
+
+def _covered_call_blocking_gate(
+    profile: str,
+    earnings_gate: GateResult,
+    ex_dividend_gate: GateResult,
+) -> GateResult | None:
+    if profile == "fundamentals_strict_all":
+        if earnings_gate.status == "REJECT":
+            return earnings_gate
+        if ex_dividend_gate.status == "REJECT":
+            return ex_dividend_gate
+    if profile == "fundamentals_strict_financials" and ex_dividend_gate.status == "REJECT":
+        return ex_dividend_gate
+    return None
+
+
+def _is_strict_financial_reason(reason: str) -> bool:
+    return any(reason.startswith(prefix) for prefix in STRICT_FINANCIAL_REASON_PREFIXES)
+
+
+def _reason_has_strict_pit_provenance(
+    reason: str,
+    snapshot: FundamentalSnapshot,
+) -> bool:
+    fields = _fields_for_fundamental_reason(reason)
+    if not fields:
+        return False
+    return any(
+        snapshot.provenance.get(field) is not None
+        and snapshot.provenance[field].quality == "strict_pit"
+        for field in fields
+    )
+
+
+def _fields_for_fundamental_reason(reason: str) -> list[str]:
+    if reason.startswith("recent_move_"):
+        return ["recent_move_pct"]
+    if reason.startswith("pe_ratio_"):
+        return ["pe_ratio"]
+    if reason.startswith("positive_quarters_"):
+        return ["quarterly_net_income"]
+    if reason.startswith("positive_years_"):
+        return ["annual_net_income"]
+    return []
+
+
+def _gate_primary_reason(prefix: str, gate: GateResult) -> str:
+    reason = gate.reasons[0] if gate.reasons else gate.status.lower()
+    return f"{prefix}:{reason}"
+
+
+def _fundamental_context_payload(context: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "fundamental_snapshot": _snapshot_payload(context["snapshot"]),
+        "fundamental_gate": asdict(context["fundamental_gate"]),
+    }
+
+
+def _snapshot_payload(snapshot: FundamentalSnapshot) -> dict[str, Any]:
+    return {
+        "ticker": snapshot.ticker,
+        "quote_type": snapshot.quote_type,
+        "short_name": snapshot.short_name,
+        "long_name": snapshot.long_name,
+        "sector": snapshot.sector,
+        "industry": snapshot.industry,
+        "country": snapshot.country,
+        "market_cap": snapshot.market_cap,
+        "pe_ratio": snapshot.pe_ratio,
+        "dividend_yield": snapshot.dividend_yield,
+        "annual_dividend_rate": snapshot.annual_dividend_rate,
+        "ex_dividend_date": snapshot.ex_dividend_date,
+        "quarterly_net_income": snapshot.quarterly_net_income,
+        "annual_net_income": snapshot.annual_net_income,
+        "next_earnings_date": snapshot.next_earnings_date,
+        "recent_move_pct": snapshot.recent_move_pct,
+        "provenance": provenance_payload(snapshot),
+    }
+
+
+def _finalize_fundamental_stats(
+    stats: dict[str, Any],
+    historical_fundamentals: HistoricalFundamentalStore | None,
+) -> dict[str, Any]:
+    return {
+        "profile": stats["profile"],
+        "snapshot_count": stats["snapshot_count"],
+        "diagnostic_event_limit": stats["diagnostic_event_limit"],
+        "diagnostic_events_emitted": stats["diagnostic_events_emitted"],
+        "diagnostic_events_suppressed": stats["diagnostic_events_suppressed"],
+        "would_reject_count": sum(stats["would_reject_reason_counts"].values()),
+        "warn_count": sum(stats["warn_reason_counts"].values()),
+        "gate_status_counts": dict(sorted(stats["gate_status_counts"].items())),
+        "fundamental_gate_status_counts": dict(
+            sorted(stats["fundamental_gate_status_counts"].items())
+        ),
+        "would_reject_reason_counts": dict(
+            stats["would_reject_reason_counts"].most_common()
+        ),
+        "warn_reason_counts": dict(stats["warn_reason_counts"].most_common()),
+        "field_quality_counts": {
+            field: dict(sorted(counter.items()))
+            for field, counter in sorted(stats["field_quality_counts"].items())
+        },
+        "store": (
+            historical_fundamentals.diagnostics()
+            if historical_fundamentals is not None
+            else None
+        ),
+    }
+
+
 def _detect_pre_start_split_issues(
     stock_bars: dict[str, list[PriceBar]],
     *,
@@ -1555,6 +2012,9 @@ def _render_report(result: dict[str, Any]) -> str:
         f"- Realized stock PnL: ${summary['realized_stock_pnl']:,.2f}",
         f"- Total fees: ${summary['total_fees']:,.2f}",
         f"- Data issues: {summary['data_issue_count']}",
+        f"- Fundamental profile: {summary.get('fundamental_profile', 'technical_only')}",
+        f"- Fundamental would-rejects: {summary.get('fundamental_would_reject_count', 0)}",
+        f"- Fundamental warnings: {summary.get('fundamental_warn_count', 0)}",
         "",
         "## Assumptions",
         "",
@@ -1564,6 +2024,18 @@ def _render_report(result: dict[str, Any]) -> str:
         lines.extend(["", "## Top Rejections", ""])
         for reason, count in list(summary["rejected_reason_counts"].items())[:20]:
             lines.append(f"- {reason}: {count}")
+    fundamentals = result.get("fundamental_diagnostics") or {}
+    if fundamentals.get("profile") != "technical_only":
+        lines.extend(["", "## Fundamental Diagnostics", ""])
+        lines.append(f"- Profile: {fundamentals.get('profile')}")
+        lines.append(f"- Snapshots: {fundamentals.get('snapshot_count')}")
+        lines.append(f"- Would-reject count: {fundamentals.get('would_reject_count')}")
+        lines.append(f"- Warning count: {fundamentals.get('warn_count')}")
+        reason_counts = fundamentals.get("would_reject_reason_counts") or {}
+        if reason_counts:
+            lines.extend(["", "### Top Fundamental Would-Rejects", ""])
+            for reason, count in list(reason_counts.items())[:15]:
+                lines.append(f"- {reason}: {count}")
     return "\n".join(lines) + "\n"
 
 

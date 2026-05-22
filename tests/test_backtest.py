@@ -8,6 +8,8 @@ from wheels_copilot.backtest import StockPosition, _min_covered_call_strike, run
 from wheels_copilot.config import load_config
 from wheels_copilot.historical_data import parse_option_symbol
 from wheels_copilot.models import (
+    FundamentalFieldProvenance,
+    FundamentalSnapshot,
     OptionQuote,
     PriceBar,
     SupportAnalysis,
@@ -594,6 +596,128 @@ class BacktestRunnerTests(unittest.TestCase):
 
         self.assertEqual(min_strike, 95.0)
 
+    def test_fundamentals_warn_records_would_reject_without_blocking_trade(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        data = _FakeData(
+            bars={"AAPL": _bars(start, end, close=110)},
+            options={("AAPL", start): [_put(expiration=end, strike=95)]},
+            marks={},
+        )
+        store = _FakeFundamentalsStore(
+            FundamentalSnapshot(
+                ticker="AAPL",
+                quote_type="CS",
+                market_cap=10_000_000_000,
+                pe_ratio=-5,
+                dividend_yield=0.01,
+                quarterly_net_income=[1, 1, 1, 1, 1],
+                annual_net_income=[1, 1, 1, 1, 1],
+                next_earnings_date=date(2026, 8, 1),
+                recent_move_pct=5,
+                provenance={
+                    "pe_ratio": FundamentalFieldProvenance(
+                        value=-5,
+                        source="test",
+                        as_of=start,
+                        known_at=start,
+                        quality="strict_pit_pending_validation",
+                    )
+                },
+            )
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                fundamental_profile="fundamentals_warn",
+                historical_fundamentals=store,
+            )
+
+        self.assertEqual(result["summary"]["opened_short_puts"], 1)
+        self.assertGreater(result["summary"]["fundamental_would_reject_count"], 0)
+        self.assertIn(
+            "fundamental_gate:pe_ratio_non_positive",
+            result["fundamental_diagnostics"]["would_reject_reason_counts"],
+        )
+        self.assertTrue(
+            any(event["type"] == "FUNDAMENTAL_DIAGNOSTIC" for event in result["events"])
+        )
+
+    def test_technical_only_does_not_call_fundamental_store(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        data = _FakeData(
+            bars={"AAPL": _bars(start, end, close=110)},
+            options={("AAPL", start): [_put(expiration=end, strike=95)]},
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                historical_fundamentals=_ExplodingFundamentalsStore(),
+            )
+
+        self.assertEqual(result["summary"]["opened_short_puts"], 1)
+        self.assertEqual(result["summary"]["fundamental_profile"], "technical_only")
+
+    def test_strict_financials_does_not_block_pending_pit_financials(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        data = _FakeData(
+            bars={"AAPL": _bars(start, end, close=110)},
+            options={("AAPL", start): [_put(expiration=end, strike=95)]},
+            marks={},
+        )
+        store = _FakeFundamentalsStore(
+            FundamentalSnapshot(
+                ticker="AAPL",
+                quote_type="CS",
+                market_cap=10_000_000_000,
+                pe_ratio=-5,
+                dividend_yield=0.01,
+                quarterly_net_income=[1, 1, 1, 1, 1],
+                annual_net_income=[1, 1, 1, 1, 1],
+                next_earnings_date=date(2026, 8, 1),
+                recent_move_pct=5,
+                provenance={
+                    "pe_ratio": FundamentalFieldProvenance(
+                        value=-5,
+                        source="test",
+                        as_of=start,
+                        known_at=start,
+                        quality="strict_pit_pending_validation",
+                    )
+                },
+            )
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                fundamental_profile="fundamentals_strict_financials",
+                historical_fundamentals=store,
+            )
+
+        self.assertEqual(result["summary"]["opened_short_puts"], 1)
+        self.assertGreater(result["summary"]["fundamental_would_reject_count"], 0)
+
 
 class _FakeData:
     def __init__(
@@ -656,6 +780,42 @@ class _FakeData:
         risk_free_rate: float = 0.04,
     ) -> OptionQuote | None:
         return self.marks.get((symbol, as_of))
+
+
+class _FakeFundamentalsStore:
+    def __init__(self, snapshot: FundamentalSnapshot) -> None:
+        self.snapshot_value = snapshot
+        self.preloaded = False
+
+    def preload(self, tickers, start: date, end: date) -> None:
+        self.preloaded = True
+
+    def snapshot(
+        self,
+        ticker: str,
+        as_of: date,
+        bars: list[PriceBar],
+    ) -> FundamentalSnapshot:
+        return self.snapshot_value
+
+    def diagnostics(self) -> dict:
+        return {"preloaded": self.preloaded, "providers": {"fake": {}}}
+
+
+class _ExplodingFundamentalsStore:
+    def preload(self, tickers, start: date, end: date) -> None:
+        raise AssertionError("fundamental store should not be preloaded in technical_only")
+
+    def snapshot(
+        self,
+        ticker: str,
+        as_of: date,
+        bars: list[PriceBar],
+    ) -> FundamentalSnapshot:
+        raise AssertionError("fundamental store should not be called in technical_only")
+
+    def diagnostics(self) -> dict:
+        raise AssertionError("fundamental diagnostics should not be called in technical_only")
 
 
 def _config() -> dict:
