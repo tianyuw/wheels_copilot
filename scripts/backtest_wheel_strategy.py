@@ -44,6 +44,7 @@ def main() -> int:
         split_ratio_low=args.split_ratio_low,
         split_ratio_high=args.split_ratio_high,
         fundamental_profile=args.fundamental_profile,
+        cc_risk_profile=args.cc_risk_profile,
         fundamentals_cache_dir=Path(args.fundamentals_cache_dir),
         fundamentals_env_file=Path(args.fundamentals_env_file)
         if args.fundamentals_env_file
@@ -95,6 +96,11 @@ def parse_args() -> argparse.Namespace:
         ],
         default="technical_only",
         help="Historical fundamental gate profile.",
+    )
+    parser.add_argument(
+        "--cc-risk-profile",
+        choices=["strict", "warn_unknown_dates"],
+        help="Backtest-only covered-call risk profile. Defaults to config backtest.cc_risk_profile or strict.",
     )
     parser.add_argument(
         "--fundamentals-cache-dir",

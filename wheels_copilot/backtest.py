@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import json
 from collections import Counter, defaultdict
@@ -53,6 +54,7 @@ FUNDAMENTAL_PROFILES = {
     "fundamentals_strict_financials",
     "fundamentals_strict_all",
 }
+CC_RISK_PROFILES = {"strict", "warn_unknown_dates"}
 STRICT_FINANCIAL_REASON_PREFIXES = (
     "recent_move_",
     "pe_ratio_non_positive",
@@ -155,12 +157,14 @@ def run_backtest(
     fundamentals_cache_dir: Path = DEFAULT_FUNDAMENTALS_CACHE_DIR,
     fundamentals_env_file: Path | None = None,
     fundamentals_timeout_seconds: float = 30.0,
+    cc_risk_profile: str | None = None,
 ) -> dict[str, Any]:
     if schedule != "daily":
         raise ValueError("phase one backtest only supports daily schedule")
     if end < start:
         raise ValueError("end date must be on or after start date")
     fundamental_profile = _normalize_fundamental_profile(fundamental_profile)
+    cc_risk_profile = _normalize_cc_risk_profile(cc_risk_profile, config)
     if fundamental_profile == "technical_only":
         historical_fundamentals = None
 
@@ -246,6 +250,7 @@ def run_backtest(
     if max_orders_per_day is None:
         max_orders_per_day = int(config.get("execution", {}).get("max_orders_per_run", 3))
     execution_model = build_backtest_execution_model(config, slippage_pct=slippage_pct)
+    cc_backtest_config = _covered_call_backtest_config(config, cc_risk_profile)
 
     for day in run_days:
         todays_bars = bars_by_day.get(day, {})
@@ -305,7 +310,8 @@ def run_backtest(
                 todays_bars=todays_bars,
                 stock_bars=stock_bars,
                 day=day,
-                config=config,
+                config=cc_backtest_config,
+                cc_risk_profile=cc_risk_profile,
                 dte_min=cc_dte_min,
                 dte_max=cc_dte_max,
                 slippage_pct=slippage_pct,
@@ -567,6 +573,7 @@ def run_backtest(
         "would_reject_count"
     ]
     summary["fundamental_warn_count"] = fundamental_diagnostics["warn_count"]
+    summary["cc_risk_profile"] = cc_risk_profile
     summary["execution_model"] = execution_model.model
     summary["execution_fill_policy"] = execution_model.fill_policy
     summary["execution_reference_price_source"] = execution_model.reference_price_source
@@ -582,6 +589,7 @@ def run_backtest(
             "Support/trend signals use only bars strictly before the scan date.",
             "Short put entry uses the configured backtest execution model; default v2 uses a synthetic bid/ask spread around the slippage-adjusted option day-aggregate reference price and fills at modeled mid.",
             "Covered call entry uses the same configured backtest execution model as short puts.",
+            "Covered call risk gates use the configured backtest CC risk profile; warn_unknown_dates only downgrades unknown historical earnings/ex-dividend dates to WARN and still blocks known events inside the contract window.",
             "Day-aggregate option volume above zero is treated as necessary but not sufficient fillability evidence.",
             "Delta filters inferred from day-aggregate option prices are approximate in Phase 1.",
             "No early assignment, early profit-taking, rolling, or 21-DTE management is modeled in Phase 1.",
@@ -600,6 +608,7 @@ def run_backtest(
             "split_ratio_high": split_ratio_high,
             "contract_quantity": quantity,
             "fundamental_profile": fundamental_profile,
+            "cc_risk_profile": cc_risk_profile,
             "fundamentals_cache_dir": (
                 str(fundamentals_cache_dir)
                 if fundamental_profile != "technical_only"
@@ -856,6 +865,7 @@ def _open_covered_calls_for_day(
     stock_bars: dict[str, list[PriceBar]],
     day: date,
     config: dict[str, Any],
+    cc_risk_profile: str,
     dte_min: int,
     dte_max: int,
     slippage_pct: float,
@@ -877,7 +887,7 @@ def _open_covered_calls_for_day(
         stock = state.stocks.get(ticker)
         if stock is None or _uncovered_shares(state, ticker) < 100:
             continue
-        option, rejection_summary = _select_covered_call_for_day(
+        option, rejection_summary, selection_diagnostics = _select_covered_call_for_day(
             data=data,
             ticker=ticker,
             day=day,
@@ -891,13 +901,20 @@ def _open_covered_calls_for_day(
             execution_model=execution_model,
         )
         if option is None:
+            reason = _primary_rejection_reason(rejection_summary)
             _reject(
                 events,
                 rejected_reason_counts,
                 day,
                 ticker,
-                _primary_rejection_reason(rejection_summary),
-                diagnostics={"cc_rejection_summary": rejection_summary},
+                reason,
+                diagnostics={
+                    "phase": "covered_call",
+                    "cc_risk_profile": cc_risk_profile,
+                    "cc_rejection_summary": rejection_summary,
+                    "cc_selection_diagnostics": selection_diagnostics,
+                    "why_no_cc_after_assignment": reason,
+                },
             )
             continue
         fundamental_context = _fundamental_context(
@@ -956,8 +973,15 @@ def _open_covered_calls_for_day(
                     _gate_primary_reason("covered_call_risk_gate", blocking_gate),
                     diagnostics={
                         **_fundamental_context_payload(fundamental_context),
+                        "phase": "covered_call",
+                        "cc_risk_profile": cc_risk_profile,
+                        "cc_selection_diagnostics": selection_diagnostics,
                         "cc_earnings_gate": asdict(cc_earnings_gate),
                         "cc_ex_dividend_gate": asdict(cc_ex_dividend_gate),
+                        "why_no_cc_after_assignment": _gate_primary_reason(
+                            "covered_call_risk_gate",
+                            blocking_gate,
+                        ),
                     },
                 )
                 continue
@@ -994,6 +1018,9 @@ def _open_covered_calls_for_day(
                     if cc_ex_dividend_gate is not None
                     else {}
                 ),
+                "phase": "covered_call",
+                "cc_risk_profile": cc_risk_profile,
+                "cc_selection_diagnostics": selection_diagnostics,
             },
         ):
             opened += 1
@@ -1013,7 +1040,7 @@ def _select_covered_call_for_day(
     risk_free_rate: float,
     stock_price: float | None,
     execution_model: BacktestExecutionModel,
-) -> tuple[OptionQuote | None, dict[str, int]]:
+) -> tuple[OptionQuote | None, dict[str, int], dict[str, Any]]:
     options = data.option_chain(
         ticker,
         day,
@@ -1026,8 +1053,13 @@ def _select_covered_call_for_day(
         stock_price=stock_price,
         execution_model=execution_model,
     )
+    selection_diagnostics = _covered_call_selection_diagnostics(
+        options,
+        stock=stock,
+        config=config,
+    )
     if not options:
-        return None, {"no_fillable_call_options": 1}
+        return None, {"no_fillable_call_options": 1}, selection_diagnostics
 
     cc_cfg = config.get("cc_selector", {})
     min_strike = _min_covered_call_strike(stock, config)
@@ -1062,7 +1094,11 @@ def _select_covered_call_for_day(
         else:
             eligible.append(option)
     if not eligible:
-        return None, dict(rejected) or {"no_eligible_call_contract": 1}
+        return (
+            None,
+            dict(rejected) or {"no_eligible_call_contract": 1},
+            selection_diagnostics,
+        )
     midpoint = (min_delta + max_delta) / 2.0
     eligible.sort(
         key=lambda option: (
@@ -1072,7 +1108,12 @@ def _select_covered_call_for_day(
             option.strike,
         )
     )
-    return eligible[0], dict(rejected)
+    selected = eligible[0]
+    selection_diagnostics["selected_call"] = _covered_call_option_diagnostics(
+        selected,
+        min_strike=min_strike,
+    )
+    return selected, dict(rejected), selection_diagnostics
 
 
 def _open_short_call(
@@ -1442,16 +1483,19 @@ def _daily_equity_row(
     day: date,
     latest_close: dict[str, float],
 ) -> dict[str, Any]:
-    stock_value = sum(
-        position.shares * latest_close.get(ticker, 0.0)
-        for ticker, position in state.stocks.items()
-        if position.shares > 0
-    )
+    exposure = _stock_exposure_metrics(state, latest_close)
     return {
         "date": day.isoformat(),
         "cash": round(state.cash, 2),
         "equity": round(state.equity, 2),
-        "stock_value": round(stock_value, 2),
+        "stock_value": exposure["stock_value"],
+        "assigned_shares": exposure["assigned_shares"],
+        "covered_assigned_shares": exposure["covered_assigned_shares"],
+        "uncovered_assigned_shares": exposure["uncovered_assigned_shares"],
+        "stock_unrealized_pnl": exposure["stock_unrealized_pnl"],
+        "stock_unrealized_pnl_after_premiums": exposure[
+            "stock_unrealized_pnl_after_premiums"
+        ],
         "reserved_assignment_cash": round(state.reserved_assignment_cash, 2),
         "open_short_puts": len(state.open_short_puts),
         "open_short_calls": len(state.open_short_calls),
@@ -1460,6 +1504,50 @@ def _daily_equity_row(
             round(state.reserved_assignment_cash / state.equity * 100.0, 4)
             if state.equity > 0
             else None
+        ),
+    }
+
+
+def _stock_exposure_metrics(
+    state: BacktestState,
+    latest_close: dict[str, float],
+) -> dict[str, Any]:
+    stock_value = 0.0
+    stock_unrealized_pnl = 0.0
+    stock_unrealized_pnl_after_premiums = 0.0
+    assigned_shares = 0
+    covered_assigned_shares = 0
+    uncovered_assigned_shares = 0
+    for ticker, position in state.stocks.items():
+        if position.shares <= 0:
+            continue
+        close = latest_close.get(ticker, 0.0)
+        value = position.shares * close
+        stock_value += value
+        stock_unrealized_pnl += value - position.cost_basis_total
+        stock_unrealized_pnl_after_premiums += (
+            value - (position.cost_basis_total - position.premium_credit_total)
+        )
+        assigned_shares += position.shares
+        covered = min(
+            position.shares,
+            sum(
+                call.contracts * 100
+                for call in state.open_short_calls
+                if call.ticker == ticker
+            ),
+        )
+        covered_assigned_shares += covered
+        uncovered_assigned_shares += max(0, position.shares - covered)
+    return {
+        "stock_value": round(stock_value, 2),
+        "assigned_shares": assigned_shares,
+        "covered_assigned_shares": covered_assigned_shares,
+        "uncovered_assigned_shares": uncovered_assigned_shares,
+        "stock_unrealized_pnl": round(stock_unrealized_pnl, 2),
+        "stock_unrealized_pnl_after_premiums": round(
+            stock_unrealized_pnl_after_premiums,
+            2,
         ),
     }
 
@@ -1521,6 +1609,34 @@ def _normalize_fundamental_profile(profile: str) -> str:
         allowed = ", ".join(sorted(FUNDAMENTAL_PROFILES))
         raise ValueError(f"unsupported fundamental_profile {profile!r}; expected one of {allowed}")
     return normalized
+
+
+def _normalize_cc_risk_profile(
+    profile: str | None,
+    config: dict[str, Any],
+) -> str:
+    if profile is None:
+        profile = (config.get("backtest") or {}).get("cc_risk_profile", "strict")
+    normalized = str(profile or "strict").strip().lower()
+    if normalized not in CC_RISK_PROFILES:
+        allowed = ", ".join(sorted(CC_RISK_PROFILES))
+        raise ValueError(f"unsupported cc_risk_profile {profile!r}; expected one of {allowed}")
+    return normalized
+
+
+def _covered_call_backtest_config(
+    config: dict[str, Any],
+    cc_risk_profile: str,
+) -> dict[str, Any]:
+    if cc_risk_profile == "strict":
+        return config
+    gate_config = copy.deepcopy(config)
+    cc_risk = dict(gate_config.get("cc_risk") or {})
+    if cc_risk_profile == "warn_unknown_dates":
+        cc_risk["block_unknown_stock_earnings_date"] = False
+        cc_risk["block_unknown_ex_dividend_date_for_dividend_payers"] = False
+    gate_config["cc_risk"] = cc_risk
+    return gate_config
 
 
 def _new_fundamental_stats(profile: str) -> dict[str, Any]:
@@ -1851,6 +1967,135 @@ def _min_covered_call_strike(
     return max(floor, basis * (1.0 + pct / 100.0))
 
 
+def _covered_call_selection_diagnostics(
+    options: list[OptionQuote],
+    *,
+    stock: StockPosition,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    cc_cfg = config.get("cc_selector", {})
+    min_strike = _min_covered_call_strike(stock, config)
+    min_delta = float(cc_cfg.get("target_delta_min", 0.10))
+    max_delta = float(cc_cfg.get("target_delta_max", 0.35))
+    midpoint = (min_delta + max_delta) / 2.0
+    best_available = _best_available_call(options, midpoint=midpoint)
+    closest_above = (
+        min(
+            (option for option in options if min_strike is not None and option.strike >= min_strike),
+            key=lambda option: (option.strike, option.dte, -option.bid),
+            default=None,
+        )
+        if min_strike is not None
+        else None
+    )
+    closest_to_min = (
+        min(
+            options,
+            key=lambda option: (
+                abs(option.strike - min_strike),
+                option.dte,
+                -option.bid,
+            ),
+            default=None,
+        )
+        if min_strike is not None
+        else None
+    )
+    return {
+        "assigned_shares": stock.shares,
+        "average_cost": (
+            round(stock.average_cost, 4) if stock.average_cost is not None else None
+        ),
+        "adjusted_cost_basis": (
+            round(stock.adjusted_average_cost, 4)
+            if stock.adjusted_average_cost is not None
+            else None
+        ),
+        "min_covered_call_strike": round(min_strike, 4) if min_strike is not None else None,
+        "min_strike_vs_cost_basis_pct": float(
+            cc_cfg.get("min_strike_vs_cost_basis_pct", 0.0)
+        ),
+        "min_strike_floor_pct_of_unadjusted_cost": float(
+            cc_cfg.get("min_strike_floor_pct_of_unadjusted_cost", 100.0)
+        ),
+        "call_contract_count": len(options),
+        "lowest_call_strike": min((option.strike for option in options), default=None),
+        "highest_call_strike": max((option.strike for option in options), default=None),
+        "best_available_call_strike": (
+            best_available.strike if best_available is not None else None
+        ),
+        "best_available_call": _covered_call_option_diagnostics(
+            best_available,
+            min_strike=min_strike,
+        ),
+        "strike_to_adjusted_cost_basis_gap": (
+            round(min_strike - best_available.strike, 4)
+            if min_strike is not None and best_available is not None
+            else None
+        ),
+        "closest_call_above_cost_basis": _covered_call_option_diagnostics(
+            closest_above,
+            min_strike=min_strike,
+        ),
+        "closest_call_delta": closest_above.delta if closest_above is not None else None,
+        "closest_call_bid": closest_above.bid if closest_above is not None else None,
+        "closest_call_mid": (
+            round(closest_above.mid, 4) if closest_above is not None else None
+        ),
+        "closest_call_to_min_strike": _covered_call_option_diagnostics(
+            closest_to_min,
+            min_strike=min_strike,
+        ),
+    }
+
+
+def _best_available_call(
+    options: list[OptionQuote],
+    *,
+    midpoint: float,
+) -> OptionQuote | None:
+    if not options:
+        return None
+    return sorted(
+        options,
+        key=lambda option: (
+            option.dte,
+            abs(float(option.delta) - midpoint) if option.delta is not None else 999.0,
+            -option.bid,
+            option.strike,
+        ),
+    )[0]
+
+
+def _covered_call_option_diagnostics(
+    option: OptionQuote | None,
+    *,
+    min_strike: float | None,
+) -> dict[str, Any] | None:
+    if option is None:
+        return None
+    return {
+        "symbol": option.symbol,
+        "expiration": option.expiration.isoformat(),
+        "dte": option.dte,
+        "strike": option.strike,
+        "strike_gap_to_min": (
+            round(option.strike - min_strike, 4) if min_strike is not None else None
+        ),
+        "bid": option.bid,
+        "ask": option.ask,
+        "mid": round(option.mid, 4),
+        "spread_pct_of_mid": (
+            round(option.spread_pct_of_mid, 6)
+            if option.spread_pct_of_mid is not None
+            else None
+        ),
+        "delta": option.delta,
+        "open_interest": option.open_interest,
+        "volume": option.volume,
+    }
+
+
 def _remove_stock_shares(stock: StockPosition, shares: int) -> tuple[float, float]:
     if shares <= 0 or stock.shares <= 0:
         return 0.0, 0.0
@@ -1931,6 +2176,96 @@ def _close_trade(
         return
 
 
+def _assignment_recovery_diagnostics(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    assigned_events = [
+        event for event in events if event.get("type") == "ASSIGNED"
+    ]
+    diagnostics: list[dict[str, Any]] = []
+    for assignment in assigned_events:
+        ticker = str(assignment.get("ticker") or "")
+        assignment_date = _parse_event_date(assignment)
+        if assignment_date is None:
+            continue
+        later_events = [
+            event
+            for event in events
+            if event.get("ticker") == ticker
+            and (event_date := _parse_event_date(event)) is not None
+            and event_date > assignment_date
+        ]
+        first_attempt = next(
+            (event for event in later_events if _is_covered_call_attempt_event(event)),
+            None,
+        )
+        first_open = next(
+            (event for event in later_events if event.get("type") == "OPEN_SHORT_CALL"),
+            None,
+        )
+        first_attempt_date = _parse_event_date(first_attempt) if first_attempt else None
+        first_open_date = _parse_event_date(first_open) if first_open else None
+        diagnostics.append(
+            {
+                "assignment_trade_id": assignment.get("trade_id"),
+                "ticker": ticker,
+                "assignment_date": assignment_date.isoformat(),
+                "shares_acquired": assignment.get("shares_acquired"),
+                "assignment_strike": assignment.get("strike"),
+                "assignment_underlying_close": assignment.get("underlying_close"),
+                "first_cc_attempt_date": (
+                    first_attempt_date.isoformat() if first_attempt_date else None
+                ),
+                "first_cc_attempt_type": (
+                    first_attempt.get("type") if first_attempt else None
+                ),
+                "first_cc_attempt_reason": (
+                    first_attempt.get("reason") if first_attempt else None
+                ),
+                "first_cc_opened_date": (
+                    first_open_date.isoformat() if first_open_date else None
+                ),
+                "days_to_first_cc_attempt": (
+                    (first_attempt_date - assignment_date).days
+                    if first_attempt_date is not None
+                    else None
+                ),
+                "days_to_first_cc_open": (
+                    (first_open_date - assignment_date).days
+                    if first_open_date is not None
+                    else None
+                ),
+            }
+        )
+    return diagnostics
+
+
+def _parse_event_date(event: dict[str, Any] | None) -> date | None:
+    if not event:
+        return None
+    value = event.get("date")
+    if not value:
+        return None
+    return date.fromisoformat(str(value))
+
+
+def _is_covered_call_attempt_event(event: dict[str, Any]) -> bool:
+    if event.get("type") == "OPEN_SHORT_CALL":
+        return True
+    if event.get("type") != "REJECT":
+        return False
+    diagnostics = event.get("diagnostics") or {}
+    return isinstance(diagnostics, dict) and diagnostics.get("phase") == "covered_call"
+
+
+def _assignment_recovery_notes(assigned_share_values: list[int]) -> list[str]:
+    notes = [
+        "assignment_to_cc_matching_uses_ticker_and_date_not_tax_lot_identity",
+        "assigned_stock_recovery_pnl_estimate_is_diagnostic_not_an_accounting_identity",
+    ]
+    if max(assigned_share_values, default=0) > 100:
+        notes.append("multi_lot_assigned_stock_detected")
+    return notes
+
+
 def _summarize_backtest(
     *,
     state: BacktestState,
@@ -1965,6 +2300,34 @@ def _summarize_backtest(
         for trade in trades
         if trade.get("entry_fill_discount_pct_of_mid") is not None
     ]
+    uncovered_share_values = [
+        int(row.get("uncovered_assigned_shares") or 0) for row in equity_curve
+    ]
+    assigned_share_values = [
+        int(row.get("assigned_shares") or 0) for row in equity_curve
+    ]
+    assignment_diagnostics = _assignment_recovery_diagnostics(events)
+    csp_realized_option_pnl = sum(
+        float(trade.get("realized_option_pnl") or 0.0) for trade in csp_trades
+    )
+    cc_realized_option_pnl = sum(
+        float(trade.get("realized_option_pnl") or 0.0) for trade in cc_trades
+    )
+    cc_called_away_stock_pnl = sum(
+        float(trade.get("realized_stock_pnl") or 0.0) for trade in cc_trades
+    )
+    last_equity_row = equity_curve[-1] if equity_curve else {}
+    open_assigned_stock_unrealized_pnl = float(
+        last_equity_row.get("stock_unrealized_pnl") or 0.0
+    )
+    open_assigned_stock_unrealized_pnl_after_premiums = float(
+        last_equity_row.get("stock_unrealized_pnl_after_premiums") or 0.0
+    )
+    assignments_with_cc_opened = sum(
+        1
+        for item in assignment_diagnostics
+        if item.get("first_cc_opened_date") is not None
+    )
     return {
         "starting_equity": round(starting_equity, 2),
         "ending_equity": round(ending_equity, 2),
@@ -1976,6 +2339,23 @@ def _summarize_backtest(
         "max_drawdown_pct": max_drawdown_pct,
         "realized_option_pnl": round(state.realized_option_pnl, 2),
         "realized_stock_pnl": round(state.realized_stock_pnl, 2),
+        "csp_realized_option_pnl": round(csp_realized_option_pnl, 2),
+        "cc_realized_option_pnl": round(cc_realized_option_pnl, 2),
+        "cc_called_away_stock_pnl": round(cc_called_away_stock_pnl, 2),
+        "open_assigned_stock_unrealized_pnl": round(
+            open_assigned_stock_unrealized_pnl,
+            2,
+        ),
+        "open_assigned_stock_unrealized_pnl_after_premiums": round(
+            open_assigned_stock_unrealized_pnl_after_premiums,
+            2,
+        ),
+        "assigned_stock_recovery_pnl_estimate": round(
+            cc_realized_option_pnl
+            + cc_called_away_stock_pnl
+            + open_assigned_stock_unrealized_pnl,
+            2,
+        ),
         "total_fees": round(state.total_fees, 2),
         "opened_short_puts": len(csp_trades),
         "expired_worthless": csp_status_counts.get("EXPIRED_WORTHLESS", 0),
@@ -1986,6 +2366,25 @@ def _summarize_backtest(
         "open_short_puts": len(state.open_short_puts),
         "open_short_calls": len(state.open_short_calls),
         "long_stock_positions": sum(1 for stock in state.stocks.values() if stock.shares > 0),
+        "uncovered_assigned_days": sum(1 for value in uncovered_share_values if value > 0),
+        "uncovered_assigned_share_days": sum(uncovered_share_values),
+        "average_uncovered_assigned_shares": (
+            round(sum(uncovered_share_values) / len(uncovered_share_values), 4)
+            if uncovered_share_values
+            else 0.0
+        ),
+        "max_uncovered_assigned_shares": (
+            max(uncovered_share_values) if uncovered_share_values else 0
+        ),
+        "assignments_with_cc_opened": assignments_with_cc_opened,
+        "assignments_without_cc_opened": max(
+            0,
+            csp_status_counts.get("ASSIGNED", 0) - assignments_with_cc_opened,
+        ),
+        "assignment_recovery_diagnostics": assignment_diagnostics,
+        "assignment_recovery_diagnostic_notes": _assignment_recovery_notes(
+            assigned_share_values
+        ),
         "reserved_assignment_cash": round(state.reserved_assignment_cash, 2),
         "trade_status_counts": dict(sorted(trade_status_counts.items())),
         "csp_trade_status_counts": dict(sorted(csp_status_counts.items())),
@@ -2095,8 +2494,14 @@ def _render_report(result: dict[str, Any]) -> str:
         f"- Total fees: ${summary['total_fees']:,.2f}",
         f"- Data issues: {summary['data_issue_count']}",
         f"- Fundamental profile: {summary.get('fundamental_profile', 'technical_only')}",
+        f"- CC risk profile: {summary.get('cc_risk_profile', 'strict')}",
         f"- Fundamental would-rejects: {summary.get('fundamental_would_reject_count', 0)}",
         f"- Fundamental warnings: {summary.get('fundamental_warn_count', 0)}",
+        f"- Uncovered assigned days: {summary.get('uncovered_assigned_days', 0)}",
+        f"- Uncovered assigned share-days: {summary.get('uncovered_assigned_share_days', 0)}",
+        f"- CC realized option PnL: ${summary.get('cc_realized_option_pnl', 0):,.2f}",
+        f"- Open assigned stock unrealized PnL: ${summary.get('open_assigned_stock_unrealized_pnl', 0):,.2f}",
+        f"- Assigned stock recovery PnL estimate: ${summary.get('assigned_stock_recovery_pnl_estimate', 0):,.2f}",
         f"- Execution model: {summary.get('execution_model', 'unknown')}",
         f"- Execution fill policy: {summary.get('execution_fill_policy', 'unknown')}",
         f"- Avg entry spread pct of mid: {summary.get('average_entry_spread_pct_of_mid')}",

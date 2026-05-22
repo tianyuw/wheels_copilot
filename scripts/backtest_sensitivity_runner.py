@@ -71,6 +71,7 @@ def main() -> int:
         "max_orders_per_day": args.max_orders_per_day,
         "split_ratio_low": args.split_ratio_low,
         "split_ratio_high": args.split_ratio_high,
+        "cc_risk_profile": args.cc_risk_profile,
     }
     plan = {
         "scenario": scenario_name,
@@ -187,6 +188,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-orders-per-day", type=int)
     parser.add_argument("--split-ratio-low", type=float, default=0.75)
     parser.add_argument("--split-ratio-high", type=float, default=1.25)
+    parser.add_argument(
+        "--cc-risk-profile",
+        choices=["strict", "warn_unknown_dates"],
+        help="Backtest-only covered-call risk profile. Defaults to config backtest.cc_risk_profile or strict.",
+    )
     parser.add_argument(
         "--skip-cache-preflight",
         action="store_true",

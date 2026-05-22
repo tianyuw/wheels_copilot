@@ -302,7 +302,19 @@ class BacktestRunnerTests(unittest.TestCase):
         self.assertEqual(result["summary"]["assigned"], 1)
         self.assertEqual(result["summary"]["opened_covered_calls"], 1)
         self.assertEqual(result["summary"]["open_short_calls"], 1)
+        self.assertEqual(result["summary"]["assignments_with_cc_opened"], 1)
+        self.assertEqual(result["summary"]["assignments_without_cc_opened"], 0)
+        self.assertEqual(result["summary"]["uncovered_assigned_days"], 1)
+        self.assertEqual(result["summary"]["uncovered_assigned_share_days"], 100)
         self.assertEqual(result["open_positions"]["short_calls"][0]["ticker"], "AAPL")
+        recovery = result["summary"]["assignment_recovery_diagnostics"][0]
+        self.assertEqual(recovery["assignment_date"], put_expiration.isoformat())
+        self.assertEqual(recovery["first_cc_opened_date"], call_scan.isoformat())
+        self.assertEqual(recovery["days_to_first_cc_open"], 3)
+        last_row = result["equity_curve"][-1]
+        self.assertEqual(last_row["assigned_shares"], 100)
+        self.assertEqual(last_row["covered_assigned_shares"], 100)
+        self.assertEqual(last_row["uncovered_assigned_shares"], 0)
 
     def test_covered_call_expires_worthless_and_keeps_stock(self):
         start = date(2026, 1, 5)
@@ -416,6 +428,305 @@ class BacktestRunnerTests(unittest.TestCase):
         self.assertIn(
             "strike_below_adjusted_cost_basis",
             result["summary"]["rejected_reason_counts"],
+        )
+        reject_events = [
+            event
+            for event in result["events"]
+            if event["type"] == "REJECT" and event["ticker"] == "AAPL"
+        ]
+        diagnostics = reject_events[-1]["diagnostics"]["cc_selection_diagnostics"]
+        self.assertEqual(diagnostics["best_available_call_strike"], 90)
+        self.assertGreater(diagnostics["strike_to_adjusted_cost_basis_gap"], 0)
+
+    def test_cc_warn_unknown_dates_opens_call_without_mutating_config(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        config = _config()
+        config["cc_risk"]["nested"] = {"preserve": True}
+        original_cc_risk = dict(config["cc_risk"])
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=96,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+        store = _FakeFundamentalsStore(
+            _fundamental(
+                next_earnings_date=None,
+                dividend_yield=0.01,
+                ex_dividend_date=None,
+            )
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=config,
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+                fundamental_profile="fundamentals_strict_all",
+                historical_fundamentals=store,
+                cc_risk_profile="warn_unknown_dates",
+            )
+
+        self.assertEqual(result["summary"]["cc_risk_profile"], "warn_unknown_dates")
+        self.assertEqual(result["summary"]["opened_covered_calls"], 1)
+        self.assertEqual(config["cc_risk"], original_cc_risk)
+        self.assertTrue(config["cc_risk"]["block_unknown_stock_earnings_date"])
+        self.assertEqual(config["cc_risk"]["nested"], {"preserve": True})
+        call_trade = result["trades"][-1]
+        self.assertEqual(call_trade["strategy"], "covered_call")
+
+    def test_cc_warn_unknown_dates_allows_stale_ex_dividend_date(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=96,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+        store = _FakeFundamentalsStore(
+            _fundamental(
+                next_earnings_date=date(2026, 3, 1),
+                dividend_yield=0.01,
+                ex_dividend_date=date(2025, 12, 1),
+            )
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+                fundamental_profile="fundamentals_strict_all",
+                historical_fundamentals=store,
+                cc_risk_profile="warn_unknown_dates",
+            )
+
+        self.assertEqual(result["summary"]["opened_covered_calls"], 1)
+        call_event = [
+            event for event in result["events"] if event["type"] == "OPEN_SHORT_CALL"
+        ][0]
+        self.assertEqual(
+            call_event["diagnostics"]["cc_ex_dividend_gate"]["status"],
+            "WARN",
+        )
+
+    def test_cc_risk_profile_precedence_explicit_arg_overrides_config(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        config = _config()
+        config["backtest"] = {"cc_risk_profile": "warn_unknown_dates"}
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=96,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+        store = _FakeFundamentalsStore(_fundamental(next_earnings_date=None))
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=config,
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+                fundamental_profile="fundamentals_strict_all",
+                historical_fundamentals=store,
+                cc_risk_profile="strict",
+            )
+
+        self.assertEqual(result["summary"]["cc_risk_profile"], "strict")
+        self.assertEqual(result["summary"]["opened_covered_calls"], 0)
+
+    def test_cc_risk_profile_defaults_to_strict_without_config(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        config = _config()
+        config.pop("backtest", None)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=96,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+        store = _FakeFundamentalsStore(_fundamental(next_earnings_date=None))
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=config,
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+                fundamental_profile="fundamentals_strict_all",
+                historical_fundamentals=store,
+            )
+
+        self.assertEqual(result["summary"]["cc_risk_profile"], "strict")
+        self.assertEqual(result["summary"]["opened_covered_calls"], 0)
+
+    def test_cc_warn_unknown_dates_still_blocks_known_earnings_inside_window(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=96,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+        store = _FakeFundamentalsStore(
+            _fundamental(next_earnings_date=call_expiration)
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+                fundamental_profile="fundamentals_strict_all",
+                historical_fundamentals=store,
+                cc_risk_profile="warn_unknown_dates",
+            )
+
+        self.assertEqual(result["summary"]["opened_covered_calls"], 0)
+        self.assertTrue(
+            any(
+                reason.startswith(
+                    "covered_call_risk_gate:cc_expiration_on_or_after_earnings"
+                )
+                for reason in result["summary"]["rejected_reason_counts"]
+            )
+        )
+
+    def test_cc_warn_unknown_dates_still_blocks_known_ex_dividend_inside_window(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=96,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+        store = _FakeFundamentalsStore(
+            _fundamental(
+                next_earnings_date=date(2026, 3, 1),
+                dividend_yield=0.01,
+                ex_dividend_date=date(2026, 1, 15),
+            )
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+                fundamental_profile="fundamentals_strict_all",
+                historical_fundamentals=store,
+                cc_risk_profile="warn_unknown_dates",
+            )
+
+        self.assertEqual(result["summary"]["opened_covered_calls"], 0)
+        self.assertTrue(
+            any(
+                reason.startswith(
+                    "covered_call_risk_gate:cc_ex_dividend_within_contract_window"
+                )
+                for reason in result["summary"]["rejected_reason_counts"]
+            )
         )
 
     def test_covered_call_missing_expiration_close_does_not_use_prior_close(self):
@@ -846,6 +1157,27 @@ class _ExplodingFundamentalsStore:
 
     def diagnostics(self) -> dict:
         raise AssertionError("fundamental diagnostics should not be called in technical_only")
+
+
+def _fundamental(
+    *,
+    next_earnings_date: date | None,
+    dividend_yield: float | None = None,
+    ex_dividend_date: date | None = None,
+) -> FundamentalSnapshot:
+    return FundamentalSnapshot(
+        ticker="AAPL",
+        quote_type="CS",
+        market_cap=10_000_000_000,
+        pe_ratio=20,
+        dividend_yield=dividend_yield,
+        annual_dividend_rate=1.0 if dividend_yield else None,
+        ex_dividend_date=ex_dividend_date,
+        quarterly_net_income=[1, 1, 1, 1, 1],
+        annual_net_income=[1, 1, 1, 1, 1],
+        next_earnings_date=next_earnings_date,
+        recent_move_pct=5,
+    )
 
 
 def _config() -> dict:

@@ -281,6 +281,46 @@ class CoveredCallPlannerTests(unittest.TestCase):
         )
         self.assertEqual(build_covered_call_shadow_orders(proposals, cfg)["order_count"], 0)
 
+    def test_live_planner_ignores_backtest_cc_risk_profile(self):
+        cfg = _config()
+        cfg["backtest"] = {"cc_risk_profile": "warn_unknown_dates"}
+        cfg["cc_risk"] = {
+            "block_unknown_stock_earnings_date": True,
+            "block_unknown_ex_dividend_date_for_dividend_payers": True,
+        }
+
+        proposals = build_covered_call_proposals(
+            _lifecycle(
+                [
+                    {
+                        "ticker": "AAPL",
+                        "state": "ASSIGNED",
+                        "covered_call_eligible": True,
+                        "long_shares": 100,
+                        "available_shares_for_cc": 100,
+                        "adjusted_cost_basis": 88.8,
+                    }
+                ]
+            ),
+            cfg,
+            as_of=date(2026, 5, 21),
+            option_chain_by_ticker={
+                "AAPL": [_call("AAPL260529C00090000", strike=90, delta=0.22)]
+            },
+            fundamental_by_ticker={
+                "AAPL": _fundamental(
+                    next_earnings_date=None,
+                    dividend_yield=0.01,
+                    ex_dividend_date=None,
+                )
+            },
+        )
+
+        proposal = proposals["proposals"][0]
+        self.assertEqual(proposal["decision"], "WATCH")
+        self.assertIn("cc_earnings_date_unknown", proposal["rejection_summary"])
+        self.assertEqual(build_covered_call_shadow_orders(proposals, cfg)["order_count"], 0)
+
     def test_covered_call_shadow_order_metadata_is_json_serializable(self):
         proposals = build_covered_call_proposals(
             _lifecycle(

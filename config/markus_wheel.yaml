@@ -17,6 +17,9 @@ account:
   currency: USD
   live_trading_enabled: false
 
+backtest:
+  cc_risk_profile: warn_unknown_dates
+
 backtest_execution:
   model: day_agg_synthetic_spread
   scan_timing: previous_close_signal_next_open_fill

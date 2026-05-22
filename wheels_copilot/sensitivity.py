@@ -554,6 +554,21 @@ def flatten_run_metrics(
         "average_capital_utilization_pct": summary.get("average_capital_utilization_pct"),
         "max_capital_utilization_pct": summary.get("max_capital_utilization_pct"),
         "data_issue_count": summary.get("data_issue_count"),
+        "cc_risk_profile": summary.get("cc_risk_profile"),
+        "uncovered_assigned_days": summary.get("uncovered_assigned_days"),
+        "uncovered_assigned_share_days": summary.get("uncovered_assigned_share_days"),
+        "average_uncovered_assigned_shares": summary.get(
+            "average_uncovered_assigned_shares"
+        ),
+        "max_uncovered_assigned_shares": summary.get("max_uncovered_assigned_shares"),
+        "cc_realized_option_pnl": summary.get("cc_realized_option_pnl"),
+        "cc_called_away_stock_pnl": summary.get("cc_called_away_stock_pnl"),
+        "open_assigned_stock_unrealized_pnl": summary.get(
+            "open_assigned_stock_unrealized_pnl"
+        ),
+        "assigned_stock_recovery_pnl_estimate": summary.get(
+            "assigned_stock_recovery_pnl_estimate"
+        ),
         "execution_model": summary.get("execution_model"),
         "execution_fill_policy": summary.get("execution_fill_policy"),
         "execution_reference_price_source": summary.get(
@@ -681,6 +696,15 @@ def write_leaderboard_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "average_capital_utilization_pct",
         "max_capital_utilization_pct",
         "data_issue_count",
+        "cc_risk_profile",
+        "uncovered_assigned_days",
+        "uncovered_assigned_share_days",
+        "average_uncovered_assigned_shares",
+        "max_uncovered_assigned_shares",
+        "cc_realized_option_pnl",
+        "cc_called_away_stock_pnl",
+        "open_assigned_stock_unrealized_pnl",
+        "assigned_stock_recovery_pnl_estimate",
         "execution_model",
         "execution_fill_policy",
         "execution_reference_price_source",
