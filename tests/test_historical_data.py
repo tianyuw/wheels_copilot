@@ -7,9 +7,11 @@ from pathlib import Path
 
 from wheels_copilot.historical_data import (
     FlatFilesStore,
+    black_scholes_call_price,
     black_scholes_put_price,
     detect_price_space_breaks,
     infer_put_iv,
+    infer_call_iv,
     parse_option_symbol,
 )
 from wheels_copilot.models import PriceBar
@@ -76,6 +78,34 @@ class HistoricalDataTests(unittest.TestCase):
         self.assertEqual(options[0].symbol, "AAPL260109P00090000")
         self.assertEqual(options[0].volume, 10)
 
+    def test_option_day_memory_cache_keeps_only_current_day(self):
+        store = FlatFilesStore(cache_dir=Path(tempfile.gettempdir()))
+
+        store._remember_option_day_rows(
+            date(2026, 1, 5),
+            {"AAPL"},
+            option_type="put",
+            chains={"AAPL": [{"ticker": "O:AAPL260109P00095000"}]},
+        )
+        store._remember_option_day_rows(
+            date(2026, 1, 6),
+            {"AAPL"},
+            option_type="put",
+            chains={"AAPL": [{"ticker": "O:AAPL260109P00094000"}]},
+        )
+
+        self.assertEqual(
+            {key[0] for key in store._option_day_memory_cache},
+            {date(2026, 1, 6)},
+        )
+        self.assertIsNotNone(
+            store._option_day_memory_hit(
+                date(2026, 1, 6),
+                {"AAPL"},
+                option_type="put",
+            )
+        )
+
     def test_infer_put_iv_rejects_prices_below_lower_bound(self):
         minimum_price = black_scholes_put_price(
             stock_price=50,
@@ -96,6 +126,29 @@ class HistoricalDataTests(unittest.TestCase):
         )
 
         self.assertIsNone(iv)
+
+    def test_infer_call_iv_returns_delta_usable_value(self):
+        price = black_scholes_call_price(
+            stock_price=100,
+            strike=105,
+            dte=7,
+            implied_volatility=0.35,
+            risk_free_rate=0.04,
+        )
+        self.assertIsNotNone(price)
+        assert price is not None
+
+        iv = infer_call_iv(
+            price=price,
+            stock_price=100,
+            strike=105,
+            dte=7,
+            risk_free_rate=0.04,
+        )
+
+        self.assertIsNotNone(iv)
+        assert iv is not None
+        self.assertAlmostEqual(iv, 0.35, places=3)
 
 
 class _MemoryFlatFilesStore(FlatFilesStore):

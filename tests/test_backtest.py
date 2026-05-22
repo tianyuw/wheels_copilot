@@ -4,8 +4,9 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import patch
 
-from wheels_copilot.backtest import run_backtest
+from wheels_copilot.backtest import StockPosition, _min_covered_call_strike, run_backtest
 from wheels_copilot.config import load_config
+from wheels_copilot.historical_data import parse_option_symbol
 from wheels_copilot.models import (
     OptionQuote,
     PriceBar,
@@ -234,6 +235,365 @@ class BacktestRunnerTests(unittest.TestCase):
             )
         )
 
+    def test_assignment_opens_covered_call_next_trading_day(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=110,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+            )
+
+        self.assertEqual(result["summary"]["assigned"], 1)
+        self.assertEqual(result["summary"]["opened_covered_calls"], 1)
+        self.assertEqual(result["summary"]["open_short_calls"], 1)
+        self.assertEqual(result["open_positions"]["short_calls"][0]["ticker"], "AAPL")
+
+    def test_covered_call_expires_worthless_and_keeps_stock(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=98,
+                    close_overrides={put_expiration: 90, call_scan: 96},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_expiration,
+                slippage_pct=0.0,
+            )
+
+        self.assertEqual(result["summary"]["expired_covered_calls"], 1)
+        self.assertEqual(result["summary"]["called_away"], 0)
+        self.assertEqual(result["open_positions"]["stocks"][0]["shares"], 100)
+        self.assertEqual(result["open_positions"]["short_calls"], [])
+
+    def test_covered_call_called_away_removes_stock_and_realizes_stock_pnl(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=105,
+                    close_overrides={put_expiration: 90, call_scan: 96},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_expiration,
+                slippage_pct=0.0,
+            )
+
+        self.assertEqual(result["summary"]["called_away"], 1)
+        self.assertEqual(result["summary"]["long_stock_positions"], 0)
+        self.assertAlmostEqual(result["summary"]["realized_stock_pnl"], 500.0)
+        self.assertEqual(result["open_positions"]["stocks"], [])
+
+    def test_covered_call_rejects_strike_below_adjusted_cost_basis(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_scan,
+                    close=96,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=date(2026, 1, 16), strike=90, dte=4)
+                ],
+            },
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+            )
+
+        self.assertEqual(result["summary"]["opened_covered_calls"], 0)
+        self.assertIn(
+            "strike_below_adjusted_cost_basis",
+            result["summary"]["rejected_reason_counts"],
+        )
+
+    def test_covered_call_missing_expiration_close_does_not_use_prior_close(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        bars = [
+            bar
+            for bar in _bars(
+                start,
+                call_expiration,
+                close=98,
+                close_overrides={put_expiration: 90, call_scan: 96},
+            )
+            if bar.date != call_expiration
+        ]
+        data = _FakeData(
+            bars={"AAPL": bars},
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_expiration,
+                slippage_pct=0.0,
+            )
+
+        self.assertEqual(result["summary"]["expired_covered_calls"], 0)
+        self.assertEqual(result["summary"]["called_away"], 0)
+        self.assertEqual(result["summary"]["open_short_calls"], 1)
+        self.assertTrue(
+            any(
+                event["type"] == "CALL_EXPIRATION_MISSING_UNDERLYING_CLOSE"
+                for event in result["events"]
+            )
+        )
+
+    def test_open_covered_call_intrinsic_fallback_marks_liability(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        call_expiration = date(2026, 1, 16)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=105,
+                    close_overrides={put_expiration: 90, call_scan: 105},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+            },
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+            )
+
+        self.assertEqual(result["summary"]["open_short_calls"], 1)
+        self.assertGreaterEqual(result["summary"]["data_issue_counts"]["missing_option_mark"], 1)
+        self.assertLess(result["summary"]["ending_equity"], 501100)
+
+    def test_partial_coverage_can_open_second_call_for_remaining_lot(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        first_call_scan = date(2026, 1, 12)
+        second_call_scan = date(2026, 1, 13)
+        call_expiration = date(2026, 1, 16)
+        config = _config()
+        config["trade_planner"]["default_contract_quantity"] = 2
+        config["cc_selector"]["default_contract_quantity"] = 1
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_expiration,
+                    close=96,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", first_call_scan): [
+                    _call(expiration=call_expiration, strike=100, dte=4)
+                ],
+                ("AAPL", second_call_scan): [
+                    _call(expiration=call_expiration, strike=101, dte=3)
+                ],
+            },
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=config,
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=second_call_scan,
+                slippage_pct=0.0,
+            )
+
+        self.assertEqual(result["open_positions"]["stocks"][0]["shares"], 200)
+        self.assertEqual(result["summary"]["opened_covered_calls"], 2)
+        self.assertEqual(result["summary"]["open_short_calls"], 2)
+
+    def test_covered_call_filter_rejections_are_counted(self):
+        start = date(2026, 1, 5)
+        put_expiration = date(2026, 1, 9)
+        call_scan = date(2026, 1, 12)
+        data = _FakeData(
+            bars={
+                "AAPL": _bars(
+                    start,
+                    call_scan,
+                    close=96,
+                    close_overrides={put_expiration: 90},
+                )
+            },
+            options={
+                ("AAPL", start): [_put(expiration=put_expiration, strike=95)],
+                ("AAPL", call_scan): [
+                    _call(
+                        expiration=date(2026, 1, 16),
+                        strike=100,
+                        dte=4,
+                        bid=0.05,
+                    ),
+                    _call(
+                        expiration=date(2026, 1, 16),
+                        strike=101,
+                        dte=4,
+                        bid=1.0,
+                        ask=1.5,
+                    ),
+                    _call(
+                        expiration=date(2026, 1, 16),
+                        strike=102,
+                        dte=4,
+                        delta=0.5,
+                    ),
+                    _call(
+                        expiration=date(2026, 1, 16),
+                        strike=103,
+                        dte=4,
+                        open_interest=1,
+                    ),
+                ],
+            },
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=call_scan,
+                slippage_pct=0.0,
+            )
+
+        self.assertEqual(result["summary"]["opened_covered_calls"], 0)
+        reject_events = [
+            event
+            for event in result["events"]
+            if event["type"] == "REJECT" and event["ticker"] == "AAPL"
+        ]
+        cc_summary = reject_events[-1]["diagnostics"]["cc_rejection_summary"]
+        self.assertIn("bid_below_min", cc_summary)
+        self.assertIn("spread_too_wide", cc_summary)
+        self.assertIn("delta_outside_target", cc_summary)
+        self.assertIn("open_interest_below_min", cc_summary)
+
+    def test_adjusted_cost_basis_floor_prevents_negative_min_strike(self):
+        stock = StockPosition(
+            ticker="AAPL",
+            shares=100,
+            cost_basis_total=9500,
+            premium_credit_total=20000,
+        )
+
+        min_strike = _min_covered_call_strike(stock, _config())
+
+        self.assertEqual(min_strike, 95.0)
+
 
 class _FakeData:
     def __init__(
@@ -281,7 +641,9 @@ class _FakeData:
         return [
             option
             for option in options
-            if dte_min <= option.dte <= dte_max and (option.volume or 0) > 0
+            if dte_min <= option.dte <= dte_max
+            and (option.volume or 0) > 0
+            and _option_type(option.symbol) == option_type
         ]
 
     def option_mark(
@@ -344,6 +706,39 @@ def _put(
         volume=volume,
         delta=-0.2,
     )
+
+
+def _call(
+    *,
+    ticker: str = "AAPL",
+    expiration: date,
+    strike: float,
+    dte: int,
+    volume: int = 100,
+    bid: float = 1.0,
+    ask: float = 1.0,
+    delta: float = 0.2,
+    open_interest: int = 500,
+) -> OptionQuote:
+    return OptionQuote(
+        symbol=f"{ticker}{expiration:%y%m%d}C{int(strike * 1000):08d}",
+        expiration=expiration,
+        dte=dte,
+        strike=strike,
+        bid=bid,
+        ask=ask,
+        last=(bid + ask) / 2,
+        implied_volatility=0.25,
+        open_interest=open_interest,
+        volume=volume,
+        delta=delta,
+    )
+
+
+def _option_type(symbol: str) -> str:
+    parsed = parse_option_symbol(symbol)
+    assert parsed is not None
+    return parsed.option_type
 
 
 def _bars(

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 from .models import OptionQuote, PriceBar
-from .option_math import black_scholes_put_delta, norm_cdf
+from .option_math import black_scholes_call_delta, black_scholes_put_delta, norm_cdf
 
 
 DEFAULT_FLATFILES_CACHE_DIR = Path("/Volumes/Data/wheels_copilot/flatfiles_cache")
@@ -96,6 +96,10 @@ class FlatFilesStore:
         self.endpoint_url = endpoint_url
         self.bucket = bucket
         self.cache_timeout_seconds = cache_timeout_seconds
+        self._option_day_memory_cache: dict[
+            tuple[date, str, tuple[str, ...]], dict[str, list[dict[str, Any]]]
+        ] = {}
+        self._option_day_memory_day: date | None = None
 
     def preflight_cache(self) -> CachePreflightResult:
         probe = self.cache_dir / ".preflight" / "write_probe.txt"
@@ -226,27 +230,21 @@ class FlatFilesStore:
             if raw_price <= 0:
                 continue
             executable_price = raw_price * max(0.0, 1.0 - slippage_pct)
-            iv = (
-                infer_put_iv(
-                    price=executable_price,
-                    stock_price=stock_price,
-                    strike=parsed.strike,
-                    dte=dte,
-                    risk_free_rate=risk_free_rate,
-                )
-                if option_type == "put" and stock_price is not None
-                else None
+            iv = _infer_iv(
+                option_type=option_type,
+                price=executable_price,
+                stock_price=stock_price,
+                strike=parsed.strike,
+                dte=dte,
+                risk_free_rate=risk_free_rate,
             )
-            delta = (
-                black_scholes_put_delta(
-                    stock_price=stock_price,
-                    strike=parsed.strike,
-                    dte=dte,
-                    implied_volatility=iv,
-                    risk_free_rate=risk_free_rate,
-                )
-                if option_type == "put" and stock_price is not None and iv is not None
-                else None
+            delta = _option_delta(
+                option_type=option_type,
+                stock_price=stock_price,
+                strike=parsed.strike,
+                dte=dte,
+                implied_volatility=iv,
+                risk_free_rate=risk_free_rate,
             )
             options.append(
                 OptionQuote(
@@ -288,7 +286,10 @@ class FlatFilesStore:
             dte = max((parsed.expiration - as_of).days, 0)
             price = to_float(row.get(price_field))
             if price <= 0:
-                price = max(0.0, parsed.strike - (stock_price or 0.0))
+                if parsed.option_type == "put":
+                    price = max(0.0, parsed.strike - (stock_price or 0.0))
+                else:
+                    price = max(0.0, (stock_price or 0.0) - parsed.strike)
             return OptionQuote(
                 symbol=normalize_option_symbol(symbol),
                 expiration=parsed.expiration,
@@ -310,12 +311,47 @@ class FlatFilesStore:
         option_type: str = "put",
     ) -> dict[str, list[dict[str, Any]]]:
         normalized_underlyings = {ticker.upper() for ticker in underlyings}
+        memory_hit = self._option_day_memory_hit(
+            day,
+            normalized_underlyings,
+            option_type=option_type,
+        )
+        if memory_hit is not None:
+            return memory_hit
+        return self.prefetch_option_day_rows(
+            day,
+            normalized_underlyings,
+            option_type=option_type,
+        )
+
+    def prefetch_option_day_rows(
+        self,
+        day: date,
+        underlyings: set[str],
+        *,
+        option_type: str = "put",
+    ) -> dict[str, list[dict[str, Any]]]:
+        normalized_underlyings = {ticker.upper() for ticker in underlyings}
+        memory_hit = self._option_day_memory_hit(
+            day,
+            normalized_underlyings,
+            option_type=option_type,
+        )
+        if memory_hit is not None:
+            return memory_hit
         cache_path = self._cache_path(
             f"options_day_{option_type}s", day, normalized_underlyings
         )
         cached = read_json_if_exists(cache_path)
         if cached is not None:
-            return {} if cached.get("missing") else cached.get("chains", {})
+            chains = {} if cached.get("missing") else cached.get("chains", {})
+            self._remember_option_day_rows(
+                day,
+                normalized_underlyings,
+                option_type=option_type,
+                chains=chains,
+            )
+            return chains
 
         chains: dict[str, list[dict[str, Any]]] = {
             ticker: [] for ticker in normalized_underlyings
@@ -344,13 +380,56 @@ class FlatFilesStore:
                 {"missing": True, "chains": {}},
                 timeout_seconds=self.cache_timeout_seconds,
             )
+            self._remember_option_day_rows(
+                day,
+                normalized_underlyings,
+                option_type=option_type,
+                chains={},
+            )
             return {}
         write_json_atomic(
             cache_path,
             {"missing": False, "chains": chains},
             timeout_seconds=self.cache_timeout_seconds,
         )
+        self._remember_option_day_rows(
+            day,
+            normalized_underlyings,
+            option_type=option_type,
+            chains=chains,
+        )
         return chains
+
+    def _option_day_memory_hit(
+        self,
+        day: date,
+        underlyings: set[str],
+        *,
+        option_type: str,
+    ) -> dict[str, list[dict[str, Any]]] | None:
+        if self._option_day_memory_day is not None and self._option_day_memory_day != day:
+            self._option_day_memory_cache.clear()
+            self._option_day_memory_day = None
+        for (cached_day, cached_type, cached_symbols), chains in self._option_day_memory_cache.items():
+            if cached_day != day or cached_type != option_type:
+                continue
+            if underlyings.issubset(set(cached_symbols)):
+                return {ticker: chains.get(ticker, []) for ticker in underlyings}
+        return None
+
+    def _remember_option_day_rows(
+        self,
+        day: date,
+        underlyings: set[str],
+        *,
+        option_type: str,
+        chains: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        if self._option_day_memory_day is not None and self._option_day_memory_day != day:
+            self._option_day_memory_cache.clear()
+        self._option_day_memory_day = day
+        key = (day, option_type, tuple(sorted(underlyings)))
+        self._option_day_memory_cache[key] = chains
 
     def iter_dataset_rows(self, dataset: str, day: date) -> Iterable[dict[str, str]]:
         key = key_for_dataset(dataset, day)
@@ -583,6 +662,108 @@ def infer_put_iv(
     return (low + high) / 2.0
 
 
+def infer_call_iv(
+    *,
+    price: float,
+    stock_price: float | None,
+    strike: float,
+    dte: int,
+    risk_free_rate: float,
+) -> float | None:
+    if (
+        price <= 0
+        or stock_price is None
+        or stock_price <= 0
+        or strike <= 0
+        or dte <= 0
+    ):
+        return None
+    low = 0.0001
+    high = 5.0
+    tolerance = 1e-6
+    low_price = black_scholes_call_price(stock_price, strike, dte, low, risk_free_rate)
+    if low_price is None or low_price > price + tolerance:
+        return None
+    high_price = black_scholes_call_price(stock_price, strike, dte, high, risk_free_rate)
+    while high_price is not None and high_price < price and high < 20.0:
+        high *= 2
+        high_price = black_scholes_call_price(stock_price, strike, dte, high, risk_free_rate)
+    if high_price is None or high_price < price:
+        return None
+    for _ in range(50):
+        mid = (low + high) / 2.0
+        mid_price = black_scholes_call_price(stock_price, strike, dte, mid, risk_free_rate)
+        if mid_price is None:
+            return None
+        if abs(mid_price - price) <= tolerance:
+            return mid
+        if mid_price < price:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
+def _infer_iv(
+    *,
+    option_type: str,
+    price: float,
+    stock_price: float | None,
+    strike: float,
+    dte: int,
+    risk_free_rate: float,
+) -> float | None:
+    if stock_price is None:
+        return None
+    if option_type == "put":
+        return infer_put_iv(
+            price=price,
+            stock_price=stock_price,
+            strike=strike,
+            dte=dte,
+            risk_free_rate=risk_free_rate,
+        )
+    if option_type == "call":
+        return infer_call_iv(
+            price=price,
+            stock_price=stock_price,
+            strike=strike,
+            dte=dte,
+            risk_free_rate=risk_free_rate,
+        )
+    return None
+
+
+def _option_delta(
+    *,
+    option_type: str,
+    stock_price: float | None,
+    strike: float,
+    dte: int,
+    implied_volatility: float | None,
+    risk_free_rate: float,
+) -> float | None:
+    if stock_price is None or implied_volatility is None:
+        return None
+    if option_type == "put":
+        return black_scholes_put_delta(
+            stock_price=stock_price,
+            strike=strike,
+            dte=dte,
+            implied_volatility=implied_volatility,
+            risk_free_rate=risk_free_rate,
+        )
+    if option_type == "call":
+        return black_scholes_call_delta(
+            stock_price=stock_price,
+            strike=strike,
+            dte=dte,
+            implied_volatility=implied_volatility,
+            risk_free_rate=risk_free_rate,
+        )
+    return None
+
+
 def black_scholes_put_price(
     stock_price: float,
     strike: float,
@@ -604,6 +785,30 @@ def black_scholes_put_price(
     return (
         strike * math.exp(-risk_free_rate * t) * norm_cdf(-d2)
         - stock_price * norm_cdf(-d1)
+    )
+
+
+def black_scholes_call_price(
+    stock_price: float,
+    strike: float,
+    dte: int,
+    implied_volatility: float,
+    risk_free_rate: float,
+) -> float | None:
+    if stock_price <= 0 or strike <= 0 or dte <= 0 or implied_volatility <= 0:
+        return None
+    t = dte / 365.0
+    sigma_sqrt_t = implied_volatility * math.sqrt(t)
+    if sigma_sqrt_t <= 0:
+        return None
+    d1 = (
+        math.log(stock_price / strike)
+        + (risk_free_rate + 0.5 * implied_volatility * implied_volatility) * t
+    ) / sigma_sqrt_t
+    d2 = d1 - sigma_sqrt_t
+    return (
+        stock_price * norm_cdf(d1)
+        - strike * math.exp(-risk_free_rate * t) * norm_cdf(d2)
     )
 
 
