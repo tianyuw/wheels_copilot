@@ -578,6 +578,8 @@ def run_backtest(
     summary["execution_fill_policy"] = execution_model.fill_policy
     summary["execution_reference_price_source"] = execution_model.reference_price_source
     summary["execution_calibration_status"] = execution_model.calibration_status
+    cache_stats_fn = getattr(data, "cache_stats_snapshot", None)
+    data_cache_stats = cache_stats_fn() if callable(cache_stats_fn) else None
     return {
         "version": BACKTEST_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -615,6 +617,7 @@ def run_backtest(
                 else None
             ),
             "backtest_execution": execution_model.metadata(),
+            "data_cache": data_cache_stats,
         },
         "config_snapshot": config,
         "fundamental_diagnostics": fundamental_diagnostics,

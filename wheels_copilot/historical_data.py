@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import gzip
-import io
 import json
 import math
 import os
@@ -15,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Protocol, Sequence
 
 from .execution_price import BacktestExecutionModel, modeled_quote_from_reference
 from .models import OptionQuote, PriceBar
@@ -28,13 +27,46 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms.
 
 
 DEFAULT_FLATFILES_CACHE_DIR = Path("/Volumes/Data/wheels_copilot/flatfiles_cache")
+DEFAULT_FLATFILES_RAW_DIR = Path("/Volumes/Data/wheels_copilot/flatfiles_raw")
+DEFAULT_FLATFILES_INDEXED_DIR = Path("/Volumes/Data/wheels_copilot/flatfiles_indexed")
 DEFAULT_ENDPOINT_URL = "https://files.massive.com"
 DEFAULT_BUCKET = "flatfiles"
 DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS = 300.0
+INDEXED_CACHE_SCHEMA_VERSION = "flatfiles_indexed.v1"
+DATASET_CACHE_DIRS = {
+    "stocks-day-aggs": "stocks_day_aggs",
+    "options-day-aggs": "options_day_aggs",
+}
 
 
 class BacktestDataError(RuntimeError):
     pass
+
+
+class WarmCacheMiss(BacktestDataError):
+    def __init__(
+        self,
+        *,
+        dataset: str,
+        day: date,
+        reason: str,
+        tickers: Sequence[str] | None = None,
+        option_type: str | None = None,
+    ) -> None:
+        details = [f"dataset={dataset}", f"date={day.isoformat()}"]
+        if option_type:
+            details.append(f"option_type={option_type}")
+        if tickers:
+            preview = ",".join(sorted(tickers)[:12])
+            if len(tickers) > 12:
+                preview += f",...(+{len(tickers) - 12})"
+            details.append(f"tickers={preview}")
+        super().__init__(f"warm cache miss ({'; '.join(details)}): {reason}")
+        self.dataset = dataset
+        self.day = day
+        self.reason = reason
+        self.tickers = tuple(sorted(tickers or []))
+        self.option_type = option_type
 
 
 class FlatFileMissing(RuntimeError):
@@ -99,23 +131,59 @@ class FlatFilesStore:
         self,
         *,
         cache_dir: Path = DEFAULT_FLATFILES_CACHE_DIR,
+        raw_cache_dir: Path | None = None,
+        indexed_cache_dir: Path | None = None,
         aws: str = "aws",
         endpoint_url: str = DEFAULT_ENDPOINT_URL,
         bucket: str = DEFAULT_BUCKET,
         cache_timeout_seconds: float = 15.0,
+        require_warm_cache: bool = False,
     ) -> None:
         self.cache_dir = Path(cache_dir)
+        if raw_cache_dir is None:
+            raw_cache_dir = (
+                DEFAULT_FLATFILES_RAW_DIR
+                if self.cache_dir == DEFAULT_FLATFILES_CACHE_DIR
+                else self.cache_dir / "raw"
+            )
+        if indexed_cache_dir is None:
+            indexed_cache_dir = (
+                DEFAULT_FLATFILES_INDEXED_DIR
+                if self.cache_dir == DEFAULT_FLATFILES_CACHE_DIR
+                else self.cache_dir / "indexed"
+            )
+        self.raw_cache_dir = Path(raw_cache_dir)
+        self.indexed_cache_dir = Path(indexed_cache_dir)
         self.aws = aws
         self.endpoint_url = endpoint_url
         self.bucket = bucket
         self.cache_timeout_seconds = cache_timeout_seconds
+        self.require_warm_cache = require_warm_cache
+        self.cache_stats: dict[str, int] = {
+            "raw_hits": 0,
+            "raw_downloads": 0,
+            "raw_missing": 0,
+            "indexed_hits": 0,
+            "indexed_builds": 0,
+            "indexed_missing": 0,
+            "strict_misses": 0,
+        }
         self._option_day_memory_cache: dict[
             tuple[date, str, tuple[str, ...]], dict[str, list[dict[str, Any]]]
         ] = {}
         self._option_day_memory_day: date | None = None
 
     def preflight_cache(self) -> CachePreflightResult:
-        probe = self.cache_dir / ".preflight" / "write_probe.txt"
+        for cache_dir in dict.fromkeys(
+            [self.cache_dir, self.raw_cache_dir, self.indexed_cache_dir]
+        ):
+            result = self._preflight_cache_dir(cache_dir)
+            if not result.ok:
+                return result
+        return CachePreflightResult(cache_dir=self.cache_dir, ok=True)
+
+    def _preflight_cache_dir(self, cache_dir: Path) -> CachePreflightResult:
+        probe = cache_dir / ".preflight" / "write_probe.txt"
         try:
             ensure_parent_dir(probe, timeout_seconds=self.cache_timeout_seconds)
             script = (
@@ -140,17 +208,17 @@ class FlatFilesStore:
             )
         except subprocess.TimeoutExpired:
             return CachePreflightResult(
-                cache_dir=self.cache_dir,
+                cache_dir=cache_dir,
                 ok=False,
                 reason="cache write/read/delete timed out",
             )
         except (subprocess.CalledProcessError, OSError) as exc:
             return CachePreflightResult(
-                cache_dir=self.cache_dir,
+                cache_dir=cache_dir,
                 ok=False,
                 reason=str(exc),
             )
-        return CachePreflightResult(cache_dir=self.cache_dir, ok=True)
+        return CachePreflightResult(cache_dir=cache_dir, ok=True)
 
     def require_writable_cache(self) -> None:
         result = self.preflight_cache()
@@ -187,41 +255,23 @@ class FlatFilesStore:
     def stock_day_rows(
         self, day: date, tickers: set[str]
     ) -> dict[str, dict[str, Any]]:
-        cache_path = self._cache_path("stocks_day", day, tickers)
-        cached = read_json_if_exists(cache_path)
-        if cached is not None:
-            return {} if cached.get("missing") else cached.get("rows", {})
-
-        with cache_file_lock(
-            cache_path,
-            timeout_seconds=max(
-                self.cache_timeout_seconds,
-                DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS,
-            ),
-        ):
-            cached = read_json_if_exists(cache_path)
-            if cached is not None:
-                return {} if cached.get("missing") else cached.get("rows", {})
-
-            rows: dict[str, dict[str, Any]] = {}
-            try:
-                for row in self.iter_dataset_rows("stocks-day-aggs", day):
-                    ticker = str(row.get("ticker") or "").upper()
-                    if ticker in tickers:
-                        rows[ticker] = row
-            except FlatFileMissing:
-                write_json_atomic(
-                    cache_path,
-                    {"missing": True, "rows": {}},
-                    timeout_seconds=self.cache_timeout_seconds,
-                )
-                return {}
-            write_json_atomic(
-                cache_path,
-                {"missing": False, "rows": rows},
-                timeout_seconds=self.cache_timeout_seconds,
-            )
+        normalized = {ticker.upper() for ticker in tickers}
+        if not normalized:
+            return {}
+        rows, missing = self._read_indexed_stock_day(day, normalized)
+        if not missing:
+            self.cache_stats["indexed_hits"] += 1
             return rows
+        self.cache_stats["indexed_missing"] += 1
+        if self.require_warm_cache:
+            self.cache_stats["strict_misses"] += 1
+            raise WarmCacheMiss(
+                dataset="stocks-day-aggs",
+                day=day,
+                tickers=sorted(missing),
+                reason="indexed stock cache does not cover requested tickers",
+            )
+        return self._build_indexed_stock_day(day, normalized)
 
     def option_chain(
         self,
@@ -368,6 +418,8 @@ class FlatFilesStore:
         option_type: str = "put",
     ) -> dict[str, list[dict[str, Any]]]:
         normalized_underlyings = {ticker.upper() for ticker in underlyings}
+        if not normalized_underlyings:
+            return {}
         memory_hit = self._option_day_memory_hit(
             day,
             normalized_underlyings,
@@ -375,12 +427,13 @@ class FlatFilesStore:
         )
         if memory_hit is not None:
             return memory_hit
-        cache_path = self._cache_path(
-            f"options_day_{option_type}s", day, normalized_underlyings
+        chains, missing = self._read_indexed_option_day(
+            day,
+            normalized_underlyings,
+            option_type=option_type,
         )
-        cached = read_json_if_exists(cache_path)
-        if cached is not None:
-            chains = {} if cached.get("missing") else cached.get("chains", {})
+        if not missing:
+            self.cache_stats["indexed_hits"] += 1
             self._remember_option_day_rows(
                 day,
                 normalized_underlyings,
@@ -388,71 +441,28 @@ class FlatFilesStore:
                 chains=chains,
             )
             return chains
-
-        with cache_file_lock(
-            cache_path,
-            timeout_seconds=max(
-                self.cache_timeout_seconds,
-                DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS,
-            ),
-        ):
-            cached = read_json_if_exists(cache_path)
-            if cached is not None:
-                chains = {} if cached.get("missing") else cached.get("chains", {})
-                self._remember_option_day_rows(
-                    day,
-                    normalized_underlyings,
-                    option_type=option_type,
-                    chains=chains,
-                )
-                return chains
-
-            chains: dict[str, list[dict[str, Any]]] = {
-                ticker: [] for ticker in normalized_underlyings
-            }
-            try:
-                for row in self.iter_dataset_rows("options-day-aggs", day):
-                    parsed = parse_option_symbol(str(row.get("ticker") or ""))
-                    if parsed is None or parsed.option_type != option_type:
-                        continue
-                    if parsed.underlying not in normalized_underlyings:
-                        continue
-                    normalized = dict(row)
-                    normalized.update(
-                        {
-                            "underlying": parsed.underlying,
-                            "expiration": parsed.expiration.isoformat(),
-                            "option_type": parsed.option_type,
-                            "strike": parsed.strike,
-                            "normalized_ticker": normalize_option_symbol(parsed.raw_symbol),
-                        }
-                    )
-                    chains[parsed.underlying].append(normalized)
-            except FlatFileMissing:
-                write_json_atomic(
-                    cache_path,
-                    {"missing": True, "chains": {}},
-                    timeout_seconds=self.cache_timeout_seconds,
-                )
-                self._remember_option_day_rows(
-                    day,
-                    normalized_underlyings,
-                    option_type=option_type,
-                    chains={},
-                )
-                return {}
-            write_json_atomic(
-                cache_path,
-                {"missing": False, "chains": chains},
-                timeout_seconds=self.cache_timeout_seconds,
-            )
-            self._remember_option_day_rows(
-                day,
-                normalized_underlyings,
+        self.cache_stats["indexed_missing"] += 1
+        if self.require_warm_cache:
+            self.cache_stats["strict_misses"] += 1
+            raise WarmCacheMiss(
+                dataset="options-day-aggs",
+                day=day,
                 option_type=option_type,
-                chains=chains,
+                tickers=sorted(missing),
+                reason="indexed option cache does not cover requested underlyings",
             )
-            return chains
+        chains = self._build_indexed_option_day(
+            day,
+            normalized_underlyings,
+            option_type=option_type,
+        )
+        self._remember_option_day_rows(
+            day,
+            normalized_underlyings,
+            option_type=option_type,
+            chains=chains,
+        )
+        return chains
 
     def _option_day_memory_hit(
         self,
@@ -482,49 +492,462 @@ class FlatFilesStore:
         if self._option_day_memory_day is not None and self._option_day_memory_day != day:
             self._option_day_memory_cache.clear()
         self._option_day_memory_day = day
+        if len(self._option_day_memory_cache) >= 32:
+            self._option_day_memory_cache.clear()
         key = (day, option_type, tuple(sorted(underlyings)))
         self._option_day_memory_cache[key] = chains
 
     def iter_dataset_rows(self, dataset: str, day: date) -> Iterable[dict[str, str]]:
+        raw_path = self.raw_cache_path(dataset, day)
+        if raw_path.exists():
+            self.cache_stats["raw_hits"] += 1
+            yield from iter_csv_gzip_rows(raw_path)
+            return
+        if self.raw_missing_path(dataset, day).exists():
+            self.cache_stats["raw_missing"] += 1
+            raise FlatFileMissing(str(raw_path))
+        if self.require_warm_cache:
+            self.cache_stats["strict_misses"] += 1
+            raise WarmCacheMiss(
+                dataset=dataset,
+                day=day,
+                reason="raw FlatFile is not present in local cache",
+            )
+        self.download_raw_flatfile(dataset, day)
+        self.cache_stats["raw_downloads"] += 1
+        yield from iter_csv_gzip_rows(raw_path)
+
+    def warmup_day(
+        self,
+        day: date,
+        tickers: set[str],
+        *,
+        datasets: Sequence[str] = ("stocks-day-aggs", "options-day-aggs"),
+        option_types: Sequence[str] = ("put", "call"),
+    ) -> dict[str, Any]:
+        if self.require_warm_cache:
+            raise BacktestDataError("warmup_day requires a non-strict FlatFilesStore")
+        normalized = {ticker.upper() for ticker in tickers}
+        result: dict[str, Any] = {
+            "date": day.isoformat(),
+            "tickers": len(normalized),
+            "datasets": {},
+        }
+        if "stocks-day-aggs" in datasets:
+            rows = self._build_indexed_stock_day(day, normalized)
+            result["datasets"]["stocks-day-aggs"] = {"rows": len(rows)}
+        if "options-day-aggs" in datasets:
+            option_result: dict[str, Any] = {}
+            for option_type in option_types:
+                chains = self._build_indexed_option_day(
+                    day,
+                    normalized,
+                    option_type=option_type,
+                )
+                option_result[option_type] = {
+                    "rows": sum(len(rows) for rows in chains.values())
+                }
+            result["datasets"]["options-day-aggs"] = option_result
+        return result
+
+    def cache_stats_snapshot(self) -> dict[str, int]:
+        return dict(self.cache_stats)
+
+    def raw_cache_path(self, dataset: str, day: date) -> Path:
+        return (
+            self.raw_cache_dir
+            / dataset_cache_dir(dataset)
+            / f"{day.year:04d}"
+            / f"{day.month:02d}"
+            / f"{day.isoformat()}.csv.gz"
+        )
+
+    def raw_missing_path(self, dataset: str, day: date) -> Path:
+        path = self.raw_cache_path(dataset, day)
+        return path.with_name(path.name + ".missing.json")
+
+    def indexed_cache_path(self, dataset: str, day: date) -> Path:
+        return (
+            self.indexed_cache_dir
+            / dataset_cache_dir(dataset)
+            / f"{day.year:04d}"
+            / f"{day.month:02d}"
+            / f"{day.isoformat()}.parquet"
+        )
+
+    def indexed_manifest_path(self, dataset: str, day: date) -> Path:
+        path = self.indexed_cache_path(dataset, day)
+        return path.with_name(path.name + ".manifest.json")
+
+    def indexed_missing_path(self, dataset: str, day: date) -> Path:
+        path = self.indexed_cache_path(dataset, day)
+        return path.with_name(path.name + ".missing.json")
+
+    def download_raw_flatfile(self, dataset: str, day: date) -> None:
         key = key_for_dataset(dataset, day)
         uri = f"s3://{self.bucket}/{key}"
-        cmd = [
-            self.aws,
-            "s3",
-            "cp",
-            uri,
-            "-",
-            "--endpoint-url",
-            self.endpoint_url,
-            "--no-progress",
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        assert proc.stdout is not None
-        assert proc.stderr is not None
-        try:
-            with gzip.GzipFile(fileobj=proc.stdout) as gz:
-                with io.TextIOWrapper(gz, encoding="utf-8", newline="") as text:
-                    yield from csv.DictReader(text)
-        except (EOFError, gzip.BadGzipFile) as exc:
-            stderr = proc.stderr.read().decode("utf-8", errors="replace")
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait()
-            if is_missing_flatfile(stderr):
-                raise FlatFileMissing(uri) from exc
-            raise BacktestDataError(f"failed to read {uri}: {stderr[:500]}") from exc
-        except Exception:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-            raise
-        if proc.poll() is None:
-            proc.wait()
-        stderr = proc.stderr.read().decode("utf-8", errors="replace")
-        if proc.returncode not in (0, None):
-            if is_missing_flatfile(stderr):
+        raw_path = self.raw_cache_path(dataset, day)
+        missing_path = self.raw_missing_path(dataset, day)
+        lock_path = raw_path.with_name(raw_path.name + ".lock_target")
+        with cache_file_lock(
+            lock_path,
+            timeout_seconds=max(
+                self.cache_timeout_seconds,
+                DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS,
+            ),
+        ):
+            if raw_path.exists():
+                return
+            if missing_path.exists():
                 raise FlatFileMissing(uri)
-            raise BacktestDataError(f"aws s3 cp failed for {uri}: {stderr[:500]}")
+            ensure_parent_dir(raw_path, timeout_seconds=self.cache_timeout_seconds)
+            temp_path = raw_path.with_name(
+                f"{raw_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            )
+            cmd = [
+                self.aws,
+                "s3",
+                "cp",
+                uri,
+                str(temp_path),
+                "--endpoint-url",
+                self.endpoint_url,
+                "--no-progress",
+            ]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except OSError as exc:
+                raise BacktestDataError(f"failed to run aws CLI for {uri}: {exc}") from exc
+            if proc.returncode != 0:
+                temp_path.unlink(missing_ok=True)
+                if is_missing_flatfile(proc.stderr):
+                    write_json_atomic(
+                        missing_path,
+                        {
+                            "missing": True,
+                            "dataset": dataset,
+                            "date": day.isoformat(),
+                            "source_uri": uri,
+                            "checked_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        timeout_seconds=self.cache_timeout_seconds,
+                    )
+                    raise FlatFileMissing(uri)
+                raise BacktestDataError(
+                    f"aws s3 cp failed for {uri}: {(proc.stderr or '')[:500]}"
+                )
+            os.replace(temp_path, raw_path)
+
+    def _read_indexed_stock_day(
+        self,
+        day: date,
+        tickers: set[str],
+    ) -> tuple[dict[str, dict[str, Any]], set[str]]:
+        if self.indexed_missing_path("stocks-day-aggs", day).exists():
+            return {}, set()
+        coverage = self._stock_coverage(day)
+        if not coverage:
+            return {}, set(tickers)
+        missing = set(tickers) - coverage
+        rows = {
+            str(row.get("ticker") or "").upper(): row
+            for row in read_parquet_rows_if_exists(
+                self.indexed_cache_path("stocks-day-aggs", day)
+            )
+        }
+        return {ticker: rows[ticker] for ticker in tickers if ticker in rows}, missing
+
+    def _build_indexed_stock_day(
+        self,
+        day: date,
+        tickers: set[str],
+    ) -> dict[str, dict[str, Any]]:
+        if self.require_warm_cache:
+            raise WarmCacheMiss(
+                dataset="stocks-day-aggs",
+                day=day,
+                tickers=sorted(tickers),
+                reason="strict mode cannot build indexed stock cache",
+            )
+        cache_path = self.indexed_cache_path("stocks-day-aggs", day)
+        with cache_file_lock(
+            cache_path,
+            timeout_seconds=max(
+                self.cache_timeout_seconds,
+                DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS,
+            ),
+        ):
+            rows, missing = self._read_indexed_stock_day(day, tickers)
+            if not missing:
+                return rows
+            existing_rows = read_parquet_rows_if_exists(cache_path)
+            by_ticker = {
+                str(row.get("ticker") or "").upper(): row
+                for row in existing_rows
+                if row.get("ticker")
+            }
+            try:
+                for row in self.iter_dataset_rows("stocks-day-aggs", day):
+                    ticker = str(row.get("ticker") or "").upper()
+                    if ticker not in missing:
+                        continue
+                    normalized = normalize_parquet_row(row)
+                    normalized["ticker"] = ticker
+                    by_ticker[ticker] = normalized
+            except FlatFileMissing:
+                if not cache_path.exists():
+                    write_json_atomic(
+                        self.indexed_missing_path("stocks-day-aggs", day),
+                        {
+                            "missing": True,
+                            "dataset": "stocks-day-aggs",
+                            "date": day.isoformat(),
+                            "schema_version": INDEXED_CACHE_SCHEMA_VERSION,
+                            "checked_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        timeout_seconds=self.cache_timeout_seconds,
+                    )
+                return {
+                    ticker: by_ticker[ticker]
+                    for ticker in tickers
+                    if ticker in by_ticker
+                }
+            write_parquet_rows_atomic(
+                cache_path,
+                list(by_ticker.values()),
+                default_columns=["ticker", "open", "high", "low", "close", "volume"],
+                timeout_seconds=self.cache_timeout_seconds,
+            )
+            manifest = self._read_indexed_manifest("stocks-day-aggs", day)
+            covered = set(manifest.get("tickers") or [])
+            covered.update(tickers)
+            self._write_indexed_manifest(
+                "stocks-day-aggs",
+                day,
+                {
+                    **manifest,
+                    "schema_version": INDEXED_CACHE_SCHEMA_VERSION,
+                    "dataset": "stocks-day-aggs",
+                    "date": day.isoformat(),
+                    "tickers": sorted(covered),
+                    "row_count": len(by_ticker),
+                    "raw_file": self._raw_file_manifest("stocks-day-aggs", day),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            self.cache_stats["indexed_builds"] += 1
+            return {
+                ticker: by_ticker[ticker]
+                for ticker in tickers
+                if ticker in by_ticker
+            }
+
+    def _read_indexed_option_day(
+        self,
+        day: date,
+        underlyings: set[str],
+        *,
+        option_type: str,
+    ) -> tuple[dict[str, list[dict[str, Any]]], set[str]]:
+        if self.indexed_missing_path("options-day-aggs", day).exists():
+            return {ticker: [] for ticker in underlyings}, set()
+        coverage = self._option_coverage(day, option_type)
+        if not coverage:
+            return {}, set(underlyings)
+        missing = set(underlyings) - coverage
+        chains = {ticker: [] for ticker in underlyings}
+        for row in read_parquet_rows_if_exists(
+            self.indexed_cache_path("options-day-aggs", day)
+        ):
+            underlying = str(row.get("underlying") or "").upper()
+            row_type = str(row.get("option_type") or "").lower()
+            if underlying in underlyings and row_type == option_type:
+                chains[underlying].append(row)
+        return chains, missing
+
+    def _build_indexed_option_day(
+        self,
+        day: date,
+        underlyings: set[str],
+        *,
+        option_type: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if self.require_warm_cache:
+            raise WarmCacheMiss(
+                dataset="options-day-aggs",
+                day=day,
+                option_type=option_type,
+                tickers=sorted(underlyings),
+                reason="strict mode cannot build indexed option cache",
+            )
+        cache_path = self.indexed_cache_path("options-day-aggs", day)
+        with cache_file_lock(
+            cache_path,
+            timeout_seconds=max(
+                self.cache_timeout_seconds,
+                DEFAULT_CACHE_LOCK_TIMEOUT_SECONDS,
+            ),
+        ):
+            chains, missing = self._read_indexed_option_day(
+                day,
+                underlyings,
+                option_type=option_type,
+            )
+            if not missing:
+                return chains
+            existing_rows = read_parquet_rows_if_exists(cache_path)
+            remaining_rows = [
+                row
+                for row in existing_rows
+                if not (
+                    str(row.get("underlying") or "").upper() in missing
+                    and str(row.get("option_type") or "").lower() == option_type
+                )
+            ]
+            new_rows: list[dict[str, Any]] = []
+            try:
+                for row in self.iter_dataset_rows("options-day-aggs", day):
+                    parsed = parse_option_symbol(str(row.get("ticker") or ""))
+                    if parsed is None or parsed.option_type != option_type:
+                        continue
+                    if parsed.underlying not in missing:
+                        continue
+                    normalized = normalize_parquet_row(row)
+                    normalized.update(
+                        {
+                            "underlying": parsed.underlying,
+                            "expiration": parsed.expiration.isoformat(),
+                            "option_type": parsed.option_type,
+                            "strike": parsed.strike,
+                            "normalized_ticker": normalize_option_symbol(parsed.raw_symbol),
+                        }
+                    )
+                    new_rows.append(normalized)
+            except FlatFileMissing:
+                if not cache_path.exists():
+                    write_json_atomic(
+                        self.indexed_missing_path("options-day-aggs", day),
+                        {
+                            "missing": True,
+                            "dataset": "options-day-aggs",
+                            "date": day.isoformat(),
+                            "schema_version": INDEXED_CACHE_SCHEMA_VERSION,
+                            "checked_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        timeout_seconds=self.cache_timeout_seconds,
+                    )
+                chains = {ticker: [] for ticker in underlyings}
+                for row in existing_rows:
+                    underlying = str(row.get("underlying") or "").upper()
+                    row_type = str(row.get("option_type") or "").lower()
+                    if underlying in underlyings and row_type == option_type:
+                        chains[underlying].append(row)
+                return chains
+            all_rows = remaining_rows + new_rows
+            write_parquet_rows_atomic(
+                cache_path,
+                all_rows,
+                default_columns=[
+                    "ticker",
+                    "underlying",
+                    "expiration",
+                    "option_type",
+                    "strike",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "normalized_ticker",
+                ],
+                timeout_seconds=self.cache_timeout_seconds,
+            )
+            manifest = self._read_indexed_manifest("options-day-aggs", day)
+            option_coverage = dict(manifest.get("option_types") or {})
+            type_coverage = set(option_coverage.get(option_type) or [])
+            type_coverage.update(underlyings)
+            option_coverage[option_type] = sorted(type_coverage)
+            self._write_indexed_manifest(
+                "options-day-aggs",
+                day,
+                {
+                    **manifest,
+                    "schema_version": INDEXED_CACHE_SCHEMA_VERSION,
+                    "dataset": "options-day-aggs",
+                    "date": day.isoformat(),
+                    "option_types": option_coverage,
+                    "row_count": len(all_rows),
+                    "raw_file": self._raw_file_manifest("options-day-aggs", day),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            self.cache_stats["indexed_builds"] += 1
+            chains = {ticker: [] for ticker in underlyings}
+            for row in all_rows:
+                underlying = str(row.get("underlying") or "").upper()
+                row_type = str(row.get("option_type") or "").lower()
+                if underlying in underlyings and row_type == option_type:
+                    chains[underlying].append(row)
+            return chains
+
+    def _read_indexed_manifest(self, dataset: str, day: date) -> dict[str, Any]:
+        payload = read_json_if_exists(self.indexed_manifest_path(dataset, day))
+        return payload if isinstance(payload, dict) else {}
+
+    def _write_indexed_manifest(
+        self,
+        dataset: str,
+        day: date,
+        payload: dict[str, Any],
+    ) -> None:
+        write_json_atomic(
+            self.indexed_manifest_path(dataset, day),
+            payload,
+            timeout_seconds=self.cache_timeout_seconds,
+        )
+
+    def _stock_coverage(self, day: date) -> set[str]:
+        manifest = self._read_indexed_manifest("stocks-day-aggs", day)
+        if manifest.get("schema_version") == INDEXED_CACHE_SCHEMA_VERSION:
+            return {str(ticker).upper() for ticker in manifest.get("tickers") or []}
+        return set()
+
+    def _option_coverage(self, day: date, option_type: str) -> set[str]:
+        manifest = self._read_indexed_manifest("options-day-aggs", day)
+        if manifest.get("schema_version") == INDEXED_CACHE_SCHEMA_VERSION:
+            option_types = manifest.get("option_types") or {}
+            return {
+                str(ticker).upper()
+                for ticker in option_types.get(option_type) or []
+            }
+        return set()
+
+    def _raw_file_manifest(self, dataset: str, day: date) -> dict[str, Any]:
+        path = self.raw_cache_path(dataset, day)
+        payload: dict[str, Any] = {
+            "path": str(path),
+            "source_key": key_for_dataset(dataset, day),
+        }
+        try:
+            stat = path.stat()
+        except OSError:
+            return payload
+        payload.update(
+            {
+                "size_bytes": stat.st_size,
+                "mtime": datetime.fromtimestamp(
+                    stat.st_mtime,
+                    tz=timezone.utc,
+                ).isoformat(),
+            }
+        )
+        return payload
 
     def _cache_path(self, namespace: str, day: date, symbols: set[str]) -> Path:
         digest = stable_digest("_".join(sorted(symbols)))
@@ -549,6 +972,104 @@ def key_for_dataset(dataset: str, day: date) -> str:
             f"{day.year:04d}/{day.month:02d}/{day.isoformat()}.csv.gz"
         )
     raise BacktestDataError(f"unsupported flatfile dataset: {dataset}")
+
+
+def dataset_cache_dir(dataset: str) -> str:
+    try:
+        return DATASET_CACHE_DIRS[dataset]
+    except KeyError as exc:
+        raise BacktestDataError(f"unsupported flatfile dataset: {dataset}") from exc
+
+
+def iter_csv_gzip_rows(path: Path) -> Iterable[dict[str, str]]:
+    with gzip.open(path, "rt", encoding="utf-8", newline="") as f:
+        yield from csv.DictReader(f)
+
+
+PARQUET_FLOAT_COLUMNS = {
+    "open",
+    "high",
+    "low",
+    "close",
+    "vwap",
+    "strike",
+}
+PARQUET_INT_COLUMNS = {
+    "volume",
+    "transactions",
+    "window_start",
+    "open_interest",
+}
+
+
+def normalize_parquet_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): normalize_parquet_value(str(key), value)
+        for key, value in row.items()
+    }
+
+
+def normalize_parquet_value(column: str, value: Any) -> Any:
+    if value is None or value == "":
+        return None
+    if column in PARQUET_FLOAT_COLUMNS:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    if column in PARQUET_INT_COLUMNS:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+    return str(value)
+
+
+def read_parquet_rows_if_exists(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover - depends on local environment.
+        raise BacktestDataError(
+            "pyarrow is required for FlatFiles indexed Parquet cache; "
+            "install project dependencies before running backtests."
+        ) from exc
+    table = pq.read_table(path)
+    return table.to_pylist()
+
+
+def write_parquet_rows_atomic(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    default_columns: Sequence[str],
+    timeout_seconds: float = 15.0,
+) -> None:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover - depends on local environment.
+        raise BacktestDataError(
+            "pyarrow is required for FlatFiles indexed Parquet cache; "
+            "install project dependencies before running backtests."
+        ) from exc
+    ensure_parent_dir(path, timeout_seconds=timeout_seconds)
+    columns = sorted({str(key) for row in rows for key in row} | set(default_columns))
+    data = {
+        column: [normalize_parquet_value(column, row.get(column)) for row in rows]
+        for column in columns
+    }
+    table = pa.table(data)
+    temp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        pq.write_table(table, temp_path, compression="zstd")
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def parse_option_symbol(symbol: str) -> ParsedOptionSymbol | None:

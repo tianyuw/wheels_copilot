@@ -15,7 +15,12 @@ if str(ROOT) not in sys.path:
 from wheels_copilot.backtest import run_backtest, write_backtest_outputs
 from wheels_copilot.config import load_config
 from wheels_copilot.historical_fundamentals import DEFAULT_FUNDAMENTALS_CACHE_DIR
-from wheels_copilot.historical_data import DEFAULT_FLATFILES_CACHE_DIR, FlatFilesStore
+from wheels_copilot.historical_data import (
+    DEFAULT_FLATFILES_CACHE_DIR,
+    DEFAULT_FLATFILES_INDEXED_DIR,
+    DEFAULT_FLATFILES_RAW_DIR,
+    FlatFilesStore,
+)
 
 
 def main() -> int:
@@ -25,7 +30,12 @@ def main() -> int:
     if not universe:
         raise SystemExit("No tickers selected for backtest.")
 
-    store = FlatFilesStore(cache_dir=Path(args.cache_dir))
+    store = FlatFilesStore(
+        cache_dir=Path(args.cache_dir),
+        raw_cache_dir=Path(args.raw_cache_dir),
+        indexed_cache_dir=Path(args.indexed_cache_dir),
+        require_warm_cache=args.require_warm_cache,
+    )
     if not args.skip_cache_preflight:
         store.require_writable_cache()
 
@@ -75,7 +85,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         default=str(DEFAULT_FLATFILES_CACHE_DIR),
-        help="Massive FlatFiles filtered cache directory.",
+        help="Legacy Massive FlatFiles cache directory.",
+    )
+    parser.add_argument(
+        "--raw-cache-dir",
+        default=str(DEFAULT_FLATFILES_RAW_DIR),
+        help="Local raw Massive FlatFiles CSV.GZ cache directory.",
+    )
+    parser.add_argument(
+        "--indexed-cache-dir",
+        default=str(DEFAULT_FLATFILES_INDEXED_DIR),
+        help="Local indexed Massive FlatFiles Parquet cache directory.",
+    )
+    parser.add_argument(
+        "--require-warm-cache",
+        action="store_true",
+        help="Fail instead of downloading/building FlatFiles cache during the backtest.",
     )
     parser.add_argument("--output-dir", help="Directory for JSON/CSV/Markdown outputs.")
     parser.add_argument("--schedule", choices=["daily"], default="daily")

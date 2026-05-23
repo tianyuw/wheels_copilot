@@ -366,6 +366,9 @@ def run_sensitivity(
     specs: list[SensitivityRunSpec],
     output_dir: Path,
     cache_dir: Path,
+    raw_cache_dir: Path | None = None,
+    indexed_cache_dir: Path | None = None,
+    require_warm_cache: bool = False,
     resource_plan: ResourcePlan,
     resume: bool,
     rerun_failed: bool,
@@ -376,7 +379,12 @@ def run_sensitivity(
     runs_dir = output_dir / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     if not skip_cache_preflight:
-        FlatFilesStore(cache_dir=cache_dir).require_writable_cache()
+        FlatFilesStore(
+            cache_dir=cache_dir,
+            raw_cache_dir=raw_cache_dir,
+            indexed_cache_dir=indexed_cache_dir,
+            require_warm_cache=require_warm_cache,
+        ).require_writable_cache()
     results: list[dict[str, Any]] = []
     planned = _filter_specs_for_resume(
         specs,
@@ -397,6 +405,9 @@ def run_sensitivity(
             baseline_specs,
             output_dir=output_dir,
             cache_dir=cache_dir,
+            raw_cache_dir=raw_cache_dir,
+            indexed_cache_dir=indexed_cache_dir,
+            require_warm_cache=require_warm_cache,
             workers=1,
             skip_cache_preflight=True,
             run_options=run_options,
@@ -409,6 +420,9 @@ def run_sensitivity(
             variant_specs,
             output_dir=output_dir,
             cache_dir=cache_dir,
+            raw_cache_dir=raw_cache_dir,
+            indexed_cache_dir=indexed_cache_dir,
+            require_warm_cache=require_warm_cache,
             workers=resource_plan.workers,
             skip_cache_preflight=True,
             run_options=run_options,
@@ -434,7 +448,14 @@ def execute_run_worker(payload: dict[str, Any]) -> dict[str, Any]:
         metadata = _run_metadata(spec, status="running", started_at=started)
         write_json(temp_dir / "run_metadata.json", metadata)
         write_json(temp_dir / "parameter_patch.json", spec.parameter_patch)
-        store = FlatFilesStore(cache_dir=Path(payload["cache_dir"]))
+        raw_cache_dir = payload.get("raw_cache_dir")
+        indexed_cache_dir = payload.get("indexed_cache_dir")
+        store = FlatFilesStore(
+            cache_dir=Path(payload["cache_dir"]),
+            raw_cache_dir=Path(raw_cache_dir) if raw_cache_dir else None,
+            indexed_cache_dir=Path(indexed_cache_dir) if indexed_cache_dir else None,
+            require_warm_cache=bool(payload.get("require_warm_cache")),
+        )
         if not payload["skip_cache_preflight"]:
             store.require_writable_cache()
         result = run_backtest(
@@ -940,6 +961,9 @@ def _run_specs_parallel(
     *,
     output_dir: Path,
     cache_dir: Path,
+    raw_cache_dir: Path | None,
+    indexed_cache_dir: Path | None,
+    require_warm_cache: bool,
     workers: int,
     skip_cache_preflight: bool,
     run_options: dict[str, Any],
@@ -958,6 +982,11 @@ def _run_specs_parallel(
                     "spec": asdict(spec),
                     "output_dir": str(output_dir),
                     "cache_dir": str(cache_dir),
+                    "raw_cache_dir": str(raw_cache_dir) if raw_cache_dir else None,
+                    "indexed_cache_dir": str(indexed_cache_dir)
+                    if indexed_cache_dir
+                    else None,
+                    "require_warm_cache": require_warm_cache,
                     "skip_cache_preflight": skip_cache_preflight,
                     "run_options": run_options,
                 },

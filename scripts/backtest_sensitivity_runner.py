@@ -13,7 +13,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from wheels_copilot.config import load_config
-from wheels_copilot.historical_data import DEFAULT_FLATFILES_CACHE_DIR
+from wheels_copilot.historical_data import (
+    DEFAULT_FLATFILES_CACHE_DIR,
+    DEFAULT_FLATFILES_INDEXED_DIR,
+    DEFAULT_FLATFILES_RAW_DIR,
+)
 from wheels_copilot.sensitivity import (
     build_run_specs,
     compute_resource_plan,
@@ -42,6 +46,8 @@ def main() -> int:
         else default_output_dir(scenario_name, start, end)
     )
     cache_dir = Path(args.cache_dir)
+    raw_cache_dir = Path(args.raw_cache_dir)
+    indexed_cache_dir = Path(args.indexed_cache_dir)
     specs = build_run_specs(
         scenario=scenario,
         base_config=config,
@@ -77,6 +83,9 @@ def main() -> int:
         "scenario": scenario_name,
         "output_dir": str(output_dir),
         "cache_dir": str(cache_dir),
+        "raw_cache_dir": str(raw_cache_dir),
+        "indexed_cache_dir": str(indexed_cache_dir),
+        "require_warm_cache": args.require_warm_cache,
         "start": start,
         "end": end,
         "universe": universe,
@@ -109,6 +118,9 @@ def main() -> int:
         resume=args.resume,
         rerun_failed=args.rerun_failed,
         skip_cache_preflight=args.skip_cache_preflight,
+        raw_cache_dir=raw_cache_dir,
+        indexed_cache_dir=indexed_cache_dir,
+        require_warm_cache=args.require_warm_cache,
         run_options=run_options,
     )
     leaderboard_rows = load_leaderboard_rows(output_dir)
@@ -155,7 +167,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         default=str(DEFAULT_FLATFILES_CACHE_DIR),
-        help="Massive FlatFiles filtered cache directory.",
+        help="Legacy Massive FlatFiles cache directory.",
+    )
+    parser.add_argument(
+        "--raw-cache-dir",
+        default=str(DEFAULT_FLATFILES_RAW_DIR),
+        help="Local raw Massive FlatFiles CSV.GZ cache directory.",
+    )
+    parser.add_argument(
+        "--indexed-cache-dir",
+        default=str(DEFAULT_FLATFILES_INDEXED_DIR),
+        help="Local indexed Massive FlatFiles Parquet cache directory.",
+    )
+    parser.add_argument(
+        "--require-warm-cache",
+        action="store_true",
+        help="Fail instead of downloading/building FlatFiles cache during sensitivity runs.",
     )
     parser.add_argument("--output-dir", help="Directory for plan, run outputs, and reports.")
     parser.add_argument(

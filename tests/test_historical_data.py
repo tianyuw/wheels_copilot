@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import csv
+import gzip
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 from wheels_copilot.execution_price import build_backtest_execution_model
 from wheels_copilot.historical_data import (
     FlatFilesStore,
+    WarmCacheMiss,
     black_scholes_call_price,
     black_scholes_put_price,
     detect_price_space_breaks,
@@ -15,6 +19,7 @@ from wheels_copilot.historical_data import (
     infer_call_iv,
     parse_option_symbol,
     read_json_if_exists,
+    write_parquet_rows_atomic,
     write_json_atomic,
 )
 from wheels_copilot.models import PriceBar
@@ -162,6 +167,208 @@ class HistoricalDataTests(unittest.TestCase):
             )
         )
 
+    def test_stock_day_rows_builds_daily_indexed_cache_and_strict_reads_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day = date(2026, 1, 5)
+            store = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw",
+                indexed_cache_dir=root / "indexed",
+            )
+            _write_raw_csv(
+                store.raw_cache_path("stocks-day-aggs", day),
+                [
+                    {
+                        "ticker": "AAPL",
+                        "open": "100",
+                        "high": "101",
+                        "low": "99",
+                        "close": "100.50",
+                        "volume": "123",
+                    },
+                    {
+                        "ticker": "MSFT",
+                        "open": "200",
+                        "high": "202",
+                        "low": "199",
+                        "close": "201",
+                        "volume": "456",
+                    },
+                ],
+            )
+
+            rows = store.stock_day_rows(day, {"AAPL"})
+
+            self.assertEqual(rows["AAPL"]["close"], 100.5)
+            self.assertTrue(store.indexed_cache_path("stocks-day-aggs", day).exists())
+            strict = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw_missing_on_purpose",
+                indexed_cache_dir=root / "indexed",
+                require_warm_cache=True,
+            )
+            self.assertEqual(strict.stock_day_rows(day, {"AAPL"})["AAPL"]["open"], 100.0)
+            with self.assertRaises(WarmCacheMiss):
+                strict.stock_day_rows(day, {"MSFT"})
+
+    def test_option_day_rows_merges_daily_parquet_by_option_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day = date(2026, 1, 5)
+            store = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw",
+                indexed_cache_dir=root / "indexed",
+            )
+            _write_raw_csv(
+                store.raw_cache_path("options-day-aggs", day),
+                [
+                    {
+                        "ticker": "O:AAPL260109P00090000",
+                        "open": "1.00",
+                        "close": "1.10",
+                        "volume": "10",
+                    },
+                    {
+                        "ticker": "O:AAPL260109C00120000",
+                        "open": "0.50",
+                        "close": "0.55",
+                        "volume": "20",
+                    },
+                    {
+                        "ticker": "O:MSFT260109P00200000",
+                        "open": "2.00",
+                        "close": "2.10",
+                        "volume": "30",
+                    },
+                ],
+            )
+
+            puts = store.option_day_rows(day, {"AAPL"}, option_type="put")
+            calls = store.option_day_rows(day, {"AAPL"}, option_type="call")
+
+            self.assertEqual(len(puts["AAPL"]), 1)
+            self.assertEqual(len(calls["AAPL"]), 1)
+            strict = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw_missing_on_purpose",
+                indexed_cache_dir=root / "indexed",
+                require_warm_cache=True,
+            )
+            self.assertEqual(
+                strict.option_day_rows(day, {"AAPL"}, option_type="put")["AAPL"][0][
+                    "strike"
+                ],
+                90.0,
+            )
+            with self.assertRaises(WarmCacheMiss):
+                strict.option_day_rows(day, {"MSFT"}, option_type="put")
+
+    def test_strict_missing_indexed_cache_does_not_call_subprocess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw",
+                indexed_cache_dir=root / "indexed",
+                require_warm_cache=True,
+            )
+
+            with patch("wheels_copilot.historical_data.subprocess.run") as run:
+                with self.assertRaises(WarmCacheMiss):
+                    store.stock_day_rows(date(2026, 1, 5), {"AAPL"})
+
+            run.assert_not_called()
+
+    def test_option_zero_row_underlying_is_covered_by_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day = date(2026, 1, 5)
+            store = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw",
+                indexed_cache_dir=root / "indexed",
+            )
+            _write_raw_csv(
+                store.raw_cache_path("options-day-aggs", day),
+                [
+                    {
+                        "ticker": "O:AAPL260109P00090000",
+                        "open": "1.00",
+                        "close": "1.10",
+                        "volume": "10",
+                    },
+                ],
+            )
+
+            rows = store.option_day_rows(day, {"MSFT"}, option_type="put")
+
+            self.assertEqual(rows, {"MSFT": []})
+            strict = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw_missing_on_purpose",
+                indexed_cache_dir=root / "indexed",
+                require_warm_cache=True,
+            )
+            self.assertEqual(strict.option_day_rows(day, {"MSFT"}, option_type="put"), {"MSFT": []})
+
+    def test_indexed_parquet_without_manifest_is_not_treated_as_warm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day = date(2026, 1, 5)
+            store = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw",
+                indexed_cache_dir=root / "indexed",
+            )
+            write_parquet_rows_atomic(
+                store.indexed_cache_path("options-day-aggs", day),
+                [
+                    {
+                        "ticker": "O:AAPL260109P00090000",
+                        "underlying": "AAPL",
+                        "option_type": "put",
+                        "strike": 90.0,
+                    }
+                ],
+                default_columns=["ticker", "underlying", "option_type", "strike"],
+            )
+            strict = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw_missing_on_purpose",
+                indexed_cache_dir=root / "indexed",
+                require_warm_cache=True,
+            )
+
+            with self.assertRaises(WarmCacheMiss):
+                strict.option_day_rows(day, {"AAPL"}, option_type="put")
+
+    def test_indexed_missing_sentinel_returns_empty_option_chains_in_strict_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day = date(2026, 1, 5)
+            setup = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw",
+                indexed_cache_dir=root / "indexed",
+            )
+            write_json_atomic(
+                setup.indexed_missing_path("options-day-aggs", day),
+                {"missing": True},
+            )
+            strict = FlatFilesStore(
+                cache_dir=root / "legacy",
+                raw_cache_dir=root / "raw_missing_on_purpose",
+                indexed_cache_dir=root / "indexed",
+                require_warm_cache=True,
+            )
+
+            self.assertEqual(
+                strict.option_day_rows(day, {"AAPL", "MSFT"}, option_type="put"),
+                {"AAPL": [], "MSFT": []},
+            )
+
     def test_infer_put_iv_rejects_prices_below_lower_bound(self):
         minimum_price = black_scholes_put_price(
             stock_price=50,
@@ -214,6 +421,15 @@ class _MemoryFlatFilesStore(FlatFilesStore):
 
     def option_day_rows(self, day, underlyings, *, option_type="put"):
         return {"AAPL": self.rows}
+
+
+def _write_raw_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = sorted({key for row in rows for key in row})
+    with gzip.open(path, "wt", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 if __name__ == "__main__":
