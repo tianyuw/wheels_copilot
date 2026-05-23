@@ -16,6 +16,7 @@ from wheels_copilot.models import (
     SupportZone,
     TrendCheck,
 )
+from wheels_copilot.price_space_breaks import SplitEvent, StaticSplitEventProvider
 
 
 class BacktestRunnerTests(unittest.TestCase):
@@ -165,6 +166,389 @@ class BacktestRunnerTests(unittest.TestCase):
         self.assertEqual(result["summary"]["opened_short_puts"], 0)
         self.assertGreaterEqual(result["summary"]["data_issue_count"], 1)
         self.assertEqual(result["data_issues"][0]["type"], "price_space_break")
+        self.assertEqual(result["summary"]["price_space_break_category_counts"], {})
+        self.assertEqual(result["summary"]["price_space_break_action_counts"], {})
+
+    def test_price_break_classifier_unblocks_pre_start_real_gap(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        bars = _bars(start, end, close=110)
+        bars[10] = PriceBar(date=bars[10].date, open=77, high=78, low=76, close=77)
+        data = _FakeData(
+            bars={"AAPL": bars},
+            options={("AAPL", start): [_put(expiration=end, strike=95)]},
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                price_space_break_classifier="massive_splits",
+                price_space_break_split_provider=StaticSplitEventProvider([]),
+            )
+
+        self.assertEqual(result["summary"]["opened_short_puts"], 1)
+        self.assertGreaterEqual(
+            result["summary"]["price_space_break_category_counts"]["real_gap_move"],
+            1,
+        )
+        self.assertEqual(
+            result["summary"]["event_counts"]["PRICE_SPACE_BREAK_ALLOWED"],
+            result["summary"]["data_issue_counts"]["price_space_break"],
+        )
+
+    def test_price_break_classifier_resets_confirmed_split_lookback(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        bars = _bars(start, end, close=110)
+        split_day = bars[10].date
+        _set_bar_values_from(bars, split_day, value=55)
+        data = _FakeData(
+            bars={"AAPL": bars},
+            options={("AAPL", start): [_put(expiration=end, strike=95)]},
+            marks={},
+        )
+
+        result = run_backtest(
+            config=_config(),
+            data=data,
+            universe=["AAPL"],
+            start=start,
+            end=end,
+            slippage_pct=0.0,
+            price_space_break_classifier="massive_splits",
+            price_space_break_split_provider=StaticSplitEventProvider(
+                [
+                    SplitEvent(
+                        ticker="AAPL",
+                        execution_date=split_day,
+                        split_from=1,
+                        split_to=2,
+                    )
+                ]
+            ),
+        )
+
+        self.assertEqual(result["summary"]["opened_short_puts"], 0)
+        self.assertEqual(
+            result["summary"]["price_space_break_category_counts"]["confirmed_split"],
+            1,
+        )
+        self.assertEqual(
+            result["summary"]["price_space_break_action_counts"]["reset_lookback"],
+            1,
+        )
+        self.assertEqual(
+            result["summary"]["event_counts"]["PRICE_SPACE_BREAK_RESET"],
+            1,
+        )
+        self.assertEqual(
+            result["run_parameters"]["price_space_reset_dates"]["AAPL"],
+            split_day.isoformat(),
+        )
+
+    def test_pre_start_split_reset_cooldown_blocks_short_history(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        bars = _bars(start, end, close=110)
+        pre_start_indices = [index for index, bar in enumerate(bars) if bar.date < start]
+        split_day = bars[pre_start_indices[-2]].date
+        _set_bar_values_from(bars, split_day, value=55)
+        data = _FakeData(
+            bars={"AAPL": bars},
+            options={("AAPL", start): [_put(expiration=end, strike=95)]},
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support") as support:
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                price_space_break_classifier="massive_splits",
+                price_space_break_split_provider=StaticSplitEventProvider(
+                    [
+                        SplitEvent(
+                            ticker="AAPL",
+                            execution_date=split_day,
+                            split_from=1,
+                            split_to=2,
+                        )
+                    ]
+                ),
+            )
+
+        support.assert_not_called()
+        self.assertEqual(result["summary"]["opened_short_puts"], 0)
+        self.assertGreaterEqual(
+            result["summary"]["rejected_reason_counts"][
+                "post_split_reset_insufficient_support_history"
+            ],
+            1,
+        )
+
+    def test_unknown_break_after_confirmed_split_still_blocks_ticker(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        bars = _bars(start, end, close=110)
+        split_day = bars[10].date
+        unknown_day = bars[20].date
+        _set_bar_values_from(bars, split_day, value=55)
+        _set_bar_values_from(bars, unknown_day, value=4)
+        data = _FakeData(
+            bars={"AAPL": bars},
+            options={("AAPL", start): [_put(expiration=end, strike=95)]},
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support") as support:
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                price_space_break_classifier="massive_splits",
+                price_space_break_split_provider=StaticSplitEventProvider(
+                    [
+                        SplitEvent(
+                            ticker="AAPL",
+                            execution_date=split_day,
+                            split_from=1,
+                            split_to=2,
+                        )
+                    ]
+                ),
+            )
+
+        support.assert_not_called()
+        self.assertEqual(result["summary"]["opened_short_puts"], 0)
+        self.assertEqual(
+            result["summary"]["price_space_break_action_counts"]["reset_lookback"],
+            1,
+        )
+        self.assertGreaterEqual(
+            result["summary"]["price_space_break_action_counts"]["block"],
+            1,
+        )
+        self.assertGreaterEqual(
+            result["summary"]["event_counts"]["PRICE_SPACE_BREAK_BLOCK"],
+            1,
+        )
+
+    def test_confirmed_split_clears_prior_price_space_block(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 16)
+        unknown_day = date(2026, 1, 6)
+        split_day = date(2026, 1, 8)
+        trade_day = date(2026, 1, 9)
+        bars = _bars(start, end, close=100)
+        _set_bar_values_from(bars, unknown_day, value=20)
+        _set_bar_values_from(bars, split_day, value=10)
+        data = _FakeData(
+            bars={"AAPL": bars},
+            options={("AAPL", trade_day): [_put(expiration=date(2026, 1, 14), strike=8)]},
+            marks={},
+        )
+
+        zone = SupportZone(
+            method="test",
+            center=9,
+            bottom=8,
+            top=10,
+            touches=3,
+            rejections=3,
+            score=90,
+        )
+        support = SupportAnalysis(
+            trend=TrendCheck(passed=True, current_price=10, sma200=9, sma200_slope=1),
+            zones=[zone],
+            selected_zone=zone,
+            atr14=1,
+            current_price=10,
+            min_score_to_trade=70,
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=support):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                price_space_break_classifier="massive_splits",
+                price_space_break_split_provider=StaticSplitEventProvider(
+                    [
+                        SplitEvent(
+                            ticker="AAPL",
+                            execution_date=split_day,
+                            split_from=1,
+                            split_to=2,
+                        )
+                    ]
+                ),
+                price_space_split_reset_min_support_bars=1,
+            )
+
+        self.assertEqual(result["summary"]["opened_short_puts"], 1)
+        self.assertEqual(result["trades"][0]["entry_date"], trade_day.isoformat())
+        self.assertGreaterEqual(
+            result["summary"]["price_space_break_action_counts"]["block"],
+            1,
+        )
+        self.assertEqual(
+            result["summary"]["price_space_break_action_counts"]["reset_lookback"],
+            1,
+        )
+
+    def test_confirmed_split_reset_uses_only_post_split_support_bars(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        bars = _bars(start, end, close=110)
+        split_day = bars[10].date
+        _set_bar_values_from(bars, split_day, value=55)
+        data = _FakeData(
+            bars={"AAPL": bars},
+            options={("AAPL", start): [_put(expiration=end, strike=95)]},
+            marks={},
+        )
+        support_seen = {}
+
+        def fake_support(support_bars, config):
+            support_seen["first_date"] = support_bars[0].date
+            support_seen["count"] = len(support_bars)
+            return _support()
+
+        with patch("wheels_copilot.backtest.analyze_support", side_effect=fake_support):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                price_space_break_classifier="massive_splits",
+                price_space_break_split_provider=StaticSplitEventProvider(
+                    [
+                        SplitEvent(
+                            ticker="AAPL",
+                            execution_date=split_day,
+                            split_from=1,
+                            split_to=2,
+                        )
+                    ]
+                ),
+            )
+
+        self.assertEqual(result["summary"]["opened_short_puts"], 1)
+        self.assertEqual(support_seen["first_date"], split_day)
+        self.assertLess(support_seen["count"], len([bar for bar in bars if bar.date < start]))
+
+    def test_open_option_through_split_reset_is_flagged_unmodeled(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        split_day = date(2026, 1, 8)
+        bars = _bars(start, end, close=110)
+        _set_bar_values_from(bars, split_day, value=55)
+        data = _FakeData(
+            bars={"AAPL": bars},
+            options={("AAPL", start): [_put(expiration=end, strike=95)]},
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                price_space_break_classifier="massive_splits",
+                price_space_break_split_provider=StaticSplitEventProvider(
+                    [
+                        SplitEvent(
+                            ticker="AAPL",
+                            execution_date=split_day,
+                            split_from=1,
+                            split_to=2,
+                        )
+                    ]
+                ),
+            )
+
+        self.assertEqual(result["summary"]["opened_short_puts"], 1)
+        self.assertEqual(result["trades"][0]["entry_date"], start.isoformat())
+        self.assertEqual(
+            result["summary"]["data_issue_counts"][
+                "open_option_through_price_space_reset"
+            ],
+            1,
+        )
+        self.assertEqual(
+            result["summary"]["event_counts"][
+                "OPEN_OPTION_THROUGH_PRICE_SPACE_RESET_UNMODELED"
+            ],
+            1,
+        )
+
+    def test_covered_call_respects_post_split_reset_cooldown(self):
+        start = date(2026, 1, 5)
+        end = date(2026, 1, 9)
+        assignment_day = date(2026, 1, 6)
+        split_day = date(2026, 1, 7)
+        bars = _bars(
+            start,
+            end,
+            close=110,
+            close_overrides={assignment_day: 90},
+        )
+        _set_bar_values_from(bars, split_day, value=45)
+        data = _FakeData(
+            bars={"AAPL": bars},
+            options={("AAPL", start): [_put(expiration=assignment_day, strike=95)]},
+            marks={},
+        )
+
+        with patch("wheels_copilot.backtest.analyze_support", return_value=_support()):
+            result = run_backtest(
+                config=_config(),
+                data=data,
+                universe=["AAPL"],
+                start=start,
+                end=end,
+                slippage_pct=0.0,
+                price_space_break_classifier="massive_splits",
+                price_space_break_split_provider=StaticSplitEventProvider(
+                    [
+                        SplitEvent(
+                            ticker="AAPL",
+                            execution_date=split_day,
+                            split_from=1,
+                            split_to=2,
+                        )
+                    ]
+                ),
+            )
+
+        self.assertEqual(result["summary"]["assigned"], 1)
+        self.assertEqual(result["summary"]["opened_covered_calls"], 0)
+        self.assertGreaterEqual(
+            result["summary"]["rejected_reason_counts"][
+                "cc_post_split_reset_insufficient_support_history"
+            ],
+            1,
+        )
 
     def test_future_split_guard_does_not_block_entries_before_break(self):
         start = date(2026, 1, 5)
@@ -1289,6 +1673,19 @@ def _bars(
             )
         current += timedelta(days=1)
     return bars
+
+
+def _set_bar_values_from(bars: list[PriceBar], start: date, *, value: float) -> None:
+    for index, bar in enumerate(bars):
+        if bar.date >= start:
+            bars[index] = PriceBar(
+                date=bar.date,
+                open=value,
+                high=value + 1,
+                low=value - 1,
+                close=value,
+                volume=bar.volume,
+            )
 
 
 if __name__ == "__main__":

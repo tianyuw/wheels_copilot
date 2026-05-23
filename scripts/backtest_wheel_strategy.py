@@ -21,6 +21,7 @@ from wheels_copilot.historical_data import (
     DEFAULT_FLATFILES_RAW_DIR,
     FlatFilesStore,
 )
+from wheels_copilot.price_space_breaks import DEFAULT_PRICE_SPACE_BREAK_CACHE_DIR
 
 
 def main() -> int:
@@ -60,6 +61,15 @@ def main() -> int:
         if args.fundamentals_env_file
         else None,
         fundamentals_timeout_seconds=args.fundamentals_timeout_seconds,
+        price_space_break_classifier=args.price_space_break_classifier,
+        price_space_break_cache_dir=Path(args.price_space_break_cache_dir),
+        price_space_break_env_file=Path(args.price_space_break_env_file)
+        if args.price_space_break_env_file
+        else None,
+        price_space_break_timeout_seconds=args.price_space_break_timeout_seconds,
+        price_space_split_reset_min_support_bars=(
+            args.price_space_split_reset_min_support_bars
+        ),
     )
     output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(args)
     paths = write_backtest_outputs(result, output_dir)
@@ -137,6 +147,26 @@ def parse_args() -> argparse.Namespace:
         help="Optional .env file containing Massive and Unusual Whales credentials.",
     )
     parser.add_argument("--fundamentals-timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--price-space-break-classifier",
+        choices=["off", "massive_splits"],
+        help="Classify price-space breaks. massive_splits allows real gaps, resets confirmed split lookbacks, and blocks unknown breaks.",
+    )
+    parser.add_argument(
+        "--price-space-break-cache-dir",
+        default=str(DEFAULT_PRICE_SPACE_BREAK_CACHE_DIR),
+        help="Cache directory for Massive split corporate-action lookups.",
+    )
+    parser.add_argument(
+        "--price-space-break-env-file",
+        help="Optional .env file containing Massive credentials for the classifier.",
+    )
+    parser.add_argument("--price-space-break-timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--price-space-split-reset-min-support-bars",
+        type=int,
+        help="Minimum post-split support bars before new CSP entries are considered. Defaults to config backtest.price_space_split_reset_min_support_bars or 30.",
+    )
     parser.add_argument(
         "--skip-cache-preflight",
         action="store_true",

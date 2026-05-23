@@ -40,6 +40,16 @@ from .models import (
     PriceBar,
 )
 from .portfolio_risk import evaluate_portfolio_risk
+from .price_space_breaks import (
+    DEFAULT_PRICE_SPACE_BREAK_CACHE_DIR,
+    PRICE_SPACE_BREAK_ALLOW_REAL_GAP,
+    PRICE_SPACE_BREAK_RESET_LOOKBACK,
+    PriceSpaceBreakClassification,
+    PriceSpaceBreakClassifier,
+    SplitEventProvider,
+    build_price_space_break_classifier,
+    normalize_classifier_mode,
+)
 from .support import analyze_support
 
 
@@ -158,6 +168,12 @@ def run_backtest(
     fundamentals_env_file: Path | None = None,
     fundamentals_timeout_seconds: float = 30.0,
     cc_risk_profile: str | None = None,
+    price_space_break_classifier: str | None = None,
+    price_space_break_split_provider: SplitEventProvider | None = None,
+    price_space_break_cache_dir: Path = DEFAULT_PRICE_SPACE_BREAK_CACHE_DIR,
+    price_space_break_env_file: Path | None = None,
+    price_space_break_timeout_seconds: float = 30.0,
+    price_space_split_reset_min_support_bars: int | None = None,
 ) -> dict[str, Any]:
     if schedule != "daily":
         raise ValueError("phase one backtest only supports daily schedule")
@@ -167,6 +183,22 @@ def run_backtest(
     cc_risk_profile = _normalize_cc_risk_profile(cc_risk_profile, config)
     if fundamental_profile == "technical_only":
         historical_fundamentals = None
+    price_space_break_classifier = normalize_classifier_mode(
+        price_space_break_classifier
+        or config.get("backtest", {}).get("price_space_break_classifier")
+        or "off"
+    )
+    if price_space_split_reset_min_support_bars is None:
+        price_space_split_reset_min_support_bars = int(
+            config.get("backtest", {}).get(
+                "price_space_split_reset_min_support_bars",
+                30,
+            )
+        )
+    price_space_split_reset_min_support_bars = max(
+        1,
+        int(price_space_split_reset_min_support_bars),
+    )
 
     tickers = sorted({str(ticker).strip().upper() for ticker in universe if str(ticker).strip()})
     if not tickers:
@@ -193,6 +225,15 @@ def run_backtest(
         )
     if historical_fundamentals is not None and fundamental_profile != "technical_only":
         historical_fundamentals.preload(tickers, start, end)
+    break_classifier = build_price_space_break_classifier(
+        mode=price_space_break_classifier,
+        env_file=price_space_break_env_file,
+        cache_dir=price_space_break_cache_dir,
+        timeout_seconds=price_space_break_timeout_seconds,
+        split_provider=price_space_break_split_provider,
+    )
+    if break_classifier is not None:
+        break_classifier.preload(tickers, history_start, end)
 
     bars_by_day = _bars_by_day(stock_bars)
     pre_start_split_issues = _detect_pre_start_split_issues(
@@ -201,12 +242,18 @@ def run_backtest(
         ratio_low=split_ratio_low,
         ratio_high=split_ratio_high,
     )
-    blocked_tickers = set(pre_start_split_issues)
+    blocked_tickers: set[str] = set()
+    price_space_reset_dates: dict[str, date] = {}
     data_issues: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     for ticker, issues in pre_start_split_issues.items():
         for issue in issues:
-            data_issues.append(
+            classification = _classify_price_space_break(
+                break_classifier,
+                ticker=ticker,
+                issue=issue,
+            )
+            data_issue = (
                 {
                     "date": issue["date"],
                     "ticker": ticker,
@@ -214,15 +261,56 @@ def run_backtest(
                     "details": issue,
                 }
             )
-            events.append(
-                {
-                    "date": start.isoformat(),
-                    "ticker": ticker,
-                    "type": "PRICE_SPACE_BREAK_BLOCK",
-                    "reason": "pre_start_price_space_break_in_lookback_window",
-                    "details": issue,
-                }
-            )
+            if classification is not None:
+                data_issue["classification"] = classification.to_payload()
+            data_issues.append(data_issue)
+            if _price_space_break_should_reset_lookback(classification):
+                blocked_tickers.discard(ticker)
+                _record_price_space_reset(price_space_reset_dates, ticker, classification)
+                events.append(
+                    {
+                        "date": issue.get("date") or classification.date.isoformat(),
+                        "ticker": ticker,
+                        "type": "PRICE_SPACE_BREAK_RESET",
+                        "reason": "pre_start_confirmed_split_reset_lookback",
+                        "reset_date": classification.date.isoformat(),
+                        "details": issue,
+                        "classification": classification.to_payload(),
+                    }
+                )
+                _record_open_option_price_space_reset_issues(
+                    state=state,
+                    data_issues=data_issues,
+                    events=events,
+                    day=start,
+                    ticker=ticker,
+                    classification=classification,
+                )
+            elif _price_space_break_should_block(classification):
+                blocked_tickers.add(ticker)
+                events.append(
+                    {
+                        "date": start.isoformat(),
+                        "ticker": ticker,
+                        "type": "PRICE_SPACE_BREAK_BLOCK",
+                        "reason": "pre_start_price_space_break_in_lookback_window",
+                        "details": issue,
+                        "classification": (
+                            classification.to_payload() if classification else None
+                        ),
+                    }
+                )
+            else:
+                events.append(
+                    {
+                        "date": start.isoformat(),
+                        "ticker": ticker,
+                        "type": "PRICE_SPACE_BREAK_ALLOWED",
+                        "reason": "pre_start_real_gap_move_unblocked",
+                        "details": issue,
+                        "classification": classification.to_payload(),
+                    }
+                )
 
     trades: list[dict[str, Any]] = []
     equity_curve: list[dict[str, Any]] = []
@@ -261,24 +349,72 @@ def run_backtest(
                 ratio_low=split_ratio_low,
                 ratio_high=split_ratio_high,
             )
-            if issue is not None and ticker not in blocked_tickers:
-                blocked_tickers.add(ticker)
+            if issue is not None:
+                classification = _classify_price_space_break(
+                    break_classifier,
+                    ticker=ticker,
+                    issue=issue,
+                )
                 data_issue = {
                     "date": day.isoformat(),
                     "ticker": ticker,
                     "type": "price_space_break",
                     "details": issue,
                 }
+                if classification is not None:
+                    data_issue["classification"] = classification.to_payload()
                 data_issues.append(data_issue)
-                events.append(
-                    {
-                        "date": day.isoformat(),
-                        "ticker": ticker,
-                        "type": "PRICE_SPACE_BREAK_BLOCK",
-                        "reason": "same_day_price_space_break",
-                        "details": issue,
-                    }
-                )
+                if _price_space_break_should_reset_lookback(classification):
+                    blocked_tickers.discard(ticker)
+                    _record_price_space_reset(
+                        price_space_reset_dates,
+                        ticker,
+                        classification,
+                    )
+                    events.append(
+                        {
+                            "date": day.isoformat(),
+                            "ticker": ticker,
+                            "type": "PRICE_SPACE_BREAK_RESET",
+                            "reason": "same_day_confirmed_split_reset_lookback",
+                            "reset_date": classification.date.isoformat(),
+                            "details": issue,
+                            "classification": classification.to_payload(),
+                        }
+                    )
+                    _record_open_option_price_space_reset_issues(
+                        state=state,
+                        data_issues=data_issues,
+                        events=events,
+                        day=day,
+                        ticker=ticker,
+                        classification=classification,
+                    )
+                elif _price_space_break_should_block(classification):
+                    blocked_tickers.add(ticker)
+                    events.append(
+                        {
+                            "date": day.isoformat(),
+                            "ticker": ticker,
+                            "type": "PRICE_SPACE_BREAK_BLOCK",
+                            "reason": "same_day_price_space_break",
+                            "details": issue,
+                            "classification": (
+                                classification.to_payload() if classification else None
+                            ),
+                        }
+                    )
+                else:
+                    events.append(
+                        {
+                            "date": day.isoformat(),
+                            "ticker": ticker,
+                            "type": "PRICE_SPACE_BREAK_ALLOWED",
+                            "reason": "same_day_real_gap_move_unblocked",
+                            "details": issue,
+                            "classification": classification.to_payload(),
+                        }
+                    )
 
         orders_opened_today = 0
         if todays_bars:
@@ -307,6 +443,10 @@ def run_backtest(
                 fundamental_stats=fundamental_stats,
                 tickers=tickers,
                 blocked_tickers=blocked_tickers,
+                price_space_reset_dates=price_space_reset_dates,
+                price_space_reset_min_support_bars=(
+                    price_space_split_reset_min_support_bars
+                ),
                 todays_bars=todays_bars,
                 stock_bars=stock_bars,
                 day=day,
@@ -348,7 +488,10 @@ def run_backtest(
                     profile=fundamental_profile,
                     ticker=ticker,
                     day=day,
-                    bars=stock_bars.get(ticker, []),
+                    bars=_bars_after_price_space_reset(
+                        stock_bars.get(ticker, []),
+                        price_space_reset_dates.get(ticker),
+                    ),
                     config=config,
                 )
                 if fundamental_context is not None:
@@ -380,13 +523,20 @@ def run_backtest(
                     data=data,
                     ticker=ticker,
                     day=day,
-                    bars=stock_bars.get(ticker, []),
+                    bars=_bars_after_price_space_reset(
+                        stock_bars.get(ticker, []),
+                        price_space_reset_dates.get(ticker),
+                    ),
                     config=config,
                     dte_min=dte_min,
                     dte_max=dte_max,
                     slippage_pct=slippage_pct,
                     risk_free_rate=risk_free_rate,
                     execution_model=execution_model,
+                    price_space_reset_date=price_space_reset_dates.get(ticker),
+                    price_space_reset_min_support_bars=(
+                        price_space_split_reset_min_support_bars
+                    ),
                 )
                 if candidate is None:
                     reason = _primary_rejection_reason(rejection_summary)
@@ -598,6 +748,8 @@ def run_backtest(
             "Short puts are held to expiration and settle by underlying close: close < strike assigns, otherwise expires worthless.",
             "Covered calls are held to expiration and settle by underlying close: close > strike is called away, otherwise expires worthless.",
             "Corporate action or price-space breaks are guarded by large historical close-to-close and same-day open-to-previous-close ratio detection.",
+            "When enabled, the price-space break classifier unblocks real_gap_move classifications and resets technical lookbacks after confirmed splits; unknown breaks remain conservatively blocked.",
+            "Confirmed split reset uses the split execution date as the first bar in the new price space; exact OCC option contract adjustment through a split is not modeled and is surfaced as a data issue when encountered.",
         ],
         "run_parameters": {
             "schedule": schedule,
@@ -608,6 +760,30 @@ def run_backtest(
             "max_orders_per_day": max_orders_per_day,
             "split_ratio_low": split_ratio_low,
             "split_ratio_high": split_ratio_high,
+            "price_space_break_classifier": price_space_break_classifier,
+            "price_space_break_cache_dir": (
+                str(price_space_break_cache_dir)
+                if price_space_break_classifier != "off"
+                else None
+            ),
+            "price_space_break_diagnostics": (
+                break_classifier.diagnostics() if break_classifier is not None else None
+            ),
+            "price_space_real_gap_ratio_bounds": (
+                {
+                    "low": break_classifier.real_gap_ratio_low,
+                    "high": break_classifier.real_gap_ratio_high,
+                }
+                if break_classifier is not None
+                else None
+            ),
+            "price_space_split_reset_min_support_bars": (
+                price_space_split_reset_min_support_bars
+            ),
+            "price_space_reset_dates": {
+                ticker: reset_date.isoformat()
+                for ticker, reset_date in sorted(price_space_reset_dates.items())
+            },
             "contract_quantity": quantity,
             "fundamental_profile": fundamental_profile,
             "cc_risk_profile": cc_risk_profile,
@@ -695,10 +871,31 @@ def _select_candidate_for_day(
     slippage_pct: float,
     risk_free_rate: float,
     execution_model: BacktestExecutionModel,
+    price_space_reset_date: date | None = None,
+    price_space_reset_min_support_bars: int = 30,
 ) -> tuple[CspCandidate | None, dict[str, Any] | None, dict[str, int]]:
     support_bars = [bar for bar in bars if bar.date < day]
-    if len(support_bars) < 30:
-        return None, None, {"insufficient_support_history": 1}
+    min_required = (
+        int(price_space_reset_min_support_bars)
+        if price_space_reset_date is not None
+        else 30
+    )
+    if len(support_bars) < min_required:
+        summary = (
+            {
+                "price_space_reset_date": price_space_reset_date.isoformat(),
+                "post_reset_support_bar_count": len(support_bars),
+                "post_reset_min_support_bars": min_required,
+            }
+            if price_space_reset_date is not None
+            else None
+        )
+        reason = (
+            "post_split_reset_insufficient_support_history"
+            if price_space_reset_date is not None
+            else "insufficient_support_history"
+        )
+        return None, summary, {reason: 1}
     try:
         support = analyze_support(support_bars, config)
     except ValueError as exc:
@@ -730,6 +927,9 @@ def _select_candidate_for_day(
         ),
         "reasons": support.reasons,
     }
+    if price_space_reset_date is not None:
+        support_summary["price_space_reset_date"] = price_space_reset_date.isoformat()
+        support_summary["post_reset_support_bar_count"] = len(support_bars)
     options = data.option_chain(
         ticker,
         day,
@@ -864,6 +1064,8 @@ def _open_covered_calls_for_day(
     fundamental_stats: dict[str, Any],
     tickers: list[str],
     blocked_tickers: set[str],
+    price_space_reset_dates: dict[str, date],
+    price_space_reset_min_support_bars: int,
     todays_bars: dict[str, PriceBar],
     stock_bars: dict[str, list[PriceBar]],
     day: date,
@@ -890,6 +1092,32 @@ def _open_covered_calls_for_day(
         stock = state.stocks.get(ticker)
         if stock is None or _uncovered_shares(state, ticker) < 100:
             continue
+        reset_date = price_space_reset_dates.get(ticker)
+        if reset_date is not None:
+            post_reset_count = _post_reset_support_bar_count(
+                stock_bars.get(ticker, []),
+                reset_date,
+                day,
+            )
+            min_required = int(price_space_reset_min_support_bars)
+            if post_reset_count < min_required:
+                _reject(
+                    events,
+                    rejected_reason_counts,
+                    day,
+                    ticker,
+                    "cc_post_split_reset_insufficient_support_history",
+                    diagnostics={
+                        "phase": "covered_call",
+                        "price_space_reset_date": reset_date.isoformat(),
+                        "post_reset_support_bar_count": post_reset_count,
+                        "post_reset_min_support_bars": min_required,
+                        "why_no_cc_after_assignment": (
+                            "cc_post_split_reset_insufficient_support_history"
+                        ),
+                    },
+                )
+                continue
         option, rejection_summary, selection_diagnostics = _select_covered_call_for_day(
             data=data,
             ticker=ticker,
@@ -925,7 +1153,10 @@ def _open_covered_calls_for_day(
             profile=fundamental_profile,
             ticker=ticker,
             day=day,
-            bars=stock_bars.get(ticker, []),
+            bars=_bars_after_price_space_reset(
+                stock_bars.get(ticker, []),
+                price_space_reset_dates.get(ticker),
+            ),
             config=config,
         )
         cc_earnings_gate: GateResult | None = None
@@ -1905,6 +2136,111 @@ def _same_day_price_space_break(
     }
 
 
+def _classify_price_space_break(
+    classifier: PriceSpaceBreakClassifier | None,
+    *,
+    ticker: str,
+    issue: dict[str, Any],
+) -> PriceSpaceBreakClassification | None:
+    if classifier is None:
+        return None
+    return classifier.classify(ticker=ticker, issue=issue)
+
+
+def _price_space_break_should_block(
+    classification: PriceSpaceBreakClassification | None,
+) -> bool:
+    if classification is None:
+        return True
+    return classification.action not in {
+        PRICE_SPACE_BREAK_ALLOW_REAL_GAP,
+        PRICE_SPACE_BREAK_RESET_LOOKBACK,
+    }
+
+
+def _price_space_break_should_reset_lookback(
+    classification: PriceSpaceBreakClassification | None,
+) -> bool:
+    return (
+        classification is not None
+        and classification.action == PRICE_SPACE_BREAK_RESET_LOOKBACK
+    )
+
+
+def _record_price_space_reset(
+    reset_dates: dict[str, date],
+    ticker: str,
+    classification: PriceSpaceBreakClassification,
+) -> None:
+    current = reset_dates.get(ticker)
+    if current is None or classification.date > current:
+        reset_dates[ticker] = classification.date
+
+
+def _record_open_option_price_space_reset_issues(
+    *,
+    state: BacktestState,
+    data_issues: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    day: date,
+    ticker: str,
+    classification: PriceSpaceBreakClassification,
+) -> None:
+    positions: list[ShortPutPosition | ShortCallPosition] = [
+        position
+        for position in [*state.open_short_puts, *state.open_short_calls]
+        if position.ticker == ticker
+        and position.entry_date < classification.date <= position.expiration
+    ]
+    for position in positions:
+        details = {
+            "trade_id": position.trade_id,
+            "symbol": position.symbol,
+            "expiration": position.expiration.isoformat(),
+            "reset_date": classification.date.isoformat(),
+            "note": "option contract adjustment through split is not modeled",
+        }
+        data_issues.append(
+            {
+                "date": day.isoformat(),
+                "ticker": ticker,
+                "type": "open_option_through_price_space_reset",
+                "details": details,
+                "classification": classification.to_payload(),
+            }
+        )
+        events.append(
+            {
+                "date": day.isoformat(),
+                "ticker": ticker,
+                "type": "OPEN_OPTION_THROUGH_PRICE_SPACE_RESET_UNMODELED",
+                "trade_id": position.trade_id,
+                "details": details,
+                "classification": classification.to_payload(),
+            }
+        )
+
+
+def _bars_after_price_space_reset(
+    bars: list[PriceBar],
+    reset_date: date | None,
+) -> list[PriceBar]:
+    if reset_date is None:
+        return bars
+    # Massive split execution-date bars are the first bars in the new price
+    # space, so the reset date is inclusive. Same-day CSP/CC entries are
+    # prevented because cooldown counts only bars strictly before the scan day.
+    return [bar for bar in bars if bar.date >= reset_date]
+
+
+def _post_reset_support_bar_count(
+    bars: list[PriceBar],
+    reset_date: date,
+    day: date,
+) -> int:
+    return sum(1 for bar in bars if reset_date <= bar.date < day)
+
+
 def _last_bar_before(bars: list[PriceBar], day: date) -> PriceBar | None:
     previous: PriceBar | None = None
     for bar in sorted(bars, key=lambda item: item.date):
@@ -2287,6 +2623,18 @@ def _summarize_backtest(
     cc_status_counts = Counter(str(trade.get("status")) for trade in cc_trades)
     event_counts = Counter(str(event.get("type")) for event in events)
     data_issue_counts = Counter(str(issue.get("type")) for issue in data_issues)
+    price_space_break_category_counts = Counter(
+        str(issue.get("classification", {}).get("category"))
+        for issue in data_issues
+        if issue.get("type") == "price_space_break"
+        and isinstance(issue.get("classification"), dict)
+    )
+    price_space_break_action_counts = Counter(
+        str(issue.get("classification", {}).get("action"))
+        for issue in data_issues
+        if issue.get("type") == "price_space_break"
+        and isinstance(issue.get("classification"), dict)
+    )
     max_drawdown_pct = _max_drawdown_pct([float(row["equity"]) for row in equity_curve])
     utilization_values = [
         float(row["capital_utilization_pct"])
@@ -2396,6 +2744,12 @@ def _summarize_backtest(
         "rejected_reason_counts": dict(rejected_reason_counts.most_common()),
         "data_issue_count": len(data_issues),
         "data_issue_counts": dict(sorted(data_issue_counts.items())),
+        "price_space_break_category_counts": dict(
+            sorted(price_space_break_category_counts.items())
+        ),
+        "price_space_break_action_counts": dict(
+            sorted(price_space_break_action_counts.items())
+        ),
         "average_capital_utilization_pct": (
             round(sum(utilization_values) / len(utilization_values), 4)
             if utilization_values

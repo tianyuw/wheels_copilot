@@ -18,6 +18,7 @@ from wheels_copilot.historical_data import (
     DEFAULT_FLATFILES_INDEXED_DIR,
     DEFAULT_FLATFILES_RAW_DIR,
 )
+from wheels_copilot.price_space_breaks import DEFAULT_PRICE_SPACE_BREAK_CACHE_DIR
 from wheels_copilot.sensitivity import (
     build_run_specs,
     compute_resource_plan,
@@ -78,6 +79,15 @@ def main() -> int:
         "split_ratio_low": args.split_ratio_low,
         "split_ratio_high": args.split_ratio_high,
         "cc_risk_profile": args.cc_risk_profile,
+        "price_space_break_classifier": args.price_space_break_classifier,
+        "price_space_break_cache_dir": Path(args.price_space_break_cache_dir),
+        "price_space_break_env_file": Path(args.price_space_break_env_file)
+        if args.price_space_break_env_file
+        else None,
+        "price_space_break_timeout_seconds": args.price_space_break_timeout_seconds,
+        "price_space_split_reset_min_support_bars": (
+            args.price_space_split_reset_min_support_bars
+        ),
     }
     plan = {
         "scenario": scenario_name,
@@ -219,6 +229,26 @@ def parse_args() -> argparse.Namespace:
         "--cc-risk-profile",
         choices=["strict", "warn_unknown_dates"],
         help="Backtest-only covered-call risk profile. Defaults to config backtest.cc_risk_profile or strict.",
+    )
+    parser.add_argument(
+        "--price-space-break-classifier",
+        choices=["off", "massive_splits"],
+        help="Classify price-space breaks. massive_splits allows real gaps, resets confirmed split lookbacks, and blocks unknown breaks.",
+    )
+    parser.add_argument(
+        "--price-space-break-cache-dir",
+        default=str(DEFAULT_PRICE_SPACE_BREAK_CACHE_DIR),
+        help="Cache directory for Massive split corporate-action lookups.",
+    )
+    parser.add_argument(
+        "--price-space-break-env-file",
+        help="Optional .env file containing Massive credentials for the classifier.",
+    )
+    parser.add_argument("--price-space-break-timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--price-space-split-reset-min-support-bars",
+        type=int,
+        help="Minimum post-split support bars before new CSP entries are considered. Defaults to config backtest.price_space_split_reset_min_support_bars or 30.",
     )
     parser.add_argument(
         "--skip-cache-preflight",
