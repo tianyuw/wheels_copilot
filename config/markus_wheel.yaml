@@ -19,6 +19,7 @@ account:
 
 backtest:
   cc_risk_profile: warn_unknown_dates
+  post_earnings_cooldown_days: 0
 
 backtest_execution:
   model: day_agg_synthetic_spread
@@ -26,8 +27,11 @@ backtest_execution:
   fill_policy: mid
   reference_price_source: option_day_agg_open
   calibration_status: v0_uncalibrated
+  fill_price_penalty_dollars: 0.00
+  fill_price_penalty_pct_of_mid: 0.00
   synthetic_spread:
     min_spread_pct_of_mid: 0.08
+    min_spread_dollars: 0.00
     max_spread_pct_of_mid: 0.40
     low_premium_threshold: 0.50
     low_premium_extra_pct: 0.05
@@ -87,8 +91,31 @@ trend_filter:
   require_sma200_slope_non_negative: true
   pause_if_price_breaks_sma200: true
 
+market_regime:
+  enabled: false
+  market_symbol: SPY
+  require_market_price_above_sma200: false
+  require_market_sma200_slope_non_negative: false
+  market_sma200_slope_lookback_days: 20
+  reject_unknown_market_trend: true
+  vix_enabled: false
+  vix_symbol: I:VIX
+  min_vix: 0.0
+  max_vix: 999.0
+  reject_unknown_vix: false
+  conditional_csp_overrides:
+    enabled: false
+    when_market_price_below_sma200:
+      patch: {}
+
+candidate_ledger:
+  enabled: true
+  include_rejections: true
+  include_skips: false
+
 support:
   primary_method: pivot_cluster_zone
+  selection_policy: highest_score
 
   pivot_cluster:
     enabled: true
@@ -131,7 +158,32 @@ support:
     bollinger_window_days: 20
     bollinger_stddev: 2
 
+  preconditions:
+    enabled: false
+    rsi_period: 14
+    max_rsi14: 999.0
+    max_close_vs_sma50_pct: 999.0
+    max_return_10d_pct: 999.0
+    max_return_20d_pct: 999.0
+    max_bollinger_position: 999.0
+    bollinger_position_window_days: 20
+    bollinger_position_stddev: 2.0
+    require_pullback_from_recent_high: false
+    pullback_lookback_days: 10
+    min_pullback_from_high_pct: 0.0
+    require_recent_bollinger_touch: false
+    bollinger_touch_window_days: 20
+    bollinger_touch_stddev: 2.0
+    bollinger_touch_lookback_days: 10
+    bollinger_touch_tolerance_atr_multiple: 0.25
+    bollinger_touch_tolerance_pct: 1.0
+
   scoring:
+    mode: legacy
+    binary_override_score: 100
+    random_seed: 0
+    random_score_min: 0
+    random_score_max: 100
     min_score_to_trade: 70
     pivot_cluster_weight: 35
     range_floor_weight: 20
@@ -141,6 +193,31 @@ support:
     recency_weight: 10
     penalty_recent_break: -50
     penalty_new_low_within_days: -30
+    context_adjustments:
+      enabled: false
+      rsi_period: 14
+      rsi_bonus_max: 60.0
+      rsi_bonus: 0.0
+      rsi_penalty_min: 70.0
+      rsi_penalty: 0.0
+      close_vs_sma50_bonus_max_pct: 25.0
+      close_vs_sma50_bonus: 0.0
+      close_vs_sma50_penalty_min_pct: 30.0
+      close_vs_sma50_penalty: 0.0
+      return_10d_bonus_max_pct: 8.0
+      return_10d_bonus: 0.0
+      return_10d_penalty_min_pct: 10.0
+      return_10d_penalty: 0.0
+      return_20d_bonus_max_pct: 15.0
+      return_20d_bonus: 0.0
+      return_20d_penalty_min_pct: 20.0
+      return_20d_penalty: 0.0
+      bollinger_position_window_days: 20
+      bollinger_position_stddev: 2.0
+      bollinger_position_bonus_max: 0.33
+      bollinger_position_bonus: 0.0
+      bollinger_position_penalty_min: 0.75
+      bollinger_position_penalty: 0.0
 
 csp_selector:
   dte_min: 1
@@ -148,6 +225,9 @@ csp_selector:
   allowed_strike_offset_count: 1
   require_strike_at_or_below_support_zone_bottom: true
   allow_strike_inside_support_zone_only_in_paper: true
+  auto_trade_inside_support_zone: false
+  allow_strike_above_support_zone: false
+  auto_trade_above_support_zone: false
   allow_one_strike_above_support_only_manual_review: true
   min_strike_distance_atr_multiple: 1.0
   min_strike_distance_pct: 3.0
@@ -180,6 +260,13 @@ trade_planner:
     time_in_force: day
     position_intent: sell_to_open
 
+backtest_position_sizing:
+  mode: fixed
+  target_equity_pct: 0.05
+  target_dollars: 25000
+  min_contracts: 1
+  max_contracts: 0
+
 shadow_order_validation:
   max_quote_age_seconds: 30
   max_spread_pct_of_mid: 0.12
@@ -211,6 +298,11 @@ risk:
 management:
   csp_hold_to_expiry: true
   cc_hold_to_expiry: true
+  csp_exit_model: hold_to_expiration
+  cc_exit_model: hold_to_expiration
+  profit_take_pct_of_credit: 0.50
+  profit_take_price_field: low
+  manage_at_dte: 21
   allow_close_near_expiry: true
   close_if_value_remaining_pct_of_credit_below: 10
   no_debit_roll: true

@@ -168,6 +168,63 @@ class SensitivityTests(unittest.TestCase):
                 data_source_metadata={"provider": "unit"},
             )
 
+    def test_build_run_specs_supports_variant_axes_for_tied_parameters(self):
+        scenario = {
+            "name": "unit",
+            "experiments": [
+                {
+                    "name": "stage_a",
+                    "variant_axes": {
+                        "dte": [
+                            {
+                                "name": "dte_1_9",
+                                "patch": {
+                                    "csp_selector.dte_min": 1,
+                                    "csp_selector.dte_max": 9,
+                                },
+                            },
+                            {
+                                "name": "dte_7_14",
+                                "patch": {
+                                    "csp_selector.dte_min": 7,
+                                    "csp_selector.dte_max": 14,
+                                },
+                            },
+                        ],
+                        "premium": [
+                            {
+                                "name": "prem_01875",
+                                "patch": {
+                                    "csp_selector.min_weekly_return_on_strike_pct": 0.1875,
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+        specs = build_run_specs(
+            scenario=scenario,
+            base_config=_base_config(),
+            start="2026-01-01",
+            end="2026-01-31",
+            universe=["AAPL"],
+            universe_name="unit",
+            max_runs=5,
+            max_combinations_per_experiment=4,
+            allow_large_matrix=False,
+            git_sha="abc",
+            data_source_metadata={"provider": "unit"},
+        )
+
+        self.assertEqual(len(specs), 3)
+        self.assertEqual(specs[1].parameter_patch["csp_selector.dte_min"], 1)
+        self.assertEqual(specs[1].parameter_patch["csp_selector.dte_max"], 9)
+        self.assertEqual(specs[2].parameter_patch["csp_selector.dte_min"], 7)
+        self.assertEqual(specs[2].parameter_patch["csp_selector.dte_max"], 14)
+        self.assertIn("dte_7_14", specs[2].name)
+
     def test_build_run_specs_rejects_invalid_parameter_constraints(self):
         scenario = {
             "name": "unit",
@@ -287,8 +344,110 @@ class SensitivityTests(unittest.TestCase):
             self.assertTrue(by_run["sr_base"]["sample_size_flag"])
             self.assertFalse(by_run["sr_variant"]["sample_size_flag"])
             self.assertEqual(by_run["sr_variant"]["delta_total_return_pct"], 0.5)
+            self.assertIn("candidate_supply_score_v1", by_run["sr_variant"])
+            self.assertIn("candidate_supply_score_v2", by_run["sr_variant"])
+            self.assertTrue(by_run["sr_variant"]["candidate_supply_score_v1_eligible"])
+            self.assertTrue(by_run["sr_variant"]["candidate_supply_score_v2_eligible"])
             self.assertTrue((output_dir / "leaderboard.csv").exists())
             self.assertTrue((output_dir / "report.md").exists())
+
+    def test_data_issue_penalty_uses_normalized_rate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            low_rate = output_dir / "runs" / "sr_low_rate"
+            high_rate = output_dir / "runs" / "sr_high_rate"
+            low_rate.mkdir(parents=True)
+            high_rate.mkdir(parents=True)
+            _write_completed_run(
+                low_rate,
+                run_id="sr_low_rate",
+                name="low_rate",
+                is_baseline=False,
+                patch={},
+                total_return_pct=1.0,
+                max_drawdown_pct=-1.0,
+                opened_short_puts=40,
+                data_issue_count=51,
+                support_attempts=5000,
+                scan_days=100,
+            )
+            _write_completed_run(
+                high_rate,
+                run_id="sr_high_rate",
+                name="high_rate",
+                is_baseline=False,
+                patch={},
+                total_return_pct=1.0,
+                max_drawdown_pct=-1.0,
+                opened_short_puts=40,
+                data_issue_count=3,
+                support_attempts=100,
+                scan_days=10,
+            )
+
+            rows = write_aggregate_outputs(output_dir)
+
+            by_run = {row["run_id"]: row for row in rows}
+            self.assertEqual(
+                by_run["sr_low_rate"]["data_issue_rate_pct_of_support_attempts"],
+                1.02,
+            )
+            self.assertEqual(
+                by_run["sr_low_rate"]["data_issues_per_100_scan_days"],
+                51.0,
+            )
+            self.assertTrue(by_run["sr_low_rate"]["candidate_supply_score_v2_eligible"])
+            self.assertEqual(
+                by_run["sr_low_rate"]["candidate_supply_score_v2_penalties"],
+                [],
+            )
+            self.assertEqual(
+                by_run["sr_high_rate"]["candidate_supply_score_v2_penalties"],
+                ["data_issue_rate_gt_2pct"],
+            )
+            self.assertFalse(by_run["sr_high_rate"]["candidate_supply_score_v2_eligible"])
+
+    def test_marginal_negative_return_is_warning_not_hard_penalty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            marginal = output_dir / "runs" / "sr_marginal"
+            material = output_dir / "runs" / "sr_material"
+            marginal.mkdir(parents=True)
+            material.mkdir(parents=True)
+            _write_completed_run(
+                marginal,
+                run_id="sr_marginal",
+                name="marginal",
+                is_baseline=False,
+                patch={},
+                total_return_pct=-0.08,
+                max_drawdown_pct=-1.0,
+                opened_short_puts=84,
+            )
+            _write_completed_run(
+                material,
+                run_id="sr_material",
+                name="material",
+                is_baseline=False,
+                patch={},
+                total_return_pct=-0.5,
+                max_drawdown_pct=-1.0,
+                opened_short_puts=84,
+            )
+
+            rows = write_aggregate_outputs(output_dir)
+
+            by_run = {row["run_id"]: row for row in rows}
+            self.assertTrue(by_run["sr_marginal"]["candidate_supply_score_v2_eligible"])
+            self.assertEqual(
+                by_run["sr_marginal"]["candidate_supply_score_v2_warnings"],
+                ["marginal_negative_return"],
+            )
+            self.assertFalse(by_run["sr_material"]["candidate_supply_score_v2_eligible"])
+            self.assertEqual(
+                by_run["sr_material"]["candidate_supply_score_v2_penalties"],
+                ["negative_return_lt_-0.25pct"],
+            )
 
     def test_load_scenario_file_validates_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -323,6 +482,7 @@ def _base_config() -> dict:
         "csp_selector": {
             "dte_min": 1,
             "dte_max": 9,
+            "min_weekly_return_on_strike_pct": 0.25,
             "min_strike_distance_pct": 3.0,
             "min_strike_distance_atr_multiple": 1.0,
             "delta_policy": {
@@ -349,6 +509,9 @@ def _write_completed_run(
     total_return_pct: float,
     max_drawdown_pct: float,
     opened_short_puts: int,
+    data_issue_count: int = 0,
+    support_attempts: int = 1000,
+    scan_days: int = 100,
 ) -> None:
     metadata = {
         "run_id": run_id,
@@ -369,7 +532,20 @@ def _write_completed_run(
         "called_away": 1,
         "average_capital_utilization_pct": 12.0,
         "max_capital_utilization_pct": 24.0,
-        "data_issue_count": 0,
+        "data_issue_count": data_issue_count,
+        "support_diagnostics": {"attempts": support_attempts},
+        "candidate_ledger_diagnostics": {
+            "scan_days": scan_days,
+            "starvation_days": 0,
+            "median_candidates_per_day": 4.0,
+            "average_candidates_per_day": 4.0,
+            "pct_days_with_3plus_candidates": 100.0,
+            "median_quality_candidates_per_day": 3.0,
+            "average_quality_candidates_per_day": 3.0,
+            "quality_candidate_pass_rate_pct": 75.0,
+            "average_daily_quality_candidate_pass_rate_pct": 75.0,
+            "pct_days_with_3plus_quality_candidates": 100.0,
+        },
         "rejected_reason_counts": {"trend_filter_reject": 3},
     }
     write_json(run_dir / "run_metadata.json", metadata)

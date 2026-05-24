@@ -56,6 +56,7 @@ def main() -> int:
         split_ratio_high=args.split_ratio_high,
         fundamental_profile=args.fundamental_profile,
         cc_risk_profile=args.cc_risk_profile,
+        post_earnings_cooldown_days=args.post_earnings_cooldown_days,
         fundamentals_cache_dir=Path(args.fundamentals_cache_dir),
         fundamentals_env_file=Path(args.fundamentals_env_file)
         if args.fundamentals_env_file
@@ -126,6 +127,7 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "technical_only",
             "fundamentals_warn",
+            "fundamentals_moderate",
             "fundamentals_strict_financials",
             "fundamentals_strict_all",
         ],
@@ -136,6 +138,14 @@ def parse_args() -> argparse.Namespace:
         "--cc-risk-profile",
         choices=["strict", "warn_unknown_dates"],
         help="Backtest-only covered-call risk profile. Defaults to config backtest.cc_risk_profile or strict.",
+    )
+    parser.add_argument(
+        "--post-earnings-cooldown-days",
+        type=int,
+        help=(
+            "Block new CSP entries when the previous earnings report was within this "
+            "many NYSE trading days. Defaults to config backtest.post_earnings_cooldown_days or 0."
+        ),
     )
     parser.add_argument(
         "--fundamentals-cache-dir",

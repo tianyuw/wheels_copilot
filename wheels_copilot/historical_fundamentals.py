@@ -190,7 +190,7 @@ class MassiveSecFinancialsProvider:
         as_of: date,
         bars: list[PriceBar],
     ) -> None:
-        rows = self.rows_by_ticker.get(ticker, [])
+        rows = _infer_q4_known_at_from_annual(self.rows_by_ticker.get(ticker, []))
         filings = [
             row
             for row in rows
@@ -614,6 +614,32 @@ class UnusualWhalesEarningsProvider:
         bars: list[PriceBar],
     ) -> None:
         rows = self.rows_by_ticker.get(ticker, [])
+        past_events = sorted(
+            [
+                row
+                for row in rows
+                if (report_date := _parse_date(row.get("report_date"))) is not None
+                and report_date < as_of
+            ],
+            key=lambda row: _parse_date(row.get("report_date")) or date.min,
+            reverse=True,
+        )
+        if past_events:
+            previous_report_date = _parse_date(past_events[0].get("report_date"))
+            snapshot.previous_earnings_date = previous_report_date
+            snapshot.provenance["previous_earnings_date"] = FundamentalFieldProvenance(
+                value=previous_report_date,
+                source=self.name,
+                as_of=as_of,
+                effective_date=previous_report_date,
+                known_at=previous_report_date,
+                quality=QUALITY_APPROXIMATE,
+                fallback_used=True,
+                notes=["historical_report_date_from_earnings_calendar"],
+            )
+        else:
+            _set_unavailable(snapshot, "previous_earnings_date", as_of, self.name)
+
         events = sorted(
             [
                 row
@@ -752,6 +778,15 @@ def default_env_paths() -> list[Path]:
     explicit = os.environ.get("WHEELS_COPILOT_ENV_FILE")
     if explicit:
         paths.append(Path(explicit).expanduser())
+    home = Path.home()
+    for candidate in (
+        home / "Projects" / "options-copilot" / ".env",
+        home / "Projects" / "Options,Copilot" / ".env",
+        home / "Projects" / "day-trade-copilot" / ".env",
+        home / "Projects" / "day-trade-copilot" / "backend" / ".env",
+    ):
+        if candidate not in paths:
+            paths.append(candidate)
     return paths
 
 
@@ -860,6 +895,35 @@ def _latest_distinct_filings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
     )
 
 
+def _infer_q4_known_at_from_annual(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    annual_by_year: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if (
+            str(row.get("timeframe") or "").lower() == "annual"
+            and str(row.get("fiscal_period") or "").upper() == "FY"
+            and _filing_known_at(row) is not None
+        ):
+            annual_by_year[str(row.get("fiscal_year") or "")] = row
+
+    inferred: list[dict[str, Any]] = []
+    for row in rows:
+        if (
+            str(row.get("timeframe") or "").lower() == "quarterly"
+            and str(row.get("fiscal_period") or "").upper() == "Q4"
+            and _filing_known_at(row) is None
+        ):
+            annual = annual_by_year.get(str(row.get("fiscal_year") or ""))
+            if annual is not None:
+                row = dict(row)
+                row["filing_date"] = row.get("filing_date") or annual.get("filing_date")
+                row["acceptance_datetime"] = row.get("acceptance_datetime") or annual.get(
+                    "acceptance_datetime"
+                )
+                row["_q4_known_at_inferred_from_annual"] = True
+        inferred.append(row)
+    return inferred
+
+
 def _ttm_eps(rows: list[dict[str, Any]], as_of: date) -> tuple[float | None, list[str]]:
     notes: list[str] = []
     latest_four = rows[:4]
@@ -891,10 +955,19 @@ def _filing_known_at(row: dict[str, Any]) -> date | None:
 def _filing_quality(rows: list[dict[str, Any]]) -> tuple[str, list[str]]:
     if not rows:
         return QUALITY_UNAVAILABLE, []
-    missing_acceptance = [row for row in rows if _parse_date(row.get("acceptance_datetime")) is None]
+    notes: list[str] = []
+    missing_acceptance = [
+        row for row in rows if _parse_date(row.get("acceptance_datetime")) is None
+    ]
     if missing_acceptance:
-        return QUALITY_APPROXIMATE, ["acceptance_datetime_missing"]
-    return QUALITY_STRICT_PIT_PENDING, []
+        notes.append("acceptance_datetime_missing")
+        quality = QUALITY_APPROXIMATE
+    else:
+        quality = QUALITY_STRICT_PIT_PENDING
+    if any(row.get("_q4_known_at_inferred_from_annual") for row in rows):
+        notes.append("q4_known_at_inferred_from_annual")
+    return quality, notes
+
 
 
 def _quarters_are_contiguous(rows: list[dict[str, Any]]) -> bool:

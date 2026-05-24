@@ -53,12 +53,37 @@ def rolling_low(bars: list[PriceBar], lookback: int) -> float | None:
 def bollinger_lower(
     values: list[float], window: int = 20, stddev: float = 2.0
 ) -> float | None:
+    bands = bollinger_bands(values, window, stddev)
+    return bands[0] if bands is not None else None
+
+
+def bollinger_bands(
+    values: list[float], window: int = 20, stddev: float = 2.0
+) -> tuple[float, float, float] | None:
     if len(values) < window:
         return None
     sample = values[-window:]
     mean = fmean(sample)
     variance = fmean([(x - mean) ** 2 for x in sample])
-    return mean - stddev * (variance**0.5)
+    width = stddev * (variance**0.5)
+    return mean - width, mean, mean + width
+
+
+def rsi(values: list[float], period: int = 14) -> float | None:
+    if period <= 0:
+        raise ValueError("period must be positive")
+    if len(values) <= period:
+        return None
+    changes = [cur - prev for prev, cur in zip(values, values[1:])]
+    sample = changes[-period:]
+    gains = [max(change, 0.0) for change in sample]
+    losses = [max(-change, 0.0) for change in sample]
+    avg_gain = fmean(gains)
+    avg_loss = fmean(losses)
+    if avg_loss == 0:
+        return 100.0
+    relative_strength = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + relative_strength))
 
 
 def find_pivot_lows(

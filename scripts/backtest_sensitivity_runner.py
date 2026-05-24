@@ -18,6 +18,7 @@ from wheels_copilot.historical_data import (
     DEFAULT_FLATFILES_INDEXED_DIR,
     DEFAULT_FLATFILES_RAW_DIR,
 )
+from wheels_copilot.historical_fundamentals import DEFAULT_FUNDAMENTALS_CACHE_DIR
 from wheels_copilot.price_space_breaks import DEFAULT_PRICE_SPACE_BREAK_CACHE_DIR
 from wheels_copilot.sensitivity import (
     build_run_specs,
@@ -78,7 +79,13 @@ def main() -> int:
         "max_orders_per_day": args.max_orders_per_day,
         "split_ratio_low": args.split_ratio_low,
         "split_ratio_high": args.split_ratio_high,
+        "fundamental_profile": args.fundamental_profile,
         "cc_risk_profile": args.cc_risk_profile,
+        "fundamentals_cache_dir": Path(args.fundamentals_cache_dir),
+        "fundamentals_env_file": Path(args.fundamentals_env_file)
+        if args.fundamentals_env_file
+        else None,
+        "fundamentals_timeout_seconds": args.fundamentals_timeout_seconds,
         "price_space_break_classifier": args.price_space_break_classifier,
         "price_space_break_cache_dir": Path(args.price_space_break_cache_dir),
         "price_space_break_env_file": Path(args.price_space_break_env_file)
@@ -115,7 +122,27 @@ def main() -> int:
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "plan.json", plan)
-    print(json.dumps(plan, indent=2, ensure_ascii=False, default=str))
+    if args.print_full_plan:
+        print(json.dumps(plan, indent=2, ensure_ascii=False, default=str))
+    else:
+        print(
+            json.dumps(
+                {
+                    "scenario": scenario_name,
+                    "output_dir": str(output_dir),
+                    "plan": str(output_dir / "plan.json"),
+                    "start": start,
+                    "end": end,
+                    "universe_count": len(universe),
+                    "run_count": len(specs),
+                    "resource_plan": resource_plan.__dict__,
+                    "run_options": run_options,
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
 
     if args.dry_run:
         return 0
@@ -218,6 +245,11 @@ def parse_args() -> argparse.Namespace:
         help="When used with --resume, rerun failed run directories instead of skipping them.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Write and print plan only.")
+    parser.add_argument(
+        "--print-full-plan",
+        action="store_true",
+        help="Print every run spec to stdout. The full plan is always written to plan.json.",
+    )
     parser.add_argument("--lookback-calendar-days", type=int, default=430)
     parser.add_argument("--slippage-pct", type=float, default=0.05)
     parser.add_argument("--option-fee-per-contract", type=float, default=0.10)
@@ -226,10 +258,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-ratio-low", type=float, default=0.75)
     parser.add_argument("--split-ratio-high", type=float, default=1.25)
     parser.add_argument(
+        "--fundamental-profile",
+        choices=[
+            "technical_only",
+            "fundamentals_warn",
+            "fundamentals_moderate",
+            "fundamentals_strict_financials",
+            "fundamentals_strict_all",
+        ],
+        default="technical_only",
+        help="Historical fundamental gate profile.",
+    )
+    parser.add_argument(
         "--cc-risk-profile",
         choices=["strict", "warn_unknown_dates"],
         help="Backtest-only covered-call risk profile. Defaults to config backtest.cc_risk_profile or strict.",
     )
+    parser.add_argument(
+        "--fundamentals-cache-dir",
+        default=str(DEFAULT_FUNDAMENTALS_CACHE_DIR),
+        help="Historical fundamentals REST cache directory.",
+    )
+    parser.add_argument(
+        "--fundamentals-env-file",
+        help="Optional .env file containing Massive and Unusual Whales credentials.",
+    )
+    parser.add_argument("--fundamentals-timeout-seconds", type=float, default=30.0)
     parser.add_argument(
         "--price-space-break-classifier",
         choices=["off", "massive_splits"],

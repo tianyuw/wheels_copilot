@@ -19,6 +19,7 @@ from typing import Any, Iterable, Protocol, Sequence
 from .execution_price import BacktestExecutionModel, modeled_quote_from_reference
 from .models import OptionQuote, PriceBar
 from .option_math import black_scholes_call_delta, black_scholes_put_delta, norm_cdf
+from .trading_calendar import nyse_trading_days
 
 try:
     import fcntl
@@ -183,7 +184,7 @@ class FlatFilesStore:
         return CachePreflightResult(cache_dir=self.cache_dir, ok=True)
 
     def _preflight_cache_dir(self, cache_dir: Path) -> CachePreflightResult:
-        probe = cache_dir / ".preflight" / "write_probe.txt"
+        probe = cache_dir / ".preflight" / f"write_probe.{os.getpid()}.{uuid.uuid4().hex}.txt"
         try:
             ensure_parent_dir(probe, timeout_seconds=self.cache_timeout_seconds)
             script = (
@@ -193,10 +194,6 @@ class FlatFilesStore:
                 "p.write_text('flatfiles-cache-probe\\n', encoding='utf-8')\n"
                 "assert p.read_text(encoding='utf-8') == 'flatfiles-cache-probe\\n'\n"
                 "p.unlink()\n"
-                "try:\n"
-                "    p.parent.rmdir()\n"
-                "except OSError:\n"
-                "    pass\n"
             )
             subprocess.run(
                 [sys.executable, "-c", script, str(probe)],
@@ -228,7 +225,7 @@ class FlatFilesStore:
             )
 
     def trading_days(self, start: date, end: date) -> list[date]:
-        return [day for day in date_range(start, end) if day.weekday() < 5]
+        return nyse_trading_days(start, end)
 
     def load_stock_bars(
         self, tickers: list[str], start: date, end: date
@@ -763,7 +760,12 @@ class FlatFilesStore:
         missing = set(underlyings) - coverage
         chains = {ticker: [] for ticker in underlyings}
         for row in read_parquet_rows_if_exists(
-            self.indexed_cache_path("options-day-aggs", day)
+            self.indexed_cache_path("options-day-aggs", day),
+            columns=OPTION_DAY_READ_COLUMNS,
+            filters=[
+                ("underlying", "in", sorted(underlyings)),
+                ("option_type", "==", option_type),
+            ],
         ):
             underlying = str(row.get("underlying") or "").upper()
             row_type = str(row.get("option_type") or "").lower()
@@ -1000,6 +1002,19 @@ PARQUET_INT_COLUMNS = {
     "window_start",
     "open_interest",
 }
+OPTION_DAY_READ_COLUMNS = [
+    "ticker",
+    "underlying",
+    "expiration",
+    "option_type",
+    "strike",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "normalized_ticker",
+]
 
 
 def normalize_parquet_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -1025,7 +1040,12 @@ def normalize_parquet_value(column: str, value: Any) -> Any:
     return str(value)
 
 
-def read_parquet_rows_if_exists(path: Path) -> list[dict[str, Any]]:
+def read_parquet_rows_if_exists(
+    path: Path,
+    *,
+    columns: Sequence[str] | None = None,
+    filters: Any | None = None,
+) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
@@ -1035,7 +1055,7 @@ def read_parquet_rows_if_exists(path: Path) -> list[dict[str, Any]]:
             "pyarrow is required for FlatFiles indexed Parquet cache; "
             "install project dependencies before running backtests."
         ) from exc
-    table = pq.read_table(path)
+    table = pq.read_table(path, columns=columns, filters=filters)
     return table.to_pylist()
 
 
@@ -1060,7 +1080,13 @@ def write_parquet_rows_atomic(
         column: [normalize_parquet_value(column, row.get(column)) for row in rows]
         for column in columns
     }
-    table = pa.table(data)
+    schema = pa.schema(
+        [
+            pa.field(column, parquet_column_type(pa, column))
+            for column in columns
+        ]
+    )
+    table = pa.table(data, schema=schema)
     temp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
         pq.write_table(table, temp_path, compression="zstd")
@@ -1070,6 +1096,14 @@ def write_parquet_rows_atomic(
             temp_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def parquet_column_type(pa: Any, column: str) -> Any:
+    if column in PARQUET_FLOAT_COLUMNS:
+        return pa.float64()
+    if column in PARQUET_INT_COLUMNS:
+        return pa.int64()
+    return pa.string()
 
 
 def parse_option_symbol(symbol: str) -> ParsedOptionSymbol | None:

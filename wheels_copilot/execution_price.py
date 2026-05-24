@@ -17,6 +17,7 @@ DEFAULT_CALIBRATION_STATUS = "v0_uncalibrated"
 @dataclass(frozen=True)
 class SyntheticSpreadConfig:
     min_spread_pct_of_mid: float = 0.08
+    min_spread_dollars: float = 0.0
     max_spread_pct_of_mid: float = 0.40
     low_premium_threshold: float = 0.50
     low_premium_extra_pct: float = 0.05
@@ -34,6 +35,8 @@ class BacktestExecutionModel:
     reference_price_source: str = DEFAULT_REFERENCE_PRICE_SOURCE
     calibration_status: str = DEFAULT_CALIBRATION_STATUS
     reference_price_adjustment_pct: float = 0.0
+    fill_price_penalty_dollars: float = 0.0
+    fill_price_penalty_pct_of_mid: float = 0.0
     synthetic_spread: SyntheticSpreadConfig = field(default_factory=SyntheticSpreadConfig)
 
     def metadata(self) -> dict[str, Any]:
@@ -44,6 +47,8 @@ class BacktestExecutionModel:
             "reference_price_source": self.reference_price_source,
             "calibration_status": self.calibration_status,
             "reference_price_adjustment_pct": self.reference_price_adjustment_pct,
+            "fill_price_penalty_dollars": self.fill_price_penalty_dollars,
+            "fill_price_penalty_pct_of_mid": self.fill_price_penalty_pct_of_mid,
             "synthetic_spread": asdict(self.synthetic_spread),
         }
 
@@ -79,10 +84,17 @@ def build_backtest_execution_model(
             cfg.get("calibration_status") or DEFAULT_CALIBRATION_STATUS
         ),
         reference_price_adjustment_pct=max(0.0, float(slippage_pct or 0.0)),
+        fill_price_penalty_dollars=max(
+            0.0, float(cfg.get("fill_price_penalty_dollars", 0.0))
+        ),
+        fill_price_penalty_pct_of_mid=max(
+            0.0, float(cfg.get("fill_price_penalty_pct_of_mid", 0.0))
+        ),
         synthetic_spread=SyntheticSpreadConfig(
             min_spread_pct_of_mid=float(
                 spread_cfg.get("min_spread_pct_of_mid", 0.08)
             ),
+            min_spread_dollars=float(spread_cfg.get("min_spread_dollars", 0.0)),
             max_spread_pct_of_mid=float(
                 spread_cfg.get("max_spread_pct_of_mid", 0.40)
             ),
@@ -143,14 +155,19 @@ def synthetic_spread_pct(
     volume: int | None,
     config: SyntheticSpreadConfig,
 ) -> float:
-    spread = max(0.0, config.min_spread_pct_of_mid)
+    fixed_floor_pct = (
+        max(0.0, config.min_spread_dollars) / reference_price
+        if reference_price > 0
+        else 0.0
+    )
+    spread = max(0.0, config.min_spread_pct_of_mid, fixed_floor_pct)
     if reference_price <= config.low_premium_threshold:
         spread += max(0.0, config.low_premium_extra_pct)
     if volume is not None and volume < config.low_volume_threshold:
         spread += max(0.0, config.low_volume_extra_pct)
     if _otm_pct(option_type, strike, stock_price) >= config.wide_otm_pct_threshold:
         spread += max(0.0, config.wide_otm_extra_pct)
-    cap = max(config.min_spread_pct_of_mid, config.max_spread_pct_of_mid)
+    cap = max(config.min_spread_pct_of_mid, fixed_floor_pct, config.max_spread_pct_of_mid)
     return min(spread, cap)
 
 
@@ -161,18 +178,44 @@ def entry_fill_price(
     side: str = "sell",
 ) -> float | None:
     policy = execution_model.fill_policy
+    fill = None
     if policy == "mid":
-        return option.executable_mid
-    if side == "sell":
+        fill = option.executable_mid
+    elif side == "sell":
         if policy == "bid":
-            return option.bid if option.bid > 0 else None
-        if policy == "ask":
-            return option.ask if option.ask > 0 else None
-    if policy == "bid":
-        return option.ask if option.ask > 0 else None
-    if policy == "ask":
-        return option.bid if option.bid > 0 else None
-    return None
+            fill = option.bid if option.bid > 0 else None
+        elif policy == "ask":
+            fill = option.ask if option.ask > 0 else None
+    else:
+        if policy == "bid":
+            fill = option.ask if option.ask > 0 else None
+        elif policy == "ask":
+            fill = option.bid if option.bid > 0 else None
+    if fill is None:
+        return None
+    return _apply_fill_penalty(option, execution_model, fill=fill, side=side)
+
+
+def _apply_fill_penalty(
+    option: OptionQuote,
+    execution_model: BacktestExecutionModel,
+    *,
+    fill: float,
+    side: str,
+) -> float | None:
+    mid = option.executable_mid
+    pct_penalty = (
+        max(0.0, execution_model.fill_price_penalty_pct_of_mid) * mid
+        if mid is not None and mid > 0
+        else 0.0
+    )
+    penalty = max(0.0, execution_model.fill_price_penalty_dollars) + pct_penalty
+    if penalty <= 0:
+        return fill
+    if side == "sell":
+        adjusted = fill - penalty
+        return adjusted if adjusted > 0 else None
+    return fill + penalty
 
 
 def entry_fill_diagnostics(

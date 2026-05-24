@@ -1,0 +1,81 @@
+name: support_soft_boll_pos50_champion_ai50
+description: >
+  Current AI/tech 50 paper champion from the support soft-context grid.
+  It keeps the capital-focused CSP/CC settings fixed and adds a soft support
+  score bonus when price is in the lower half of the 20-day Bollinger channel.
+  Validation window:
+  - 2025 full AI/tech 50: +28.20% total return, -12.94% max drawdown.
+  - 2026-01-01 to 2026-05-22 AI/tech 50: +13.76% total return,
+    about +39.60% rough annualized, -4.28% max drawdown.
+
+experiments:
+  - name: soft_boll_pos50_champion
+    variants:
+      - name: size10_dte7_orders5_cc45_mid_boll_pos50_bonus15
+        patch:
+          csp_selector.allow_strike_above_support_zone: true
+          csp_selector.auto_trade_above_support_zone: true
+          csp_selector.auto_trade_inside_support_zone: true
+          csp_selector.delta_policy.normal_support.target_delta_min: 0.05
+          csp_selector.delta_policy.normal_support.target_delta_max: 0.25
+          csp_selector.delta_policy.strong_support.target_delta_min: 0.10
+          csp_selector.delta_policy.strong_support.target_delta_max: 0.30
+          csp_selector.dte_min: 1
+          csp_selector.dte_max: 7
+          csp_selector.min_bid: 0.05
+          csp_selector.max_spread_pct_of_mid: 0.25
+          csp_selector.min_open_interest: 25
+          csp_selector.min_strike_distance_atr_multiple: 0.25
+          csp_selector.min_strike_distance_pct: 0.50
+          csp_selector.min_weekly_return_on_strike_pct: 0.10
+          cc_selector.dte_min: 1
+          cc_selector.dte_max: 7
+          cc_selector.target_delta_min: 0.35
+          cc_selector.target_delta_max: 0.50
+          support.scoring.min_score_to_trade: 70
+          support.selection_policy: highest_score
+          support.preconditions.enabled: false
+          support.preconditions.max_rsi14: 999.0
+          support.preconditions.max_close_vs_sma50_pct: 999.0
+          support.preconditions.max_return_10d_pct: 999.0
+          support.preconditions.max_return_20d_pct: 999.0
+          support.preconditions.max_bollinger_position: 999.0
+          support.preconditions.require_pullback_from_recent_high: false
+          support.preconditions.min_pullback_from_high_pct: 0.0
+          support.preconditions.require_recent_bollinger_touch: false
+          support.scoring.context_adjustments.enabled: true
+          support.scoring.context_adjustments.rsi_bonus: 0.0
+          support.scoring.context_adjustments.rsi_penalty: 0.0
+          support.scoring.context_adjustments.close_vs_sma50_bonus: 0.0
+          support.scoring.context_adjustments.close_vs_sma50_penalty: 0.0
+          support.scoring.context_adjustments.return_10d_bonus: 0.0
+          support.scoring.context_adjustments.return_10d_penalty: 0.0
+          support.scoring.context_adjustments.return_20d_bonus: 0.0
+          support.scoring.context_adjustments.return_20d_penalty: 0.0
+          support.scoring.context_adjustments.bollinger_position_window_days: 20
+          support.scoring.context_adjustments.bollinger_position_stddev: 2.0
+          support.scoring.context_adjustments.bollinger_position_bonus_max: 0.50
+          support.scoring.context_adjustments.bollinger_position_bonus: 15.0
+          support.scoring.context_adjustments.bollinger_position_penalty: 0.0
+          support.pivot_cluster.enabled: true
+          support.range_box.enabled: true
+          support.moving_average_supports.enabled: true
+          support.lowest_low_reference.enabled: true
+          support.bollinger_lower_band.enabled: true
+          market_regime.enabled: false
+          market_regime.require_market_price_above_sma200: false
+          market_regime.require_market_sma200_slope_non_negative: false
+          market_regime.conditional_csp_overrides.enabled: false
+          market_regime.conditional_csp_overrides.when_market_price_below_sma200.patch: {}
+          portfolio.max_active_tickers: 20
+          execution.max_orders_per_run: 5
+          backtest_position_sizing.mode: equity_pct
+          backtest_position_sizing.min_contracts: 1
+          backtest_position_sizing.max_contracts: 0
+          backtest_position_sizing.target_equity_pct: 0.10
+          risk.max_assignment_cash_pct: 0.98
+          risk.min_cash_buffer_pct: 0.02
+          risk.max_single_ticker_assignment_dollars: 250000
+          risk.max_single_ticker_assignment_pct: 0.10
+          backtest_execution.fill_policy: mid
+          backtest_execution.calibration_status: v0_uncalibrated_mid

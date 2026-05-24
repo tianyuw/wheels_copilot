@@ -70,15 +70,83 @@ def load_scenario_file(path: Path) -> dict[str, Any]:
     for experiment in experiments:
         if not isinstance(experiment, dict) or not experiment.get("name"):
             raise ValueError("Each experiment must be a mapping with name")
-        matrix = experiment.get("matrix")
-        if not isinstance(matrix, dict) or not matrix:
-            raise ValueError(f"Experiment {experiment.get('name')} must define matrix")
-        for path_key, values in matrix.items():
-            if not isinstance(path_key, str) or not path_key:
-                raise ValueError(f"Invalid matrix path in {experiment.get('name')}: {path_key}")
-            if not isinstance(values, list) or not values:
-                raise ValueError(f"Matrix path {path_key} must contain a non-empty list")
+        modes = [
+            key
+            for key in ("matrix", "variants", "variant_axes")
+            if key in experiment
+        ]
+        if len(modes) != 1:
+            raise ValueError(
+                f"Experiment {experiment.get('name')} must define exactly one of "
+                "matrix, variants, or variant_axes"
+            )
+        if "matrix" in experiment:
+            _validate_matrix_shape(experiment)
+        elif "variants" in experiment:
+            _validate_variants_shape(experiment)
+        else:
+            _validate_variant_axes_shape(experiment)
     return payload
+
+
+def _validate_matrix_shape(experiment: dict[str, Any]) -> None:
+    matrix = experiment.get("matrix")
+    if not isinstance(matrix, dict) or not matrix:
+        raise ValueError(f"Experiment {experiment.get('name')} must define matrix")
+    for path_key, values in matrix.items():
+        if not isinstance(path_key, str) or not path_key:
+            raise ValueError(f"Invalid matrix path in {experiment.get('name')}: {path_key}")
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"Matrix path {path_key} must contain a non-empty list")
+
+
+def _validate_variants_shape(experiment: dict[str, Any]) -> None:
+    variants = experiment.get("variants")
+    if not isinstance(variants, list) or not variants:
+        raise ValueError(f"Experiment {experiment.get('name')} must define variants")
+    for index, variant in enumerate(variants, start=1):
+        if not isinstance(variant, dict):
+            raise ValueError(f"Variant {index} in {experiment.get('name')} must be a mapping")
+        patch = variant.get("patch")
+        if not isinstance(patch, dict) or not patch:
+            raise ValueError(
+                f"Variant {index} in {experiment.get('name')} must define patch"
+            )
+        _validate_patch_shape(patch, f"variant {index} in {experiment.get('name')}")
+
+
+def _validate_variant_axes_shape(experiment: dict[str, Any]) -> None:
+    axes = experiment.get("variant_axes")
+    if not isinstance(axes, dict) or not axes:
+        raise ValueError(f"Experiment {experiment.get('name')} must define variant_axes")
+    for axis_name, choices in axes.items():
+        if not isinstance(axis_name, str) or not axis_name:
+            raise ValueError(f"Invalid variant axis in {experiment.get('name')}: {axis_name}")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError(
+                f"Variant axis {axis_name} in {experiment.get('name')} must contain choices"
+            )
+        for index, choice in enumerate(choices, start=1):
+            if not isinstance(choice, dict):
+                raise ValueError(
+                    f"Choice {index} in axis {axis_name} must be a mapping"
+                )
+            if not choice.get("name"):
+                raise ValueError(
+                    f"Choice {index} in axis {axis_name} must define name"
+                )
+            patch = choice.get("patch")
+            if not isinstance(patch, dict) or not patch:
+                raise ValueError(
+                    f"Choice {index} in axis {axis_name} must define patch"
+                )
+            _validate_patch_shape(patch, f"choice {index} in axis {axis_name}")
+
+
+def _validate_patch_shape(patch: dict[Any, Any], context: str) -> None:
+    for path_key in patch:
+        if not isinstance(path_key, str) or not path_key:
+            raise ValueError(f"Invalid patch path in {context}: {path_key}")
 
 
 def build_run_specs(
@@ -122,13 +190,7 @@ def build_run_specs(
     seen_run_ids.add(baseline.run_id)
 
     for experiment in scenario["experiments"]:
-        matrix = experiment["matrix"]
-        for path_key, values in matrix.items():
-            current = get_dotted_path(base_config, path_key)
-            for value in values:
-                validate_patch_value(path_key, current, value)
-        keys = list(matrix)
-        combinations = list(product(*(matrix[key] for key in keys)))
+        combinations = expand_experiment_patches(experiment)
         if (
             len(combinations) > max_combinations_per_experiment
             and not allow_large_matrix
@@ -139,12 +201,14 @@ def build_run_specs(
                 "Use --allow-large-matrix to override."
             )
         variant_index = 0
-        for combination in combinations:
-            patch = dict(zip(keys, combination))
+        for patch, name_suffix in combinations:
+            for path_key, value in patch.items():
+                current = get_dotted_path(base_config, path_key)
+                validate_patch_value(path_key, current, value)
             config = apply_dotted_patch(base_config, patch)
             validate_config_constraints(config)
             spec = _make_run_spec(
-                name=f"{experiment['name']}_{variant_index + 1:03d}",
+                name=format_spec_name(str(experiment["name"]), variant_index + 1, name_suffix),
                 experiment_name=str(experiment["name"]),
                 parameter_patch=patch,
                 config=config,
@@ -160,12 +224,73 @@ def build_run_specs(
             if spec.run_id in seen_run_ids:
                 continue
             variant_index += 1
-            spec = replace(spec, name=f"{experiment['name']}_{variant_index:03d}")
+            spec = replace(
+                spec,
+                name=format_spec_name(
+                    str(experiment["name"]),
+                    variant_index,
+                    name_suffix,
+                ),
+            )
             if len(specs) >= max_runs:
                 raise ValueError(f"Scenario expands to more than max_runs={max_runs}")
             specs.append(spec)
             seen_run_ids.add(spec.run_id)
     return specs
+
+
+def expand_experiment_patches(
+    experiment: dict[str, Any],
+) -> list[tuple[dict[str, Any], str]]:
+    if "matrix" in experiment:
+        matrix = experiment["matrix"]
+        keys = list(matrix)
+        return [
+            (dict(zip(keys, combination)), "")
+            for combination in product(*(matrix[key] for key in keys))
+        ]
+    if "variants" in experiment:
+        return [
+            (dict(variant["patch"]), safe_name(str(variant.get("name") or index)))
+            for index, variant in enumerate(experiment["variants"], start=1)
+        ]
+    axes = experiment["variant_axes"]
+    axis_names = list(axes)
+    rows: list[tuple[dict[str, Any], str]] = []
+    for choices in product(*(axes[axis] for axis in axis_names)):
+        patch: dict[str, Any] = {}
+        suffix_parts: list[str] = []
+        for choice in choices:
+            suffix_parts.append(safe_name(str(choice["name"])))
+            patch = merge_patch(patch, dict(choice["patch"]))
+        rows.append((patch, "__".join(suffix_parts)))
+    return rows
+
+
+def merge_patch(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(left)
+    for key, value in right.items():
+        if key in merged and merged[key] != value:
+            raise ValueError(f"Conflicting patch value for {key}: {merged[key]} vs {value}")
+        merged[key] = value
+    return merged
+
+
+def format_spec_name(experiment_name: str, index: int, suffix: str) -> str:
+    base = f"{experiment_name}_{index:03d}"
+    if not suffix:
+        return base
+    return f"{base}_{suffix[:96]}"
+
+
+def safe_name(value: str) -> str:
+    result = "".join(
+        char.lower() if char.isalnum() else "_"
+        for char in value.strip()
+    ).strip("_")
+    while "__" in result:
+        result = result.replace("__", "_")
+    return result or "variant"
 
 
 def get_dotted_path(config: dict[str, Any], path: str) -> Any:
@@ -226,6 +351,7 @@ def validate_config_constraints(config: dict[str, Any]) -> None:
     cc_cfg = config.get("cc_selector", {})
     execution_cfg = config.get("execution", {})
     portfolio_cfg = config.get("portfolio", {})
+    management_cfg = config.get("management", {})
     _validate_min_lte_max(
         "csp_selector.dte_min",
         csp_cfg.get("dte_min"),
@@ -268,6 +394,17 @@ def validate_config_constraints(config: dict[str, Any]) -> None:
         "csp_selector.min_strike_distance_atr_multiple",
         csp_cfg.get("min_strike_distance_atr_multiple"),
     )
+    for path, model in (
+        ("management.csp_exit_model", management_cfg.get("csp_exit_model")),
+        ("management.cc_exit_model", management_cfg.get("cc_exit_model")),
+    ):
+        if model is not None and model not in {
+            "hold_to_expiration",
+            "close_at_50pct_profit_or_expiry",
+            "manage_at_dte_or_expiry",
+            "close_at_50pct_profit_or_manage_dte_or_expiry",
+        }:
+            raise ValueError(f"{path} has unsupported exit model: {model}")
 
 
 def _validate_min_lte_max(
@@ -512,6 +649,7 @@ def write_aggregate_outputs(output_dir: Path) -> list[dict[str, Any]]:
     if baseline:
         for row in rows:
             _add_baseline_deltas(row, baseline)
+    add_candidate_supply_scores(rows)
     rows.sort(
         key=leaderboard_sort_key
     )
@@ -545,6 +683,12 @@ def flatten_run_metrics(
     opened_cc = int(summary.get("opened_covered_calls") or 0)
     drawdown = abs(float(summary.get("max_drawdown_pct") or 0.0))
     total_return = float(summary.get("total_return_pct") or 0.0)
+    support_diagnostics = summary.get("support_diagnostics") or {}
+    market_regime_diagnostics = summary.get("market_regime_diagnostics") or {}
+    candidate_ledger_diagnostics = summary.get("candidate_ledger_diagnostics") or {}
+    scan_days = candidate_ledger_diagnostics.get("scan_days")
+    data_issue_count = summary.get("data_issue_count")
+    support_attempts = support_diagnostics.get("attempts")
     row: dict[str, Any] = {
         "run_id": metadata["run_id"],
         "name": metadata.get("name"),
@@ -560,12 +704,26 @@ def flatten_run_metrics(
         "realized_stock_pnl": summary.get("realized_stock_pnl"),
         "opened_short_puts": opened_csp,
         "assigned": summary.get("assigned"),
+        "expired_worthless": summary.get("expired_worthless"),
+        "closed_short_puts": summary.get("closed_short_puts"),
+        "csp_profit_target_closes": summary.get("csp_profit_target_closes"),
+        "csp_manage_dte_closes": summary.get("csp_manage_dte_closes"),
         "opened_covered_calls": opened_cc,
         "called_away": summary.get("called_away"),
+        "closed_covered_calls": summary.get("closed_covered_calls"),
+        "cc_profit_target_closes": summary.get("cc_profit_target_closes"),
+        "cc_manage_dte_closes": summary.get("cc_manage_dte_closes"),
         "assignment_rate_pct": (
             round(float(summary.get("assigned") or 0) / opened_csp * 100.0, 4)
             if opened_csp
             else None
+        ),
+        "csp_expired_worthless_rate_pct": summary.get(
+            "csp_expired_worthless_rate_pct"
+        ),
+        "csp_assignment_rate_pct": summary.get("csp_assignment_rate_pct"),
+        "csp_realized_option_pnl_per_trade": summary.get(
+            "csp_realized_option_pnl_per_trade"
         ),
         "called_away_rate_pct": (
             round(float(summary.get("called_away") or 0) / opened_cc * 100.0, 4)
@@ -574,8 +732,180 @@ def flatten_run_metrics(
         ),
         "average_capital_utilization_pct": summary.get("average_capital_utilization_pct"),
         "max_capital_utilization_pct": summary.get("max_capital_utilization_pct"),
-        "data_issue_count": summary.get("data_issue_count"),
+        "data_issue_count": data_issue_count,
+        "data_issues_per_100_scan_days": (
+            summary.get("data_issues_per_100_scan_days")
+            if summary.get("data_issues_per_100_scan_days") is not None
+            else _rate_per_100(data_issue_count, scan_days)
+        ),
+        "data_issue_rate_pct_of_support_attempts": (
+            summary.get("data_issue_rate_pct_of_support_attempts")
+            if summary.get("data_issue_rate_pct_of_support_attempts") is not None
+            else _rate_pct(data_issue_count, support_attempts)
+        ),
+        "fundamental_profile": summary.get("fundamental_profile"),
         "cc_risk_profile": summary.get("cc_risk_profile"),
+        "csp_exit_model": summary.get("csp_exit_model"),
+        "cc_exit_model": summary.get("cc_exit_model"),
+        "profit_take_pct_of_credit": summary.get("profit_take_pct_of_credit"),
+        "profit_take_price_field": summary.get("profit_take_price_field"),
+        "manage_at_dte": summary.get("manage_at_dte"),
+        "candidate_ledger_rows": candidate_ledger_diagnostics.get("rows"),
+        "candidate_selection_stage_counts": candidate_ledger_diagnostics.get(
+            "selection_stage_counts"
+        ),
+        "candidate_binding_filter_counts": candidate_ledger_diagnostics.get(
+            "binding_filter_counts"
+        ),
+        "candidate_top_binding_filters": candidate_ledger_diagnostics.get(
+            "top_binding_filters"
+        ),
+        "mechanical_candidate_count": candidate_ledger_diagnostics.get(
+            "mechanical_candidate_count"
+        ),
+        "mechanical_auto_trade_candidate_count": candidate_ledger_diagnostics.get(
+            "mechanical_auto_trade_candidate_count"
+        ),
+        "quality_candidate_filter": candidate_ledger_diagnostics.get(
+            "quality_candidate_filter"
+        ),
+        "quality_candidate_count": candidate_ledger_diagnostics.get(
+            "quality_candidate_count"
+        ),
+        "quality_candidate_pass_rate_pct": candidate_ledger_diagnostics.get(
+            "quality_candidate_pass_rate_pct"
+        ),
+        "average_daily_quality_candidate_pass_rate_pct": (
+            candidate_ledger_diagnostics.get(
+                "average_daily_quality_candidate_pass_rate_pct"
+            )
+        ),
+        "quality_candidate_days": candidate_ledger_diagnostics.get(
+            "quality_candidate_days"
+        ),
+        "median_quality_candidates_per_day": candidate_ledger_diagnostics.get(
+            "median_quality_candidates_per_day"
+        ),
+        "average_quality_candidates_per_day": candidate_ledger_diagnostics.get(
+            "average_quality_candidates_per_day"
+        ),
+        "median_unique_quality_candidate_tickers_per_day": (
+            candidate_ledger_diagnostics.get(
+                "median_unique_quality_candidate_tickers_per_day"
+            )
+        ),
+        "average_unique_quality_candidate_tickers_per_day": (
+            candidate_ledger_diagnostics.get(
+                "average_unique_quality_candidate_tickers_per_day"
+            )
+        ),
+        "pct_days_with_3plus_quality_candidates": candidate_ledger_diagnostics.get(
+            "pct_days_with_3plus_quality_candidates"
+        ),
+        "pct_days_with_5plus_quality_candidates": candidate_ledger_diagnostics.get(
+            "pct_days_with_5plus_quality_candidates"
+        ),
+        "pct_days_with_3plus_unique_quality_tickers": (
+            candidate_ledger_diagnostics.get(
+                "pct_days_with_3plus_unique_quality_tickers"
+            )
+        ),
+        "pct_days_with_5plus_unique_quality_tickers": (
+            candidate_ledger_diagnostics.get(
+                "pct_days_with_5plus_unique_quality_tickers"
+            )
+        ),
+        "watch_only_candidate_count": candidate_ledger_diagnostics.get(
+            "watch_only_candidate_count"
+        ),
+        "selected_for_backtest_count": candidate_ledger_diagnostics.get(
+            "selected_for_backtest_count"
+        ),
+        "candidate_days": candidate_ledger_diagnostics.get("candidate_days"),
+        "auto_trade_candidate_days": candidate_ledger_diagnostics.get(
+            "auto_trade_candidate_days"
+        ),
+        "scan_days": candidate_ledger_diagnostics.get("scan_days"),
+        "starvation_days": candidate_ledger_diagnostics.get("starvation_days"),
+        "median_candidates_per_day": candidate_ledger_diagnostics.get(
+            "median_candidates_per_day"
+        ),
+        "average_candidates_per_day": candidate_ledger_diagnostics.get(
+            "average_candidates_per_day"
+        ),
+        "median_unique_candidate_tickers_per_day": candidate_ledger_diagnostics.get(
+            "median_unique_candidate_tickers_per_day"
+        ),
+        "average_unique_candidate_tickers_per_day": candidate_ledger_diagnostics.get(
+            "average_unique_candidate_tickers_per_day"
+        ),
+        "average_unique_candidate_ticker_expirations_per_day": (
+            candidate_ledger_diagnostics.get(
+                "average_unique_candidate_ticker_expirations_per_day"
+            )
+        ),
+        "pct_days_with_3plus_candidates": candidate_ledger_diagnostics.get(
+            "pct_days_with_3plus_candidates"
+        ),
+        "pct_days_with_5plus_candidates": candidate_ledger_diagnostics.get(
+            "pct_days_with_5plus_candidates"
+        ),
+        "pct_days_with_3plus_unique_tickers": candidate_ledger_diagnostics.get(
+            "pct_days_with_3plus_unique_tickers"
+        ),
+        "pct_days_with_5plus_unique_tickers": candidate_ledger_diagnostics.get(
+            "pct_days_with_5plus_unique_tickers"
+        ),
+        "pct_weeks_with_15plus_candidates": candidate_ledger_diagnostics.get(
+            "pct_weeks_with_15plus_candidates"
+        ),
+        "average_unique_candidate_tickers_per_week": candidate_ledger_diagnostics.get(
+            "average_unique_candidate_tickers_per_week"
+        ),
+        "mechanical_candidates_per_week": candidate_ledger_diagnostics.get(
+            "mechanical_candidates_per_week"
+        ),
+        "mechanical_auto_trade_candidates_per_week": candidate_ledger_diagnostics.get(
+            "mechanical_auto_trade_candidates_per_week"
+        ),
+        "opened_from_candidate_per_week": candidate_ledger_diagnostics.get(
+            "opened_from_candidate_per_week"
+        ),
+        "candidate_to_trade_ratio_pct": candidate_ledger_diagnostics.get(
+            "candidate_to_trade_ratio_pct"
+        ),
+        "auto_candidate_to_trade_ratio_pct": candidate_ledger_diagnostics.get(
+            "auto_candidate_to_trade_ratio_pct"
+        ),
+        "market_regime_reject_day_pct": market_regime_diagnostics.get(
+            "reject_day_pct"
+        ),
+        "market_regime_reason_counts": market_regime_diagnostics.get(
+            "reason_counts"
+        ),
+        "support_attempts": support_diagnostics.get("attempts"),
+        "support_coverage_pct": support_diagnostics.get("support_coverage_pct"),
+        "support_tradable_pct": support_diagnostics.get("tradable_pct"),
+        "support_candidate_found_pct": support_diagnostics.get("candidate_found_pct"),
+        "support_auto_trade_candidate_pct": support_diagnostics.get(
+            "auto_trade_candidate_pct"
+        ),
+        "support_average_zone_count": support_diagnostics.get("average_zone_count"),
+        "support_average_selected_score": support_diagnostics.get(
+            "average_selected_score"
+        ),
+        "support_average_spot_to_bottom_pct": support_diagnostics.get(
+            "average_spot_to_support_bottom_pct"
+        ),
+        "support_average_spot_to_top_pct": support_diagnostics.get(
+            "average_spot_to_support_top_pct"
+        ),
+        "support_average_spot_to_bottom_atr": support_diagnostics.get(
+            "average_spot_to_support_bottom_atr"
+        ),
+        "support_selected_method_counts": support_diagnostics.get(
+            "selected_method_counts"
+        ),
         "uncovered_assigned_days": summary.get("uncovered_assigned_days"),
         "uncovered_assigned_share_days": summary.get("uncovered_assigned_share_days"),
         "average_uncovered_assigned_shares": summary.get(
@@ -609,6 +939,18 @@ def flatten_run_metrics(
     return row
 
 
+def _rate_pct(numerator: Any, denominator: Any) -> float | None:
+    numerator_value = _finite_float_or_none(numerator)
+    denominator_value = _finite_float_or_none(denominator)
+    if numerator_value is None or denominator_value is None or denominator_value <= 0:
+        return None
+    return round(numerator_value / denominator_value * 100.0, 4)
+
+
+def _rate_per_100(numerator: Any, denominator: Any) -> float | None:
+    return _rate_pct(numerator, denominator)
+
+
 def return_per_drawdown(total_return: float, drawdown: float) -> float:
     if drawdown > 0:
         return round(total_return / drawdown, 6)
@@ -620,6 +962,10 @@ def return_per_drawdown(total_return: float, drawdown: float) -> float:
 
 
 def leaderboard_sort_key(row: dict[str, Any]) -> tuple[bool, float, float]:
+    supply_score = _ranking_supply_score(row)
+    supply_score_value = (
+        -1_000_000.0 if supply_score is None else float(supply_score)
+    )
     return_per_dd = row.get("return_per_drawdown")
     total_return = row.get("total_return_pct")
     return_per_dd_score = (
@@ -630,9 +976,177 @@ def leaderboard_sort_key(row: dict[str, Any]) -> tuple[bool, float, float]:
     )
     return (
         not row.get("is_baseline", False),
+        -supply_score_value,
         -return_per_dd_score,
         -total_return_score,
     )
+
+
+def _ranking_supply_score(row: dict[str, Any]) -> Any:
+    return (
+        row.get("candidate_supply_score_v2")
+        if row.get("candidate_supply_score_v2") is not None
+        else row.get("candidate_supply_score_v1")
+    )
+
+
+def add_candidate_supply_scores(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    metric_names = [
+        "pct_days_with_3plus_candidates",
+        "median_candidates_per_day",
+        "average_candidates_per_day",
+        "total_return_pct",
+        "opened_short_puts",
+        "max_drawdown_abs",
+        "starvation_days",
+        "csp_assignment_rate_pct",
+    ]
+    metric_values: dict[str, list[float | None]] = {name: [] for name in metric_names}
+    for row in rows:
+        row["max_drawdown_abs"] = abs(float(row.get("max_drawdown_pct") or 0.0))
+        for name in metric_names:
+            metric_values[name].append(_finite_float_or_none(row.get(name)))
+    zscores = {
+        name: _zscore_series(values) for name, values in metric_values.items()
+    }
+    for index, row in enumerate(rows):
+        raw_score = (
+            0.70 * zscores["pct_days_with_3plus_candidates"][index]
+            + 0.50 * zscores["median_candidates_per_day"][index]
+            + 0.40 * zscores["average_candidates_per_day"][index]
+            + 0.40 * zscores["total_return_pct"][index]
+            + 0.20 * zscores["opened_short_puts"][index]
+            - 0.30 * zscores["max_drawdown_abs"][index]
+            - 0.30 * zscores["starvation_days"][index]
+            - 0.20 * zscores["csp_assignment_rate_pct"][index]
+        )
+        penalties = _candidate_supply_penalties(row)
+        row["candidate_supply_score_v1_raw"] = round(raw_score, 6)
+        row["candidate_supply_score_v1_penalties"] = penalties
+        row["candidate_supply_score_v1_warnings"] = _candidate_supply_warnings(row)
+        row["candidate_supply_score_v1_eligible"] = not penalties
+        row["candidate_supply_score_v1"] = (
+            -1_000_000.0 if penalties else round(raw_score, 6)
+        )
+    _add_candidate_supply_score_v2(rows)
+
+
+def _add_candidate_supply_score_v2(rows: list[dict[str, Any]]) -> None:
+    metric_names = [
+        "pct_days_with_3plus_quality_candidates",
+        "median_quality_candidates_per_day",
+        "average_quality_candidates_per_day",
+        "pct_days_with_3plus_candidates",
+        "total_return_pct",
+        "opened_short_puts",
+        "max_drawdown_abs",
+        "starvation_days",
+        "csp_assignment_rate_pct",
+    ]
+    metric_values: dict[str, list[float | None]] = {name: [] for name in metric_names}
+    for row in rows:
+        for name in metric_names:
+            metric_values[name].append(_finite_float_or_none(row.get(name)))
+    zscores = {
+        name: _zscore_series(values) for name, values in metric_values.items()
+    }
+    for index, row in enumerate(rows):
+        raw_score = (
+            0.70 * zscores["pct_days_with_3plus_quality_candidates"][index]
+            + 0.50 * zscores["median_quality_candidates_per_day"][index]
+            + 0.30 * zscores["average_quality_candidates_per_day"][index]
+            + 0.25 * zscores["pct_days_with_3plus_candidates"][index]
+            + 0.35 * zscores["total_return_pct"][index]
+            + 0.15 * zscores["opened_short_puts"][index]
+            - 0.30 * zscores["max_drawdown_abs"][index]
+            - 0.25 * zscores["starvation_days"][index]
+            - 0.20 * zscores["csp_assignment_rate_pct"][index]
+        )
+        penalties = _candidate_supply_penalties(row)
+        row["candidate_supply_score_v2_raw"] = round(raw_score, 6)
+        row["candidate_supply_score_v2_penalties"] = penalties
+        row["candidate_supply_score_v2_warnings"] = _candidate_supply_warnings(row)
+        row["candidate_supply_score_v2_eligible"] = not penalties
+        row["candidate_supply_score_v2"] = (
+            -1_000_000.0 if penalties else round(raw_score, 6)
+        )
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _zscore_series(values: list[float | None]) -> list[float]:
+    finite = [value for value in values if value is not None]
+    if not finite:
+        return [0.0 for _ in values]
+    mean = sum(finite) / len(finite)
+    variance = sum((value - mean) ** 2 for value in finite) / len(finite)
+    stddev = math.sqrt(variance)
+    if stddev == 0:
+        return [0.0 for _ in values]
+    return [0.0 if value is None else (value - mean) / stddev for value in values]
+
+
+def _candidate_supply_penalties(row: dict[str, Any]) -> list[str]:
+    penalties: list[str] = []
+    total_return = _finite_float_or_none(row.get("total_return_pct"))
+    max_drawdown_abs = _finite_float_or_none(row.get("max_drawdown_abs"))
+    opened_short_puts = _finite_float_or_none(row.get("opened_short_puts"))
+    data_issue_rate = _finite_float_or_none(
+        row.get("data_issue_rate_pct_of_support_attempts")
+    )
+    data_issues_per_100_scan_days = _finite_float_or_none(
+        row.get("data_issues_per_100_scan_days")
+    )
+    starvation_days = _finite_float_or_none(row.get("starvation_days"))
+    scan_days = _finite_float_or_none(row.get("scan_days"))
+    if (
+        total_return is not None
+        and total_return < -0.25
+        and (opened_short_puts is None or opened_short_puts >= 30)
+    ):
+        penalties.append("negative_return_lt_-0.25pct")
+    elif total_return is not None and total_return < -1.0:
+        penalties.append("negative_return_lt_-1pct_low_sample")
+    if max_drawdown_abs is not None and max_drawdown_abs > 15.0:
+        penalties.append("max_drawdown_gt_15pct")
+    if data_issue_rate is not None:
+        if data_issue_rate > 2.0:
+            penalties.append("data_issue_rate_gt_2pct")
+    elif (
+        data_issues_per_100_scan_days is not None
+        and data_issues_per_100_scan_days > 25.0
+    ):
+        penalties.append("data_issues_per_100_scan_days_gt_25")
+    if (
+        starvation_days is not None
+        and scan_days is not None
+        and scan_days > 0
+        and starvation_days / scan_days > 0.60
+    ):
+        penalties.append("starvation_gt_60pct")
+    return penalties
+
+
+def _candidate_supply_warnings(row: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    total_return = _finite_float_or_none(row.get("total_return_pct"))
+    opened_short_puts = _finite_float_or_none(row.get("opened_short_puts"))
+    if total_return is not None and total_return < 0:
+        if total_return >= -0.25:
+            warnings.append("marginal_negative_return")
+        elif opened_short_puts is not None and opened_short_puts < 30:
+            warnings.append("negative_return_low_sample")
+    return warnings
 
 
 def run_directory_state(run_dir: Path) -> str:
@@ -707,17 +1221,100 @@ def write_leaderboard_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "total_return_pct",
         "max_drawdown_pct",
         "return_per_drawdown",
+        "candidate_supply_score_v1",
+        "candidate_supply_score_v1_raw",
+        "candidate_supply_score_v1_eligible",
+        "candidate_supply_score_v1_penalties",
+        "candidate_supply_score_v1_warnings",
+        "candidate_supply_score_v2",
+        "candidate_supply_score_v2_raw",
+        "candidate_supply_score_v2_eligible",
+        "candidate_supply_score_v2_penalties",
+        "candidate_supply_score_v2_warnings",
         "delta_total_return_pct",
         "opened_short_puts",
         "assigned",
+        "expired_worthless",
+        "closed_short_puts",
+        "csp_profit_target_closes",
+        "csp_manage_dte_closes",
         "assignment_rate_pct",
+        "csp_expired_worthless_rate_pct",
+        "csp_assignment_rate_pct",
+        "csp_realized_option_pnl_per_trade",
         "opened_covered_calls",
         "called_away",
+        "closed_covered_calls",
+        "cc_profit_target_closes",
+        "cc_manage_dte_closes",
         "called_away_rate_pct",
         "average_capital_utilization_pct",
         "max_capital_utilization_pct",
         "data_issue_count",
+        "data_issues_per_100_scan_days",
+        "data_issue_rate_pct_of_support_attempts",
+        "fundamental_profile",
         "cc_risk_profile",
+        "csp_exit_model",
+        "cc_exit_model",
+        "profit_take_pct_of_credit",
+        "profit_take_price_field",
+        "manage_at_dte",
+        "candidate_ledger_rows",
+        "candidate_selection_stage_counts",
+        "candidate_binding_filter_counts",
+        "candidate_top_binding_filters",
+        "mechanical_candidate_count",
+        "mechanical_auto_trade_candidate_count",
+        "quality_candidate_count",
+        "quality_candidate_pass_rate_pct",
+        "average_daily_quality_candidate_pass_rate_pct",
+        "quality_candidate_days",
+        "median_quality_candidates_per_day",
+        "average_quality_candidates_per_day",
+        "median_unique_quality_candidate_tickers_per_day",
+        "average_unique_quality_candidate_tickers_per_day",
+        "pct_days_with_3plus_quality_candidates",
+        "pct_days_with_5plus_quality_candidates",
+        "pct_days_with_3plus_unique_quality_tickers",
+        "pct_days_with_5plus_unique_quality_tickers",
+        "quality_candidate_filter",
+        "watch_only_candidate_count",
+        "selected_for_backtest_count",
+        "candidate_days",
+        "auto_trade_candidate_days",
+        "scan_days",
+        "starvation_days",
+        "median_candidates_per_day",
+        "average_candidates_per_day",
+        "median_unique_candidate_tickers_per_day",
+        "average_unique_candidate_tickers_per_day",
+        "average_unique_candidate_ticker_expirations_per_day",
+        "pct_days_with_3plus_candidates",
+        "pct_days_with_5plus_candidates",
+        "pct_days_with_3plus_unique_tickers",
+        "pct_days_with_5plus_unique_tickers",
+        "pct_weeks_with_15plus_candidates",
+        "average_unique_candidate_tickers_per_week",
+        "mechanical_candidates_per_week",
+        "mechanical_auto_trade_candidates_per_week",
+        "opened_from_candidate_per_week",
+        "candidate_to_trade_ratio_pct",
+        "auto_candidate_to_trade_ratio_pct",
+        "market_regime_reject_day_pct",
+        "market_regime_reason_counts",
+        "csp_regime_override",
+        "support_attempts",
+        "support_coverage_pct",
+        "support_tradable_pct",
+        "support_candidate_found_pct",
+        "support_auto_trade_candidate_pct",
+        "support_average_zone_count",
+        "support_average_selected_score",
+        "support_average_spot_to_bottom_pct",
+        "support_average_spot_to_top_pct",
+        "support_average_spot_to_bottom_atr",
+        "support_selected_method_counts",
         "uncovered_assigned_days",
         "uncovered_assigned_share_days",
         "average_uncovered_assigned_shares",
@@ -765,24 +1362,33 @@ def render_sensitivity_report(rows: list[dict[str, Any]]) -> str:
         f"- Runs completed: {len(rows)}",
         "- Ranking is diagnostic, not an automatic live-trading parameter choice.",
         "- Single-window results can overfit one market regime; validate on more windows before adopting.",
+        "- Candidate supply score v2 prioritizes quality-filtered candidate supply, then positive return and risk controls.",
         "",
-        "| Run | Experiment | Return | Max DD | Return/DD | CSPs | Assigned | CCs | Called Away | Avg Util | Avg Spread | Exec | Data Issues | Sample |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|",
+        "| Run | Experiment | Supply Score | Return | Max DD | Return/DD | Candidates/Day | Quality/Day | 3+ Quality Days | Starve | Top Binding Filter | CSPs | Assigned | CCs | Called Away | Avg Util | Avg Spread | Exec | Data Issues | Issue Rate | Sample |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---|",
     ]
     for row in rows[:50]:
         sample = "LOW" if row.get("sample_size_flag") else "OK"
         lines.append(
             "| "
             f"{row.get('name')} | {row.get('experiment_name')} | "
+            f"{_fmt(_ranking_supply_score(row))} | "
             f"{_fmt(row.get('total_return_pct'))}% | "
             f"{_fmt(row.get('max_drawdown_pct'))}% | "
             f"{_fmt(row.get('return_per_drawdown'))} | "
+            f"{_fmt(row.get('average_candidates_per_day'))} | "
+            f"{_fmt(row.get('average_quality_candidates_per_day'))} | "
+            f"{_fmt(row.get('pct_days_with_3plus_quality_candidates'))}% | "
+            f"{row.get('starvation_days')} | "
+            f"{_top_binding_filter_label(row)} | "
             f"{row.get('opened_short_puts')} | {row.get('assigned')} | "
             f"{row.get('opened_covered_calls')} | {row.get('called_away')} | "
             f"{_fmt(row.get('average_capital_utilization_pct'))}% | "
             f"{_fmt(row.get('average_entry_spread_pct_of_mid'))} | "
             f"{row.get('execution_model') or ''}/{row.get('execution_fill_policy') or ''} | "
-            f"{row.get('data_issue_count')} | {sample} |"
+            f"{row.get('data_issue_count')} | "
+            f"{_fmt(row.get('data_issue_rate_pct_of_support_attempts'))}% | "
+            f"{sample} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -1103,3 +1709,15 @@ def _fmt(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.4f}"
     return str(value)
+
+
+def _top_binding_filter_label(row: dict[str, Any]) -> str:
+    filters = row.get("candidate_top_binding_filters")
+    if not isinstance(filters, list) or not filters:
+        return "-"
+    first = filters[0]
+    if not isinstance(first, dict):
+        return "-"
+    reason = first.get("reason")
+    count = first.get("count")
+    return f"{reason} ({count})" if reason else "-"

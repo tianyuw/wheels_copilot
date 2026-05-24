@@ -54,6 +54,25 @@ class CspSelectorTests(unittest.TestCase):
 
         self.assertIsNone(candidate)
 
+    def test_delta_policy_max_changes_candidate_eligibility(self):
+        cfg = load_config("config/markus_wheel.yaml")
+        support = _support(score=75)
+        options = [_put(strike=90, delta=-0.30, bid=1.00, ask=1.10)]
+
+        rejected = evaluate_csp_candidates(options, support, cfg)
+
+        self.assertIsNone(rejected.candidate)
+        self.assertGreater(rejected.rejection_summary["delta_too_high"], 0)
+
+        cfg["csp_selector"]["delta_policy"]["normal_support"][
+            "target_delta_max"
+        ] = 0.35
+        accepted = evaluate_csp_candidates(options, support, cfg)
+
+        self.assertIsNotNone(accepted.candidate)
+        assert accepted.candidate is not None
+        self.assertAlmostEqual(abs(accepted.candidate.delta), 0.30)
+
     def test_weak_support_candidate_is_manual_review_not_auto_trade(self):
         cfg = load_config("config/markus_wheel.yaml")
         support = _support(score=60)
@@ -77,6 +96,118 @@ class CspSelectorTests(unittest.TestCase):
         assert result.candidate is not None
         self.assertFalse(result.candidate.auto_trade)
         self.assertTrue(result.candidate.diagnostics["inside_zone_watch_only"])
+
+    def test_inside_support_zone_can_be_auto_trade_when_enabled(self):
+        cfg = load_config("config/markus_wheel.yaml")
+        cfg["csp_selector"]["auto_trade_inside_support_zone"] = True
+        support = _support(score=88)
+        options = [_put(strike=92, delta=-0.20, bid=1.00, ask=1.10)]
+
+        result = evaluate_csp_candidates(options, support, cfg)
+
+        self.assertIsNotNone(result.candidate)
+        assert result.candidate is not None
+        self.assertTrue(result.candidate.auto_trade)
+        self.assertFalse(result.candidate.diagnostics["inside_zone_watch_only"])
+
+    def test_above_support_zone_can_be_watch_only_when_strike_gate_relaxed(self):
+        cfg = load_config("config/markus_wheel.yaml")
+        cfg["csp_selector"]["require_strike_at_or_below_support_zone_bottom"] = False
+        support = _support(score=88)
+        options = [_put(strike=96, delta=-0.20, bid=1.00, ask=1.10)]
+
+        result = evaluate_csp_candidates(options, support, cfg)
+
+        self.assertIsNotNone(result.candidate)
+        assert result.candidate is not None
+        self.assertFalse(result.candidate.auto_trade)
+        self.assertTrue(result.candidate.diagnostics["above_zone_watch_only"])
+        self.assertTrue(result.candidate.diagnostics["above_support_allowed"])
+
+    def test_above_support_zone_can_be_auto_trade_when_explicitly_enabled(self):
+        cfg = load_config("config/markus_wheel.yaml")
+        cfg["csp_selector"]["allow_strike_above_support_zone"] = True
+        cfg["csp_selector"]["auto_trade_above_support_zone"] = True
+        support = _support(score=88)
+        options = [_put(strike=96, delta=-0.20, bid=1.00, ask=1.10)]
+
+        result = evaluate_csp_candidates(options, support, cfg)
+
+        self.assertIsNotNone(result.candidate)
+        assert result.candidate is not None
+        self.assertTrue(result.candidate.auto_trade)
+        self.assertFalse(result.candidate.diagnostics["above_zone_watch_only"])
+
+    def test_candidate_aware_policy_uses_nearby_tradeable_support_zone(self):
+        cfg = load_config("config/markus_wheel.yaml")
+        cfg["support"]["selection_policy"] = "candidate_aware_top2"
+        deep = SupportZone(
+            method="pivot_cluster",
+            center=88,
+            bottom=87,
+            top=89,
+            touches=4,
+            rejections=4,
+            score=90,
+        )
+        near = SupportZone(
+            method="sma50",
+            center=95,
+            bottom=94,
+            top=96,
+            touches=3,
+            rejections=3,
+            score=75,
+        )
+        support = _support(score=90)
+        support.zones = [deep, near]
+        support.selected_zone = deep
+        options = [_put(strike=93, delta=-0.20, bid=1.00, ask=1.10)]
+
+        result = evaluate_csp_candidates(options, support, cfg)
+
+        self.assertIsNotNone(result.candidate)
+        assert result.candidate is not None
+        self.assertEqual(result.candidate.support_zone.method, "sma50")
+        self.assertTrue(result.candidate.auto_trade)
+        self.assertEqual(
+            result.candidate.diagnostics["support_selection_policy"],
+            "candidate_aware_top2",
+        )
+        self.assertEqual(result.candidate.diagnostics["support_zone_rank"], 2)
+
+    def test_nearest_qualified_policy_prefers_closest_qualified_zone(self):
+        cfg = load_config("config/markus_wheel.yaml")
+        cfg["support"]["selection_policy"] = "nearest_qualified"
+        deep = SupportZone(
+            method="pivot_cluster",
+            center=88,
+            bottom=87,
+            top=89,
+            touches=4,
+            rejections=4,
+            score=90,
+        )
+        near = SupportZone(
+            method="range_box_floor",
+            center=95,
+            bottom=94,
+            top=96,
+            touches=3,
+            rejections=3,
+            score=75,
+        )
+        support = _support(score=90)
+        support.zones = [deep, near]
+        support.selected_zone = deep
+        options = [_put(strike=93, delta=-0.20, bid=1.00, ask=1.10)]
+
+        result = evaluate_csp_candidates(options, support, cfg)
+
+        self.assertIsNotNone(result.candidate)
+        assert result.candidate is not None
+        self.assertEqual(result.candidate.support_zone.method, "range_box_floor")
+        self.assertTrue(result.candidate.auto_trade)
 
     def test_rejection_summary_explains_no_candidate(self):
         cfg = load_config("config/markus_wheel.yaml")

@@ -29,6 +29,7 @@ from .historical_fundamentals import (
     build_historical_fundamental_store,
     provenance_payload,
 )
+from .indicators import sma_values
 from .models import (
     BrokerAccountSnapshot,
     BrokerPosition,
@@ -51,6 +52,7 @@ from .price_space_breaks import (
     normalize_classifier_mode,
 )
 from .support import analyze_support
+from .trading_calendar import nyse_trading_days_after
 
 
 BACKTEST_VERSION = "phase_two_csp_cc_execution_v2"
@@ -61,16 +63,35 @@ DEFAULT_RISK_FREE_RATE = 0.04
 FUNDAMENTAL_PROFILES = {
     "technical_only",
     "fundamentals_warn",
+    "fundamentals_moderate",
     "fundamentals_strict_financials",
     "fundamentals_strict_all",
 }
 CC_RISK_PROFILES = {"strict", "warn_unknown_dates"}
+EXIT_MODELS = {
+    "hold_to_expiration",
+    "close_at_50pct_profit_or_expiry",
+    "manage_at_dte_or_expiry",
+    "close_at_50pct_profit_or_manage_dte_or_expiry",
+}
 STRICT_FINANCIAL_REASON_PREFIXES = (
     "recent_move_",
     "pe_ratio_non_positive",
     "pe_ratio_at_or_above_",
     "positive_quarters_",
     "positive_years_",
+)
+MODERATE_FUNDAMENTAL_HARD_REASONS = {
+    "leveraged_etf",
+    "biotech_or_binary_event_industry",
+    "chinese_adr",
+    "pe_ratio_non_positive",
+}
+MODERATE_FUNDAMENTAL_REASON_PREFIXES = (
+    "market_cap_below_",
+    "positive_quarters_",
+    "positive_years_",
+    "recent_move_",
 )
 
 
@@ -147,6 +168,18 @@ class BacktestState:
         return sum(position.assignment_cash_required for position in self.open_short_puts)
 
 
+@dataclass
+class DailyCspCandidate:
+    ticker: str
+    candidate: CspCandidate
+    support_summary: dict[str, Any] | None
+    fundamental_context: dict[str, Any] | None
+    candidate_earnings_gate: GateResult | None
+    post_earnings_cooldown_gate: GateResult | None
+    quality_score: float
+    rank_within_day: int | None = None
+
+
 def run_backtest(
     *,
     config: dict[str, Any],
@@ -168,6 +201,7 @@ def run_backtest(
     fundamentals_env_file: Path | None = None,
     fundamentals_timeout_seconds: float = 30.0,
     cc_risk_profile: str | None = None,
+    post_earnings_cooldown_days: int | None = None,
     price_space_break_classifier: str | None = None,
     price_space_break_split_provider: SplitEventProvider | None = None,
     price_space_break_cache_dir: Path = DEFAULT_PRICE_SPACE_BREAK_CACHE_DIR,
@@ -181,7 +215,15 @@ def run_backtest(
         raise ValueError("end date must be on or after start date")
     fundamental_profile = _normalize_fundamental_profile(fundamental_profile)
     cc_risk_profile = _normalize_cc_risk_profile(cc_risk_profile, config)
-    if fundamental_profile == "technical_only":
+    if post_earnings_cooldown_days is None:
+        post_earnings_cooldown_days = int(
+            config.get("backtest", {}).get("post_earnings_cooldown_days", 0) or 0
+        )
+    post_earnings_cooldown_days = max(0, int(post_earnings_cooldown_days))
+    needs_historical_fundamentals = (
+        fundamental_profile != "technical_only" or post_earnings_cooldown_days > 0
+    )
+    if not needs_historical_fundamentals:
         historical_fundamentals = None
     price_space_break_classifier = normalize_classifier_mode(
         price_space_break_classifier
@@ -215,15 +257,22 @@ def run_backtest(
     )
 
     history_start = start - timedelta(days=lookback_calendar_days)
+    market_regime_symbols = _market_regime_symbols(config)
     stock_bars = data.load_stock_bars(tickers, history_start, end)
-    if fundamental_profile != "technical_only" and historical_fundamentals is None:
+    market_regime_bars, market_regime_data_issues = _load_market_regime_bars(
+        data=data,
+        symbols=market_regime_symbols,
+        history_start=history_start,
+        end=end,
+    )
+    if needs_historical_fundamentals and historical_fundamentals is None:
         historical_fundamentals = build_historical_fundamental_store(
             config=config,
             cache_dir=fundamentals_cache_dir,
             env_file=fundamentals_env_file,
             timeout_seconds=fundamentals_timeout_seconds,
         )
-    if historical_fundamentals is not None and fundamental_profile != "technical_only":
+    if historical_fundamentals is not None and needs_historical_fundamentals:
         historical_fundamentals.preload(tickers, start, end)
     break_classifier = build_price_space_break_classifier(
         mode=price_space_break_classifier,
@@ -245,6 +294,7 @@ def run_backtest(
     blocked_tickers: set[str] = set()
     price_space_reset_dates: dict[str, date] = {}
     data_issues: list[dict[str, Any]] = []
+    data_issues.extend(market_regime_data_issues)
     events: list[dict[str, Any]] = []
     for ticker, issues in pre_start_split_issues.items():
         for issue in issues:
@@ -314,7 +364,10 @@ def run_backtest(
 
     trades: list[dict[str, Any]] = []
     equity_curve: list[dict[str, Any]] = []
+    candidate_ledger: list[dict[str, Any]] = []
     rejected_reason_counts: Counter[str] = Counter()
+    support_stats = _new_support_stats()
+    market_regime_stats = _new_market_regime_stats()
     fundamental_stats = _new_fundamental_stats(fundamental_profile)
     latest_close: dict[str, float] = {
         ticker: bar.close
@@ -334,11 +387,15 @@ def run_backtest(
     cc_cfg = config.get("cc_selector", {})
     cc_dte_min = int(cc_cfg.get("dte_min", 1))
     cc_dte_max = int(cc_cfg.get("dte_max", 9))
-    quantity = max(1, int(config.get("trade_planner", {}).get("default_contract_quantity", 1)))
+    default_quantity = max(1, int(config.get("trade_planner", {}).get("default_contract_quantity", 1)))
     if max_orders_per_day is None:
         max_orders_per_day = int(config.get("execution", {}).get("max_orders_per_run", 3))
     execution_model = build_backtest_execution_model(config, slippage_pct=slippage_pct)
     cc_backtest_config = _covered_call_backtest_config(config, cc_risk_profile)
+    csp_exit_model, cc_exit_model = _management_exit_models(config)
+    profit_take_pct = _management_profit_take_pct(config)
+    profit_take_price_field = _management_profit_take_price_field(config)
+    manage_at_dte = _management_manage_at_dte(config)
 
     for day in run_days:
         todays_bars = bars_by_day.get(day, {})
@@ -418,6 +475,50 @@ def run_backtest(
 
         orders_opened_today = 0
         if todays_bars:
+            _manage_open_short_puts_for_day(
+                state=state,
+                data=data,
+                day=day,
+                latest_close=latest_close,
+                trades=trades,
+                events=events,
+                execution_model=execution_model,
+                option_fee_per_contract=option_fee_per_contract,
+                risk_free_rate=risk_free_rate,
+                exit_model=csp_exit_model,
+                profit_take_pct=profit_take_pct,
+                profit_take_price_field=profit_take_price_field,
+                manage_at_dte=manage_at_dte,
+            )
+            _manage_open_short_calls_for_day(
+                state=state,
+                data=data,
+                day=day,
+                latest_close=latest_close,
+                trades=trades,
+                events=events,
+                execution_model=execution_model,
+                option_fee_per_contract=option_fee_per_contract,
+                risk_free_rate=risk_free_rate,
+                exit_model=cc_exit_model,
+                profit_take_pct=profit_take_pct,
+                profit_take_price_field=profit_take_price_field,
+                manage_at_dte=manage_at_dte,
+            )
+            market_regime_gate = _evaluate_market_regime_gate(
+                config,
+                market_regime_bars,
+                day,
+            )
+            _record_market_regime_stats(market_regime_stats, market_regime_gate)
+            csp_day_config, csp_regime_override = _conditional_csp_config_for_day(
+                config,
+                market_regime_bars,
+                day,
+            )
+            csp_day_cfg = csp_day_config.get("csp_selector", {})
+            csp_day_dte_min = int(csp_day_cfg.get("dte_min", dte_min))
+            csp_day_dte_max = int(csp_day_cfg.get("dte_max", dte_max))
             prefetch_options = getattr(data, "prefetch_option_day_rows", None)
             if callable(prefetch_options):
                 active_symbols = {
@@ -464,10 +565,17 @@ def run_backtest(
                 rejected_reason_counts=rejected_reason_counts,
                 latest_close=latest_close,
             )
+            daily_csp_candidates: list[DailyCspCandidate] = []
             for ticker in tickers:
-                if orders_opened_today >= max_orders_per_day:
-                    break
                 if ticker in blocked_tickers:
+                    _record_candidate_ledger(
+                        candidate_ledger,
+                        config=config,
+                        day=day,
+                        ticker=ticker,
+                        decision="REJECT",
+                        reason="price_space_break_blocked",
+                    )
                     continue
                 if ticker not in todays_bars:
                     _reject(
@@ -477,10 +585,55 @@ def run_backtest(
                         ticker,
                         "missing_stock_bar_on_scan_day",
                     )
+                    _record_candidate_ledger(
+                        candidate_ledger,
+                        config=config,
+                        day=day,
+                        ticker=ticker,
+                        decision="REJECT",
+                        reason="missing_stock_bar_on_scan_day",
+                    )
                     continue
                 if _has_open_short_put(state, ticker):
+                    _record_candidate_ledger(
+                        candidate_ledger,
+                        config=config,
+                        day=day,
+                        ticker=ticker,
+                        decision="SKIP",
+                        reason="existing_short_put_open",
+                    )
                     continue
                 if state.stocks.get(ticker, StockPosition(ticker)).shares >= 100:
+                    _record_candidate_ledger(
+                        candidate_ledger,
+                        config=config,
+                        day=day,
+                        ticker=ticker,
+                        decision="SKIP",
+                        reason="long_stock_position_open",
+                    )
+                    continue
+                if market_regime_gate.status == "REJECT":
+                    reason = _gate_primary_reason("market_regime_gate", market_regime_gate)
+                    diagnostics = {"market_regime_gate": asdict(market_regime_gate)}
+                    _reject(
+                        events,
+                        rejected_reason_counts,
+                        day,
+                        ticker,
+                        reason,
+                        diagnostics=diagnostics,
+                    )
+                    _record_candidate_ledger(
+                        candidate_ledger,
+                        config=config,
+                        day=day,
+                        ticker=ticker,
+                        decision="REJECT",
+                        reason=reason,
+                        diagnostics=diagnostics,
+                    )
                     continue
 
                 fundamental_context = _fundamental_context(
@@ -493,29 +646,45 @@ def run_backtest(
                         price_space_reset_dates.get(ticker),
                     ),
                     config=config,
+                    require_snapshot=post_earnings_cooldown_days > 0,
                 )
                 if fundamental_context is not None:
-                    _record_fundamental_context(
-                        fundamental_stats,
-                        events,
-                        day,
-                        ticker,
-                        fundamental_context,
-                        phase="csp",
-                    )
+                    if fundamental_profile != "technical_only":
+                        _record_fundamental_context(
+                            fundamental_stats,
+                            events,
+                            day,
+                            ticker,
+                            fundamental_context,
+                            phase="csp",
+                        )
                     fundamental_gate = fundamental_context["fundamental_gate"]
                     if _should_block_fundamental_gate(
                         fundamental_profile,
                         fundamental_gate,
                         fundamental_context["snapshot"],
                     ):
+                        reason = _gate_primary_reason(
+                            "fundamental_gate",
+                            fundamental_gate,
+                        )
+                        diagnostics = _fundamental_context_payload(fundamental_context)
                         _reject(
                             events,
                             rejected_reason_counts,
                             day,
                             ticker,
-                            _gate_primary_reason("fundamental_gate", fundamental_gate),
-                            diagnostics=_fundamental_context_payload(fundamental_context),
+                            reason,
+                            diagnostics=diagnostics,
+                        )
+                        _record_candidate_ledger(
+                            candidate_ledger,
+                            config=config,
+                            day=day,
+                            ticker=ticker,
+                            decision="REJECT",
+                            reason=reason,
+                            diagnostics=diagnostics,
                         )
                         continue
 
@@ -527,9 +696,9 @@ def run_backtest(
                         stock_bars.get(ticker, []),
                         price_space_reset_dates.get(ticker),
                     ),
-                    config=config,
-                    dte_min=dte_min,
-                    dte_max=dte_max,
+                    config=csp_day_config,
+                    dte_min=csp_day_dte_min,
+                    dte_max=csp_day_dte_max,
                     slippage_pct=slippage_pct,
                     risk_free_rate=risk_free_rate,
                     execution_model=execution_model,
@@ -537,9 +706,12 @@ def run_backtest(
                     price_space_reset_min_support_bars=(
                         price_space_split_reset_min_support_bars
                     ),
+                    support_stats=support_stats,
+                    csp_regime_override=csp_regime_override,
                 )
                 if candidate is None:
                     reason = _primary_rejection_reason(rejection_summary)
+                    diagnostics = {"csp_rejection_summary": rejection_summary}
                     _reject(
                         events,
                         rejected_reason_counts,
@@ -547,10 +719,21 @@ def run_backtest(
                         ticker,
                         reason,
                         support=support_summary,
-                        diagnostics={"csp_rejection_summary": rejection_summary},
+                        diagnostics=diagnostics,
+                    )
+                    _record_candidate_ledger(
+                        candidate_ledger,
+                        config=config,
+                        day=day,
+                        ticker=ticker,
+                        decision="REJECT",
+                        reason=reason,
+                        support=support_summary,
+                        diagnostics=diagnostics,
                     )
                     continue
                 if not candidate.auto_trade:
+                    diagnostics = _candidate_diagnostics(candidate)
                     _reject(
                         events,
                         rejected_reason_counts,
@@ -558,11 +741,23 @@ def run_backtest(
                         ticker,
                         "candidate_watch_only",
                         support=support_summary,
-                        diagnostics=_candidate_diagnostics(candidate),
+                        diagnostics=diagnostics,
+                    )
+                    _record_candidate_ledger(
+                        candidate_ledger,
+                        config=config,
+                        day=day,
+                        ticker=ticker,
+                        decision="WATCH",
+                        reason="candidate_watch_only",
+                        support=support_summary,
+                        candidate=candidate,
+                        diagnostics=diagnostics,
                     )
                     continue
 
                 candidate_earnings_gate: GateResult | None = None
+                post_earnings_cooldown_gate: GateResult | None = None
                 if fundamental_context is not None:
                     candidate_earnings_gate, _allowed = evaluate_earnings_gate(
                         fundamental_context["snapshot"],
@@ -578,104 +773,113 @@ def run_backtest(
                         fundamental_profile,
                         candidate_earnings_gate,
                     ):
+                        reason = _gate_primary_reason(
+                            "csp_earnings_gate",
+                            candidate_earnings_gate,
+                        )
+                        diagnostics = {
+                            **_fundamental_context_payload(fundamental_context),
+                            "earnings_gate": asdict(candidate_earnings_gate),
+                            "candidate": _candidate_diagnostics(candidate),
+                        }
                         _reject(
                             events,
                             rejected_reason_counts,
                             day,
                             ticker,
-                            _gate_primary_reason(
-                                "csp_earnings_gate",
-                                candidate_earnings_gate,
-                            ),
+                            reason,
                             support=support_summary,
-                            diagnostics={
-                                **_fundamental_context_payload(fundamental_context),
-                                "earnings_gate": asdict(candidate_earnings_gate),
-                                "candidate": _candidate_diagnostics(candidate),
-                            },
+                            diagnostics=diagnostics,
+                        )
+                        _record_candidate_ledger(
+                            candidate_ledger,
+                            config=config,
+                            day=day,
+                            ticker=ticker,
+                            decision="REJECT",
+                            reason=reason,
+                            support=support_summary,
+                            candidate=candidate,
+                            diagnostics=diagnostics,
                         )
                         continue
+                    post_earnings_cooldown_gate = _evaluate_post_earnings_cooldown_gate(
+                        fundamental_context["snapshot"],
+                        as_of=day,
+                        cooldown_days=post_earnings_cooldown_days,
+                    )
+                    if post_earnings_cooldown_gate is not None:
+                        _record_gate_stats(
+                            fundamental_stats,
+                            "csp_post_earnings_cooldown_gate",
+                            post_earnings_cooldown_gate,
+                        )
+                        if post_earnings_cooldown_gate.status == "REJECT":
+                            reason = _gate_primary_reason(
+                                "csp_post_earnings_cooldown_gate",
+                                post_earnings_cooldown_gate,
+                            )
+                            diagnostics = {
+                                **_fundamental_context_payload(fundamental_context),
+                                "post_earnings_cooldown_gate": asdict(
+                                    post_earnings_cooldown_gate
+                                ),
+                                "candidate": _candidate_diagnostics(candidate),
+                            }
+                            _reject(
+                                events,
+                                rejected_reason_counts,
+                                day,
+                                ticker,
+                                reason,
+                                support=support_summary,
+                                diagnostics=diagnostics,
+                            )
+                            _record_candidate_ledger(
+                                candidate_ledger,
+                                config=config,
+                                day=day,
+                                ticker=ticker,
+                                decision="REJECT",
+                                reason=reason,
+                                support=support_summary,
+                                candidate=candidate,
+                                diagnostics=diagnostics,
+                            )
+                            continue
 
-                scaled_candidate = _scaled_candidate(candidate, quantity)
-                available_cash_for_assignment = state.cash - state.reserved_assignment_cash
-                if available_cash_for_assignment < scaled_candidate.assignment_cash_required:
-                    _reject(
-                        events,
-                        rejected_reason_counts,
-                        day,
-                        ticker,
-                        "insufficient_cash_secured_capacity",
-                        support=support_summary,
-                        diagnostics={
-                            "cash": round(state.cash, 2),
-                            "reserved_assignment_cash": round(
-                                state.reserved_assignment_cash, 2
-                            ),
-                            "available_cash_for_assignment": round(
-                                available_cash_for_assignment, 2
-                            ),
-                            "new_assignment_cash_required": round(
-                                scaled_candidate.assignment_cash_required, 2
-                            ),
-                        },
+                daily_csp_candidates.append(
+                    DailyCspCandidate(
+                        ticker=ticker,
+                        candidate=candidate,
+                        support_summary=support_summary,
+                        fundamental_context=fundamental_context,
+                        candidate_earnings_gate=candidate_earnings_gate,
+                        post_earnings_cooldown_gate=post_earnings_cooldown_gate,
+                        quality_score=_candidate_quality_score(
+                            candidate,
+                            support_summary,
+                        ),
                     )
-                    continue
-                marked_equity = _mark_state_equity(state, latest_close, data, day)
-                portfolio_gate, portfolio_diagnostics = evaluate_portfolio_risk(
-                    ticker,
-                    scaled_candidate,
-                    _portfolio_snapshot(state, marked_equity),
-                    config,
-                    required=True,
                 )
-                if portfolio_gate is None or portfolio_gate.status == "REJECT":
-                    reason = (
-                        portfolio_gate.reasons[0]
-                        if portfolio_gate and portfolio_gate.reasons
-                        else "portfolio_risk_reject"
-                    )
-                    _reject(
-                        events,
-                        rejected_reason_counts,
-                        day,
-                        ticker,
-                        reason,
-                        support=support_summary,
-                        diagnostics={
-                            "portfolio_gate": asdict(portfolio_gate) if portfolio_gate else None,
-                            "portfolio_risk": portfolio_diagnostics,
-                        },
-                    )
-                    continue
 
-                opened = _open_short_put(
-                    state=state,
-                    candidate=scaled_candidate,
-                    day=day,
-                    ticker=ticker,
-                    contracts=quantity,
-                    option_fee_per_contract=option_fee_per_contract,
-                    execution_model=execution_model,
-                    support_summary=support_summary,
-                    trades=trades,
-                    events=events,
-                    diagnostics={
-                        **(
-                            _fundamental_context_payload(fundamental_context)
-                            if fundamental_context is not None
-                            else {}
-                        ),
-                        **(
-                            {"earnings_gate": asdict(candidate_earnings_gate)}
-                            if candidate_earnings_gate is not None
-                            else {}
-                        ),
-                        "portfolio_gate": asdict(portfolio_gate),
-                        "portfolio_risk": portfolio_diagnostics,
-                    },
-                )
-                if opened:
-                    orders_opened_today += 1
+            orders_opened_today += _execute_ranked_csp_candidates_for_day(
+                state=state,
+                candidates=daily_csp_candidates,
+                config=config,
+                csp_execution_config=csp_day_config,
+                day=day,
+                latest_close=latest_close,
+                data=data,
+                default_quantity=default_quantity,
+                max_new_orders=max(0, max_orders_per_day - orders_opened_today),
+                option_fee_per_contract=option_fee_per_contract,
+                execution_model=execution_model,
+                trades=trades,
+                events=events,
+                rejected_reason_counts=rejected_reason_counts,
+                candidate_ledger=candidate_ledger,
+            )
 
         for ticker, bar in todays_bars.items():
             latest_close[ticker] = bar.close
@@ -707,12 +911,16 @@ def run_backtest(
 
     state.equity = _mark_state_equity(state, latest_close, data, end)
     summary = _summarize_backtest(
+        config=config,
         state=state,
         equity_curve=equity_curve,
         trades=trades,
         events=events,
         rejected_reason_counts=rejected_reason_counts,
         data_issues=data_issues,
+        support_stats=support_stats,
+        market_regime_stats=market_regime_stats,
+        candidate_ledger=candidate_ledger,
     )
     fundamental_diagnostics = _finalize_fundamental_stats(
         fundamental_stats,
@@ -724,6 +932,12 @@ def run_backtest(
     ]
     summary["fundamental_warn_count"] = fundamental_diagnostics["warn_count"]
     summary["cc_risk_profile"] = cc_risk_profile
+    summary["post_earnings_cooldown_days"] = post_earnings_cooldown_days
+    summary["csp_exit_model"] = csp_exit_model
+    summary["cc_exit_model"] = cc_exit_model
+    summary["profit_take_pct_of_credit"] = profit_take_pct
+    summary["profit_take_price_field"] = profit_take_price_field
+    summary["manage_at_dte"] = manage_at_dte
     summary["execution_model"] = execution_model.model
     summary["execution_fill_policy"] = execution_model.fill_policy
     summary["execution_reference_price_source"] = execution_model.reference_price_source
@@ -744,9 +958,12 @@ def run_backtest(
             "Covered call risk gates use the configured backtest CC risk profile; warn_unknown_dates only downgrades unknown historical earnings/ex-dividend dates to WARN and still blocks known events inside the contract window.",
             "Day-aggregate option volume above zero is treated as necessary but not sufficient fillability evidence.",
             "Delta filters inferred from day-aggregate option prices are approximate in Phase 1.",
-            "No early assignment, early profit-taking, rolling, or 21-DTE management is modeled in Phase 1.",
-            "Short puts are held to expiration and settle by underlying close: close < strike assigns, otherwise expires worthless.",
-            "Covered calls are held to expiration and settle by underlying close: close > strike is called away, otherwise expires worthless.",
+            "No early assignment or rolling is modeled in Phase 1.",
+            "When configured, open short options can be closed early by a daily option mark profit target and/or manage-at-DTE rule before expiration settlement.",
+            "Candidate ledger records the CSP screener audit path for diagnostics; by default it records rejections and ranked/opened candidates, while skip rows are configurable.",
+            "CSP candidate generation scans the full daily universe before execution selection, so candidate supply is separated from max_orders_per_day capacity.",
+            "Short puts that remain open to expiration settle by underlying close: close < strike assigns, otherwise expires worthless.",
+            "Covered calls that remain open to expiration settle by underlying close: close > strike is called away, otherwise expires worthless.",
             "Corporate action or price-space breaks are guarded by large historical close-to-close and same-day open-to-previous-close ratio detection.",
             "When enabled, the price-space break classifier unblocks real_gap_move classifications and resets technical lookbacks after confirmed splits; unknown breaks remain conservatively blocked.",
             "Confirmed split reset uses the split execution date as the first bar in the new price space; exact OCC option contract adjustment through a split is not modeled and is surfaced as a data issue when encountered.",
@@ -784,12 +1001,22 @@ def run_backtest(
                 ticker: reset_date.isoformat()
                 for ticker, reset_date in sorted(price_space_reset_dates.items())
             },
-            "contract_quantity": quantity,
+            "contract_quantity": default_quantity,
+            "position_sizing": _position_sizing_config(config, default_quantity),
             "fundamental_profile": fundamental_profile,
             "cc_risk_profile": cc_risk_profile,
+            "post_earnings_cooldown_days": post_earnings_cooldown_days,
+            "management": {
+                "csp_exit_model": csp_exit_model,
+                "cc_exit_model": cc_exit_model,
+                "profit_take_pct_of_credit": profit_take_pct,
+                "profit_take_price_field": profit_take_price_field,
+                "manage_at_dte": manage_at_dte,
+            },
+            "market_regime": _market_regime_config(config),
             "fundamentals_cache_dir": (
                 str(fundamentals_cache_dir)
-                if fundamental_profile != "technical_only"
+                if needs_historical_fundamentals
                 else None
             ),
             "backtest_execution": execution_model.metadata(),
@@ -801,6 +1028,7 @@ def run_backtest(
         "data_issues": data_issues,
         "trades": trades,
         "events": events,
+        "candidate_ledger": candidate_ledger,
         "equity_curve": equity_curve,
         "open_positions": {
             "short_puts": [_serialize_short_put(position) for position in state.open_short_puts],
@@ -823,6 +1051,7 @@ def write_backtest_outputs(result: dict[str, Any], output_dir: Path) -> dict[str
         "summary": output_dir / "summary.json",
         "trades": output_dir / "trades.csv",
         "events": output_dir / "events.csv",
+        "candidate_ledger": output_dir / "candidate_ledger.csv",
         "equity_curve": output_dir / "equity_curve.csv",
         "report": output_dir / "report.md",
         "config": output_dir / "run_config_snapshot.json",
@@ -854,6 +1083,7 @@ def write_backtest_outputs(result: dict[str, Any], output_dir: Path) -> dict[str
     )
     _write_csv(paths["trades"], result["trades"])
     _write_csv(paths["events"], result["events"])
+    _write_csv(paths["candidate_ledger"], result.get("candidate_ledger", []))
     _write_csv(paths["equity_curve"], result["equity_curve"])
     paths["report"].write_text(_render_report(result), encoding="utf-8")
     return paths
@@ -873,6 +1103,8 @@ def _select_candidate_for_day(
     execution_model: BacktestExecutionModel,
     price_space_reset_date: date | None = None,
     price_space_reset_min_support_bars: int = 30,
+    support_stats: dict[str, Any] | None = None,
+    csp_regime_override: dict[str, Any] | None = None,
 ) -> tuple[CspCandidate | None, dict[str, Any] | None, dict[str, int]]:
     support_bars = [bar for bar in bars if bar.date < day]
     min_required = (
@@ -906,22 +1138,12 @@ def _select_candidate_for_day(
         "current_price": support.current_price,
         "atr14": support.atr14,
         "trend_passed": support.trend.passed,
+        "preconditions_passed": support.preconditions_passed,
+        "precondition_metrics": support.precondition_metrics,
+        "context_metrics": support.context_metrics,
         "trend_reasons": support.trend.reasons,
         "selected_zone": (
-            {
-                "method": support.selected_zone.method,
-                "center": support.selected_zone.center,
-                "bottom": support.selected_zone.bottom,
-                "top": support.selected_zone.top,
-                "score": support.selected_zone.score,
-                "touches": support.selected_zone.touches,
-                "rejections": support.selected_zone.rejections,
-                "last_touch_date": (
-                    support.selected_zone.last_touch_date.isoformat()
-                    if support.selected_zone.last_touch_date
-                    else None
-                ),
-            }
+            _support_zone_payload(support.selected_zone)
             if support.selected_zone
             else None
         ),
@@ -930,6 +1152,10 @@ def _select_candidate_for_day(
     if price_space_reset_date is not None:
         support_summary["price_space_reset_date"] = price_space_reset_date.isoformat()
         support_summary["post_reset_support_bar_count"] = len(support_bars)
+    if csp_regime_override is not None:
+        support_summary["csp_regime_override"] = csp_regime_override
+    if not support.preconditions_passed:
+        return None, support_summary, {"support_precondition_failed": 1}
     options = data.option_chain(
         ticker,
         day,
@@ -943,12 +1169,185 @@ def _select_candidate_for_day(
         execution_model=execution_model,
     )
     if not options:
+        _record_support_stats(
+            support_stats,
+            support=support,
+            candidate=None,
+            options_count=0,
+        )
         return None, support_summary, {"no_fillable_put_options": 1}
 
     result = evaluate_csp_candidates(options, support, config, risk_free_rate)
+    if result.candidate is not None:
+        support_summary["selected_zone"] = _support_zone_payload(
+            result.candidate.support_zone
+        )
+        support_summary["selection_policy"] = result.candidate.diagnostics.get(
+            "support_selection_policy"
+        )
+        support_summary["support_zone_rank"] = result.candidate.diagnostics.get(
+            "support_zone_rank"
+        )
+        support_summary["support_zones_considered"] = result.candidate.diagnostics.get(
+            "support_zones_considered"
+        )
+    _record_support_stats(
+        support_stats,
+        support=support,
+        candidate=result.candidate,
+        options_count=len(options),
+    )
     if result.candidate is None:
         return None, support_summary, result.rejection_summary or {"no_csp_candidate": 1}
     return result.candidate, support_summary, result.rejection_summary
+
+
+def _support_zone_payload(zone) -> dict[str, Any]:
+    return {
+        "method": zone.method,
+        "center": zone.center,
+        "bottom": zone.bottom,
+        "top": zone.top,
+        "score": zone.score,
+        "touches": zone.touches,
+        "rejections": zone.rejections,
+        "last_touch_date": (
+            zone.last_touch_date.isoformat() if zone.last_touch_date else None
+        ),
+    }
+
+
+def _new_support_stats() -> dict[str, Any]:
+    return {
+        "attempts": 0,
+        "with_zones": 0,
+        "trend_passed": 0,
+        "tradable": 0,
+        "candidate_found": 0,
+        "auto_trade_candidate": 0,
+        "options_count": 0,
+        "zone_count": 0,
+        "selected_score_sum": 0.0,
+        "spot_to_support_bottom_pct_sum": 0.0,
+        "spot_to_support_top_pct_sum": 0.0,
+        "spot_to_support_bottom_atr_sum": 0.0,
+        "spot_to_support_bottom_atr_count": 0,
+        "selected_method_counts": Counter(),
+        "selection_policy_counts": Counter(),
+    }
+
+
+def _record_support_stats(
+    stats: dict[str, Any] | None,
+    *,
+    support,
+    candidate: CspCandidate | None,
+    options_count: int,
+) -> None:
+    if stats is None:
+        return
+    stats["attempts"] += 1
+    stats["options_count"] += options_count
+    if support.zones:
+        stats["with_zones"] += 1
+        stats["zone_count"] += len(support.zones)
+    if support.trend.passed:
+        stats["trend_passed"] += 1
+
+    zone = candidate.support_zone if candidate is not None else support.selected_zone
+    if zone is not None and support.trend.passed and zone.score >= support.min_score_to_trade:
+        stats["tradable"] += 1
+    if candidate is not None:
+        stats["candidate_found"] += 1
+        if candidate.auto_trade:
+            stats["auto_trade_candidate"] += 1
+        policy = candidate.diagnostics.get("support_selection_policy")
+        if policy:
+            stats["selection_policy_counts"][str(policy)] += 1
+
+    if zone is None or support.current_price <= 0:
+        return
+    stats["selected_method_counts"][zone.method] += 1
+    stats["selected_score_sum"] += float(zone.score)
+    stats["spot_to_support_bottom_pct_sum"] += (
+        (support.current_price - zone.bottom) / support.current_price * 100.0
+    )
+    stats["spot_to_support_top_pct_sum"] += (
+        (support.current_price - zone.top) / support.current_price * 100.0
+    )
+    if support.atr14 and support.atr14 > 0:
+        stats["spot_to_support_bottom_atr_sum"] += (
+            (support.current_price - zone.bottom) / support.atr14
+        )
+        stats["spot_to_support_bottom_atr_count"] += 1
+
+
+def _finalize_support_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    attempts = int(stats.get("attempts") or 0)
+    with_zones = int(stats.get("with_zones") or 0)
+    candidate_found = int(stats.get("candidate_found") or 0)
+    auto_trade = int(stats.get("auto_trade_candidate") or 0)
+    selected_count = sum(stats["selected_method_counts"].values())
+    atr_count = int(stats.get("spot_to_support_bottom_atr_count") or 0)
+
+    def pct(count: int) -> float | None:
+        return round(count / attempts * 100.0, 4) if attempts else None
+
+    return {
+        "attempts": attempts,
+        "with_zones": with_zones,
+        "support_coverage_pct": pct(with_zones),
+        "trend_passed_pct": pct(int(stats.get("trend_passed") or 0)),
+        "tradable_pct": pct(int(stats.get("tradable") or 0)),
+        "candidate_found": candidate_found,
+        "candidate_found_pct": pct(candidate_found),
+        "auto_trade_candidate": auto_trade,
+        "auto_trade_candidate_pct": pct(auto_trade),
+        "average_options_count": (
+            round(float(stats.get("options_count") or 0) / attempts, 4)
+            if attempts
+            else None
+        ),
+        "average_zone_count": (
+            round(float(stats.get("zone_count") or 0) / attempts, 4)
+            if attempts
+            else None
+        ),
+        "average_selected_score": (
+            round(float(stats.get("selected_score_sum") or 0.0) / selected_count, 4)
+            if selected_count
+            else None
+        ),
+        "average_spot_to_support_bottom_pct": (
+            round(
+                float(stats.get("spot_to_support_bottom_pct_sum") or 0.0)
+                / selected_count,
+                4,
+            )
+            if selected_count
+            else None
+        ),
+        "average_spot_to_support_top_pct": (
+            round(
+                float(stats.get("spot_to_support_top_pct_sum") or 0.0)
+                / selected_count,
+                4,
+            )
+            if selected_count
+            else None
+        ),
+        "average_spot_to_support_bottom_atr": (
+            round(
+                float(stats.get("spot_to_support_bottom_atr_sum") or 0.0)
+                / atr_count,
+                4,
+            )
+            if atr_count
+            else None
+        ),
+        "selected_method_counts": dict(stats["selected_method_counts"].most_common()),
+        "selection_policy_counts": dict(stats["selection_policy_counts"].most_common()),
+    }
 
 
 def _open_short_put(
@@ -1445,6 +1844,236 @@ def _open_short_call(
     return True
 
 
+def _manage_open_short_puts_for_day(
+    *,
+    state: BacktestState,
+    data: HistoricalDataStore,
+    day: date,
+    latest_close: dict[str, float],
+    trades: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    execution_model: BacktestExecutionModel,
+    option_fee_per_contract: float,
+    risk_free_rate: float,
+    exit_model: str,
+    profit_take_pct: float,
+    profit_take_price_field: str,
+    manage_at_dte: int,
+) -> None:
+    if exit_model == "hold_to_expiration":
+        return
+    still_open: list[ShortPutPosition] = []
+    for position in state.open_short_puts:
+        if position.expiration <= day:
+            still_open.append(position)
+            continue
+        close_reason = _option_management_close_reason(
+            position=position,
+            day=day,
+            exit_model=exit_model,
+            profit_take_pct=profit_take_pct,
+            profit_take_price_field=profit_take_price_field,
+            manage_at_dte=manage_at_dte,
+            data=data,
+            latest_close=latest_close,
+            risk_free_rate=risk_free_rate,
+        )
+        if close_reason is None:
+            still_open.append(position)
+            continue
+        mark = close_reason["mark"]
+        close_price = entry_fill_price(mark, execution_model, side="buy")
+        if close_price is None or close_price < 0:
+            still_open.append(position)
+            continue
+        close_debit = close_price * 100.0 * position.contracts
+        close_fees = option_fee_per_contract * position.contracts
+        realized_pnl = position.gross_credit - position.fees - close_debit - close_fees
+        state.cash -= close_debit + close_fees
+        state.total_fees += close_fees
+        state.realized_option_pnl += realized_pnl
+        status = (
+            "CLOSED_PROFIT_TARGET"
+            if close_reason["reason"] == "profit_target"
+            else "CLOSED_MANAGE_DTE"
+        )
+        _close_trade(
+            trades,
+            position.trade_id,
+            status=status,
+            close_date=day,
+            underlying_close=latest_close.get(position.ticker, 0.0),
+            realized_option_pnl=realized_pnl,
+            close_price=close_price,
+            close_fees=close_fees,
+            close_reason=close_reason["reason"],
+        )
+        events.append(
+            {
+                "date": day.isoformat(),
+                "ticker": position.ticker,
+                "type": status,
+                "trade_id": position.trade_id,
+                "symbol": position.symbol,
+                "close_price": close_price,
+                "close_debit": close_debit,
+                "fees": close_fees,
+                "realized_option_pnl": round(realized_pnl, 2),
+                "reason": close_reason["reason"],
+                "dte": close_reason["dte"],
+                "profit_take_target_price": close_reason["target_price"],
+                "price_field": profit_take_price_field,
+            }
+        )
+    state.open_short_puts = still_open
+
+
+def _manage_open_short_calls_for_day(
+    *,
+    state: BacktestState,
+    data: HistoricalDataStore,
+    day: date,
+    latest_close: dict[str, float],
+    trades: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    execution_model: BacktestExecutionModel,
+    option_fee_per_contract: float,
+    risk_free_rate: float,
+    exit_model: str,
+    profit_take_pct: float,
+    profit_take_price_field: str,
+    manage_at_dte: int,
+) -> None:
+    if exit_model == "hold_to_expiration":
+        return
+    still_open: list[ShortCallPosition] = []
+    for position in state.open_short_calls:
+        if position.expiration <= day:
+            still_open.append(position)
+            continue
+        close_reason = _option_management_close_reason(
+            position=position,
+            day=day,
+            exit_model=exit_model,
+            profit_take_pct=profit_take_pct,
+            profit_take_price_field=profit_take_price_field,
+            manage_at_dte=manage_at_dte,
+            data=data,
+            latest_close=latest_close,
+            risk_free_rate=risk_free_rate,
+        )
+        if close_reason is None:
+            still_open.append(position)
+            continue
+        mark = close_reason["mark"]
+        close_price = entry_fill_price(mark, execution_model, side="buy")
+        if close_price is None or close_price < 0:
+            still_open.append(position)
+            continue
+        close_debit = close_price * 100.0 * position.contracts
+        close_fees = option_fee_per_contract * position.contracts
+        realized_pnl = position.gross_credit - position.fees - close_debit - close_fees
+        state.cash -= close_debit + close_fees
+        state.total_fees += close_fees
+        state.realized_option_pnl += realized_pnl
+        stock = state.stocks.setdefault(
+            position.ticker,
+            StockPosition(ticker=position.ticker),
+        )
+        stock.premium_credit_total += realized_pnl
+        status = (
+            "CALL_CLOSED_PROFIT_TARGET"
+            if close_reason["reason"] == "profit_target"
+            else "CALL_CLOSED_MANAGE_DTE"
+        )
+        _close_trade(
+            trades,
+            position.trade_id,
+            status=status,
+            close_date=day,
+            underlying_close=latest_close.get(position.ticker, 0.0),
+            realized_option_pnl=realized_pnl,
+            close_price=close_price,
+            close_fees=close_fees,
+            close_reason=close_reason["reason"],
+        )
+        events.append(
+            {
+                "date": day.isoformat(),
+                "ticker": position.ticker,
+                "type": status,
+                "trade_id": position.trade_id,
+                "symbol": position.symbol,
+                "close_price": close_price,
+                "close_debit": close_debit,
+                "fees": close_fees,
+                "realized_option_pnl": round(realized_pnl, 2),
+                "reason": close_reason["reason"],
+                "dte": close_reason["dte"],
+                "profit_take_target_price": close_reason["target_price"],
+                "price_field": profit_take_price_field,
+            }
+        )
+    state.open_short_calls = still_open
+
+
+def _option_management_close_reason(
+    *,
+    position: ShortPutPosition | ShortCallPosition,
+    day: date,
+    exit_model: str,
+    profit_take_pct: float,
+    profit_take_price_field: str,
+    manage_at_dte: int,
+    data: HistoricalDataStore,
+    latest_close: dict[str, float],
+    risk_free_rate: float,
+) -> dict[str, Any] | None:
+    dte = (position.expiration - day).days
+    initial_dte = (position.expiration - position.entry_date).days
+    mark = data.option_mark(
+        position.symbol,
+        day,
+        price_field=profit_take_price_field,
+        stock_price=latest_close.get(position.ticker),
+        risk_free_rate=risk_free_rate,
+    )
+    target_price = position.entry_price * (1.0 - profit_take_pct)
+    allows_profit_target = exit_model in {
+        "close_at_50pct_profit_or_expiry",
+        "close_at_50pct_profit_or_manage_dte_or_expiry",
+    }
+    if (
+        allows_profit_target
+        and mark is not None
+        and mark.mid <= target_price
+    ):
+        return {
+            "reason": "profit_target",
+            "mark": mark,
+            "dte": dte,
+            "target_price": round(target_price, 6),
+        }
+    allows_manage_dte = exit_model in {
+        "manage_at_dte_or_expiry",
+        "close_at_50pct_profit_or_manage_dte_or_expiry",
+    }
+    if (
+        allows_manage_dte
+        and manage_at_dte > 0
+        and initial_dte > manage_at_dte
+        and dte <= manage_at_dte
+        and mark is not None
+    ):
+        return {
+            "reason": "manage_dte",
+            "mark": mark,
+            "dte": dte,
+            "target_price": round(target_price, 6),
+        }
+    return None
+
+
 def _resolve_expiring_short_puts(
     *,
     state: BacktestState,
@@ -1718,6 +2347,24 @@ def _daily_equity_row(
     latest_close: dict[str, float],
 ) -> dict[str, Any]:
     exposure = _stock_exposure_metrics(state, latest_close)
+    reserved_assignment_cash = state.reserved_assignment_cash
+    capital_deployed = reserved_assignment_cash + float(exposure["stock_value"])
+    capital_utilization_pct = (
+        round(capital_deployed / state.equity * 100.0, 4)
+        if state.equity > 0
+        else None
+    )
+    reserved_assignment_cash_pct = (
+        round(reserved_assignment_cash / state.equity * 100.0, 4)
+        if state.equity > 0
+        else None
+    )
+    assigned_stock_utilization_pct = (
+        round(float(exposure["stock_value"]) / state.equity * 100.0, 4)
+        if state.equity > 0
+        else None
+    )
+    cash_pct = round(state.cash / state.equity * 100.0, 4) if state.equity > 0 else None
     return {
         "date": day.isoformat(),
         "cash": round(state.cash, 2),
@@ -1730,15 +2377,16 @@ def _daily_equity_row(
         "stock_unrealized_pnl_after_premiums": exposure[
             "stock_unrealized_pnl_after_premiums"
         ],
-        "reserved_assignment_cash": round(state.reserved_assignment_cash, 2),
+        "reserved_assignment_cash": round(reserved_assignment_cash, 2),
+        "capital_deployed": round(capital_deployed, 2),
         "open_short_puts": len(state.open_short_puts),
         "open_short_calls": len(state.open_short_calls),
         "long_stock_positions": sum(1 for stock in state.stocks.values() if stock.shares > 0),
-        "capital_utilization_pct": (
-            round(state.reserved_assignment_cash / state.equity * 100.0, 4)
-            if state.equity > 0
-            else None
-        ),
+        "capital_utilization_pct": capital_utilization_pct,
+        "reserved_assignment_cash_pct": reserved_assignment_cash_pct,
+        "assigned_stock_utilization_pct": assigned_stock_utilization_pct,
+        "cash_pct": cash_pct,
+        "cash_idle": capital_deployed <= 0,
     }
 
 
@@ -1837,6 +2485,333 @@ def _portfolio_snapshot(state: BacktestState, equity: float) -> PortfolioSnapsho
     )
 
 
+def _load_market_regime_bars(
+    *,
+    data: HistoricalDataStore,
+    symbols: set[str],
+    history_start: date,
+    end: date,
+) -> tuple[dict[str, list[PriceBar]], list[dict[str, Any]]]:
+    bars_by_symbol: dict[str, list[PriceBar]] = {}
+    issues: list[dict[str, Any]] = []
+    for symbol in sorted(symbols):
+        try:
+            loaded = data.load_stock_bars([symbol], history_start, end)
+        except Exception as exc:
+            bars_by_symbol[symbol] = []
+            issues.append(
+                {
+                    "date": history_start.isoformat(),
+                    "ticker": symbol,
+                    "type": "market_regime_indicator_unavailable",
+                    "details": {
+                        "symbol": symbol,
+                        "history_start": history_start.isoformat(),
+                        "end": end.isoformat(),
+                        "error": str(exc),
+                    },
+                }
+            )
+            continue
+        bars_by_symbol[symbol] = loaded.get(symbol, [])
+    return bars_by_symbol, issues
+
+
+def _market_regime_config(config: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(config.get("market_regime") or {})
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "market_symbol": str(cfg.get("market_symbol") or "SPY").upper(),
+        "require_market_price_above_sma200": bool(
+            cfg.get("require_market_price_above_sma200", False)
+        ),
+        "require_market_sma200_slope_non_negative": bool(
+            cfg.get("require_market_sma200_slope_non_negative", False)
+        ),
+        "market_sma200_slope_lookback_days": int(
+            cfg.get("market_sma200_slope_lookback_days", 20)
+        ),
+        "reject_unknown_market_trend": bool(
+            cfg.get("reject_unknown_market_trend", True)
+        ),
+        "vix_enabled": bool(cfg.get("vix_enabled", False)),
+        "vix_symbol": str(cfg.get("vix_symbol") or "I:VIX").upper(),
+        "min_vix": float(cfg.get("min_vix", 0.0)),
+        "max_vix": float(cfg.get("max_vix", 999.0)),
+        "reject_unknown_vix": bool(cfg.get("reject_unknown_vix", False)),
+    }
+
+
+def _market_regime_symbols(config: dict[str, Any]) -> set[str]:
+    cfg = _market_regime_config(config)
+    conditional_cfg = _conditional_csp_overrides_config(config)
+    if not cfg["enabled"] and not conditional_cfg["enabled"]:
+        return set()
+    symbols = {cfg["market_symbol"]}
+    if cfg["vix_enabled"]:
+        symbols.add(cfg["vix_symbol"])
+    return {symbol for symbol in symbols if symbol}
+
+
+def _evaluate_market_regime_gate(
+    config: dict[str, Any],
+    bars_by_symbol: dict[str, list[PriceBar]],
+    day: date,
+) -> GateResult:
+    cfg = _market_regime_config(config)
+    if not cfg["enabled"]:
+        return GateResult(status="PASS", reasons=["market_regime_disabled"], warnings=[])
+    reasons: list[str] = []
+    warnings: list[str] = []
+    market_payload = _market_trend_payload(
+        bars_by_symbol.get(cfg["market_symbol"], []),
+        day=day,
+        slope_lookback=int(cfg["market_sma200_slope_lookback_days"]),
+    )
+    if cfg["require_market_price_above_sma200"]:
+        if market_payload["sma200"] is None:
+            reason = f"market_sma200_unknown:{cfg['market_symbol']}"
+            if cfg["reject_unknown_market_trend"]:
+                reasons.append(reason)
+            else:
+                warnings.append(reason)
+        elif market_payload["close"] <= market_payload["sma200"]:
+            reasons.append(f"market_price_below_sma200:{cfg['market_symbol']}")
+    if cfg["require_market_sma200_slope_non_negative"]:
+        if market_payload["sma200_slope"] is None:
+            reason = f"market_sma200_slope_unknown:{cfg['market_symbol']}"
+            if cfg["reject_unknown_market_trend"]:
+                reasons.append(reason)
+            else:
+                warnings.append(reason)
+        elif market_payload["sma200_slope"] < 0:
+            reasons.append(f"market_sma200_slope_negative:{cfg['market_symbol']}")
+
+    vix_payload = None
+    if cfg["vix_enabled"]:
+        vix_payload = _latest_bar_payload(
+            bars_by_symbol.get(cfg["vix_symbol"], []),
+            day=day,
+        )
+        vix_close = vix_payload.get("close") if vix_payload else None
+        if vix_close is None:
+            reason = f"vix_unknown:{cfg['vix_symbol']}"
+            if cfg["reject_unknown_vix"]:
+                reasons.append(reason)
+            else:
+                warnings.append(reason)
+        elif float(vix_close) < cfg["min_vix"]:
+            reasons.append(f"vix_below_min:{float(vix_close):.2f}<{cfg['min_vix']:.2f}")
+        elif float(vix_close) > cfg["max_vix"]:
+            reasons.append(f"vix_above_max:{float(vix_close):.2f}>{cfg['max_vix']:.2f}")
+
+    status = "REJECT" if reasons else ("WARN" if warnings else "PASS")
+    if market_payload.get("as_of") is not None:
+        warnings.append(
+            "market_trend:"
+            f"{cfg['market_symbol']}@{market_payload['as_of']}"
+            f":close={market_payload['close']}"
+            f":sma200={market_payload['sma200']}"
+            f":slope={market_payload['sma200_slope']}"
+        )
+    if vix_payload is not None:
+        warnings.append(
+            "vix:"
+            f"{cfg['vix_symbol']}@{vix_payload['as_of']}"
+            f":close={vix_payload['close']}"
+        )
+    return GateResult(
+        status=status,
+        reasons=reasons or ["market_regime_passed"],
+        warnings=warnings,
+    )
+
+
+def _market_trend_payload(
+    bars: list[PriceBar],
+    *,
+    day: date,
+    slope_lookback: int,
+) -> dict[str, Any]:
+    prior = [bar for bar in bars if bar.date < day]
+    if not prior:
+        return {"close": None, "as_of": None, "sma200": None, "sma200_slope": None}
+    closes = [bar.close for bar in prior]
+    sma200_series = sma_values(closes, 200)
+    sma200 = sma200_series[-1]
+    old_sma = (
+        sma200_series[-1 - slope_lookback]
+        if len(sma200_series) > slope_lookback
+        else None
+    )
+    slope = None if sma200 is None or old_sma is None else sma200 - old_sma
+    return {
+        "close": prior[-1].close,
+        "as_of": prior[-1].date.isoformat(),
+        "sma200": round(sma200, 6) if sma200 is not None else None,
+        "sma200_slope": round(slope, 6) if slope is not None else None,
+    }
+
+
+def _latest_bar_payload(
+    bars: list[PriceBar],
+    *,
+    day: date,
+) -> dict[str, Any] | None:
+    prior = [bar for bar in bars if bar.date < day]
+    if not prior:
+        return None
+    bar = prior[-1]
+    return {
+        "as_of": bar.date.isoformat(),
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": bar.volume,
+    }
+
+
+def _conditional_csp_overrides_config(config: dict[str, Any]) -> dict[str, Any]:
+    market_cfg = dict(config.get("market_regime") or {})
+    cfg = dict(market_cfg.get("conditional_csp_overrides") or {})
+    below_cfg = dict(cfg.get("when_market_price_below_sma200") or {})
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "market_symbol": str(
+            cfg.get("market_symbol") or market_cfg.get("market_symbol") or "SPY"
+        ).upper(),
+        "slope_lookback_days": int(
+            cfg.get(
+                "market_sma200_slope_lookback_days",
+                market_cfg.get("market_sma200_slope_lookback_days", 20),
+            )
+        ),
+        "when_market_price_below_sma200": {
+            "patch": dict(below_cfg.get("patch") or {}),
+        },
+    }
+
+
+def _conditional_csp_config_for_day(
+    config: dict[str, Any],
+    bars_by_symbol: dict[str, list[PriceBar]],
+    day: date,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    cfg = _conditional_csp_overrides_config(config)
+    if not cfg["enabled"]:
+        return config, None
+    market_symbol = cfg["market_symbol"]
+    market_payload = _market_trend_payload(
+        bars_by_symbol.get(market_symbol, []),
+        day=day,
+        slope_lookback=int(cfg["slope_lookback_days"]),
+    )
+    diagnostics: dict[str, Any] = {
+        "enabled": True,
+        "market_symbol": market_symbol,
+        "condition": "market_price_below_sma200",
+        "market_trend": market_payload,
+        "applied": False,
+        "patch": {},
+    }
+    close = market_payload.get("close")
+    sma200 = market_payload.get("sma200")
+    if close is None or sma200 is None:
+        diagnostics["reason"] = "market_trend_unknown"
+        return config, diagnostics
+    if float(close) > float(sma200):
+        diagnostics["reason"] = "market_price_above_sma200"
+        return config, diagnostics
+    patch = cfg["when_market_price_below_sma200"]["patch"]
+    diagnostics["applied"] = bool(patch)
+    diagnostics["patch"] = patch
+    diagnostics["reason"] = "market_price_below_sma200"
+    if not patch:
+        return config, diagnostics
+    return _apply_dotted_overrides(config, patch), diagnostics
+
+
+def _apply_dotted_overrides(
+    config: dict[str, Any],
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    patched = copy.deepcopy(config)
+    for path, value in patch.items():
+        target: Any = patched
+        parts = str(path).split(".")
+        if not parts:
+            continue
+        for part in parts[:-1]:
+            if not isinstance(target, dict) or part not in target:
+                raise ValueError(f"Unknown conditional CSP override path: {path}")
+            target = target[part]
+        leaf = parts[-1]
+        if not isinstance(target, dict) or leaf not in target:
+            raise ValueError(f"Unknown conditional CSP override path: {path}")
+        target[leaf] = value
+    return patched
+
+
+def _new_market_regime_stats() -> dict[str, Any]:
+    return {
+        "days": 0,
+        "status_counts": Counter(),
+        "reason_counts": Counter(),
+    }
+
+
+def _record_market_regime_stats(
+    stats: dict[str, Any],
+    gate: GateResult,
+) -> None:
+    stats["days"] += 1
+    stats["status_counts"][gate.status] += 1
+    for reason in gate.reasons:
+        stats["reason_counts"][reason] += 1
+
+
+def _finalize_market_regime_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    days = int(stats.get("days") or 0)
+    reject_days = int(stats["status_counts"].get("REJECT", 0))
+    return {
+        "days": days,
+        "reject_days": reject_days,
+        "reject_day_pct": round(reject_days / days * 100.0, 4) if days else 0.0,
+        "status_counts": dict(sorted(stats["status_counts"].items())),
+        "reason_counts": dict(stats["reason_counts"].most_common()),
+    }
+
+
+def _management_exit_models(config: dict[str, Any]) -> tuple[str, str]:
+    cfg = dict(config.get("management") or {})
+    csp_exit_model = str(cfg.get("csp_exit_model") or "hold_to_expiration")
+    cc_exit_model = str(cfg.get("cc_exit_model") or "hold_to_expiration")
+    for model in (csp_exit_model, cc_exit_model):
+        if model not in EXIT_MODELS:
+            allowed = ", ".join(sorted(EXIT_MODELS))
+            raise ValueError(f"unsupported management exit model {model!r}; expected one of {allowed}")
+    return csp_exit_model, cc_exit_model
+
+
+def _management_profit_take_pct(config: dict[str, Any]) -> float:
+    value = float(
+        (config.get("management") or {}).get("profit_take_pct_of_credit", 0.50)
+    )
+    return min(max(value, 0.0), 1.0)
+
+
+def _management_profit_take_price_field(config: dict[str, Any]) -> str:
+    field = str((config.get("management") or {}).get("profit_take_price_field") or "low")
+    if field not in {"open", "high", "low", "close"}:
+        raise ValueError(f"unsupported management.profit_take_price_field {field!r}")
+    return field
+
+
+def _management_manage_at_dte(config: dict[str, Any]) -> int:
+    return max(0, int((config.get("management") or {}).get("manage_at_dte", 21)))
+
+
 def _normalize_fundamental_profile(profile: str) -> str:
     normalized = str(profile or "technical_only").strip().lower()
     if normalized not in FUNDAMENTAL_PROFILES:
@@ -1896,8 +2871,9 @@ def _fundamental_context(
     day: date,
     bars: list[PriceBar],
     config: dict[str, Any],
+    require_snapshot: bool = False,
 ) -> dict[str, Any] | None:
-    if profile == "technical_only" or historical_fundamentals is None:
+    if (profile == "technical_only" and not require_snapshot) or historical_fundamentals is None:
         return None
     try:
         snapshot = historical_fundamentals.snapshot(ticker, day, bars)
@@ -1977,11 +2953,51 @@ def _should_block_fundamental_gate(
             and _reason_has_strict_pit_provenance(reason, snapshot)
             for reason in gate.reasons
         )
+    if profile == "fundamentals_moderate":
+        return any(_is_moderate_fundamental_reason(reason) for reason in gate.reasons)
     return False
 
 
 def _should_block_csp_earnings_gate(profile: str, gate: GateResult) -> bool:
     return profile == "fundamentals_strict_all" and gate.status == "REJECT"
+
+
+def _evaluate_post_earnings_cooldown_gate(
+    snapshot: FundamentalSnapshot,
+    *,
+    as_of: date,
+    cooldown_days: int,
+) -> GateResult | None:
+    if cooldown_days <= 0:
+        return None
+    previous = snapshot.previous_earnings_date
+    if previous is None:
+        return GateResult(
+            status="WARN",
+            reasons=["previous_earnings_date_unknown"],
+            warnings=["cannot_evaluate_post_earnings_cooldown"],
+        )
+    if previous > as_of:
+        return GateResult(
+            status="WARN",
+            reasons=["previous_earnings_date_after_scan_date"],
+            warnings=[f"previous_earnings_date:{previous.isoformat()}"],
+        )
+    trading_days = nyse_trading_days_after(previous, as_of)
+    if trading_days <= cooldown_days:
+        return GateResult(
+            status="REJECT",
+            reasons=[f"post_earnings_cooldown_{trading_days}_lte_{cooldown_days}"],
+            warnings=[
+                f"previous_earnings_date:{previous.isoformat()}",
+                f"trading_days_since_previous_earnings:{trading_days}",
+            ],
+        )
+    return GateResult(
+        status="PASS",
+        reasons=[f"post_earnings_cooldown_clear_{trading_days}_gt_{cooldown_days}"],
+        warnings=[f"previous_earnings_date:{previous.isoformat()}"],
+    )
 
 
 def _covered_call_blocking_gate(
@@ -1994,13 +3010,21 @@ def _covered_call_blocking_gate(
             return earnings_gate
         if ex_dividend_gate.status == "REJECT":
             return ex_dividend_gate
-    if profile == "fundamentals_strict_financials" and ex_dividend_gate.status == "REJECT":
+    if profile in {"fundamentals_strict_financials", "fundamentals_moderate"} and (
+        ex_dividend_gate.status == "REJECT"
+    ):
         return ex_dividend_gate
     return None
 
 
 def _is_strict_financial_reason(reason: str) -> bool:
     return any(reason.startswith(prefix) for prefix in STRICT_FINANCIAL_REASON_PREFIXES)
+
+
+def _is_moderate_fundamental_reason(reason: str) -> bool:
+    if reason in MODERATE_FUNDAMENTAL_HARD_REASONS:
+        return True
+    return any(reason.startswith(prefix) for prefix in MODERATE_FUNDAMENTAL_REASON_PREFIXES)
 
 
 def _reason_has_strict_pit_provenance(
@@ -2058,6 +3082,7 @@ def _snapshot_payload(snapshot: FundamentalSnapshot) -> dict[str, Any]:
         "quarterly_net_income": snapshot.quarterly_net_income,
         "annual_net_income": snapshot.annual_net_income,
         "next_earnings_date": snapshot.next_earnings_date,
+        "previous_earnings_date": snapshot.previous_earnings_date,
         "recent_move_pct": snapshot.recent_move_pct,
         "provenance": provenance_payload(snapshot),
     }
@@ -2267,6 +3292,353 @@ def _scaled_candidate(candidate: CspCandidate, quantity: int) -> CspCandidate:
     )
 
 
+def _position_sizing_config(config: dict[str, Any], default_quantity: int) -> dict[str, Any]:
+    sizing = dict(config.get("backtest_position_sizing") or {})
+    mode = str(sizing.get("mode") or "fixed").strip().lower()
+    return {
+        "mode": mode,
+        "default_contract_quantity": default_quantity,
+        "target_equity_pct": sizing.get("target_equity_pct"),
+        "target_dollars": sizing.get("target_dollars"),
+        "min_contracts": sizing.get("min_contracts", 1),
+        "max_contracts": sizing.get("max_contracts"),
+    }
+
+
+def _csp_contract_quantity(
+    config: dict[str, Any],
+    candidate: CspCandidate,
+    *,
+    equity: float,
+    default_quantity: int,
+) -> tuple[int, dict[str, Any]]:
+    sizing = _position_sizing_config(config, default_quantity)
+    mode = str(sizing["mode"])
+    contract_notional = candidate.option.strike * 100.0
+    min_contracts = max(0, int(sizing.get("min_contracts") or 0))
+    max_contracts = _optional_positive_int(sizing.get("max_contracts"))
+    target_dollars: float | None = None
+    if mode == "fixed":
+        quantity = default_quantity
+    elif mode == "equity_pct":
+        target_pct = float(sizing.get("target_equity_pct") or 0.0)
+        target_dollars = max(0.0, equity * target_pct)
+        quantity = int(target_dollars // contract_notional) if contract_notional > 0 else 0
+    elif mode == "fixed_dollars":
+        target_dollars = max(0.0, float(sizing.get("target_dollars") or 0.0))
+        quantity = int(target_dollars // contract_notional) if contract_notional > 0 else 0
+    else:
+        raise ValueError(f"unsupported backtest_position_sizing.mode {mode!r}")
+    if quantity < min_contracts:
+        quantity = min_contracts
+    if max_contracts is not None:
+        quantity = min(quantity, max_contracts)
+    quantity = max(0, quantity)
+    return quantity, {
+        **sizing,
+        "equity": round(equity, 2),
+        "contract_notional": round(contract_notional, 2),
+        "target_dollars": round(target_dollars, 2) if target_dollars is not None else None,
+        "contracts": quantity,
+        "assignment_cash_required": round(contract_notional * quantity, 2),
+    }
+
+
+def _rank_daily_csp_candidates(
+    candidates: list[DailyCspCandidate],
+) -> list[DailyCspCandidate]:
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            -item.quality_score,
+            -item.candidate.weekly_return_on_strike_pct,
+            item.candidate.assignment_cash_required,
+            item.ticker,
+            item.candidate.option.expiration,
+            item.candidate.option.strike,
+        ),
+    )
+    for index, item in enumerate(ranked, start=1):
+        item.rank_within_day = index
+    return ranked
+
+
+def _execute_ranked_csp_candidates_for_day(
+    *,
+    state: BacktestState,
+    candidates: list[DailyCspCandidate],
+    config: dict[str, Any],
+    csp_execution_config: dict[str, Any] | None = None,
+    day: date,
+    latest_close: dict[str, float],
+    data: HistoricalDataStore,
+    default_quantity: int,
+    max_new_orders: int,
+    option_fee_per_contract: float,
+    execution_model: BacktestExecutionModel,
+    trades: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    rejected_reason_counts: Counter[str],
+    candidate_ledger: list[dict[str, Any]],
+) -> int:
+    execution_config = csp_execution_config or config
+    opened_count = 0
+    for item in _rank_daily_csp_candidates(candidates):
+        ticker = item.ticker
+        candidate = item.candidate
+        if opened_count >= max_new_orders:
+            _record_candidate_ledger(
+                candidate_ledger,
+                config=execution_config,
+                day=day,
+                ticker=ticker,
+                decision="CANDIDATE",
+                reason="not_selected_daily_order_limit",
+                support=item.support_summary,
+                candidate=candidate,
+                diagnostics=_candidate_diagnostics(candidate),
+                selected_for_backtest=False,
+                selection_stage="capacity",
+                rank_within_day=item.rank_within_day,
+                quality_score=item.quality_score,
+                cash_required=candidate.assignment_cash_required,
+                cash_available_at_decision=round(
+                    state.cash - state.reserved_assignment_cash,
+                    2,
+                ),
+            )
+            continue
+
+        marked_equity = _mark_state_equity(state, latest_close, data, day)
+        quantity, position_sizing = _csp_contract_quantity(
+            execution_config,
+            candidate,
+            equity=marked_equity,
+            default_quantity=default_quantity,
+        )
+        if quantity < 1:
+            diagnostics = {
+                "position_sizing": position_sizing,
+                "candidate": _candidate_diagnostics(candidate),
+            }
+            _reject(
+                events,
+                rejected_reason_counts,
+                day,
+                ticker,
+                "position_size_below_one_contract",
+                support=item.support_summary,
+                diagnostics=diagnostics,
+            )
+            _record_candidate_ledger(
+                candidate_ledger,
+                config=execution_config,
+                day=day,
+                ticker=ticker,
+                decision="REJECT",
+                reason="position_size_below_one_contract",
+                support=item.support_summary,
+                candidate=candidate,
+                diagnostics=diagnostics,
+                selected_for_backtest=False,
+                selection_stage="sizing",
+                rank_within_day=item.rank_within_day,
+                quality_score=item.quality_score,
+                cash_required=position_sizing.get("assignment_cash_required"),
+                cash_available_at_decision=round(
+                    state.cash - state.reserved_assignment_cash,
+                    2,
+                ),
+            )
+            continue
+
+        scaled_candidate = _scaled_candidate(candidate, quantity)
+        available_cash_for_assignment = state.cash - state.reserved_assignment_cash
+        if available_cash_for_assignment < scaled_candidate.assignment_cash_required:
+            diagnostics = {
+                "cash": round(state.cash, 2),
+                "reserved_assignment_cash": round(state.reserved_assignment_cash, 2),
+                "available_cash_for_assignment": round(
+                    available_cash_for_assignment,
+                    2,
+                ),
+                "new_assignment_cash_required": round(
+                    scaled_candidate.assignment_cash_required,
+                    2,
+                ),
+                "position_sizing": position_sizing,
+            }
+            _reject(
+                events,
+                rejected_reason_counts,
+                day,
+                ticker,
+                "insufficient_cash_secured_capacity",
+                support=item.support_summary,
+                diagnostics=diagnostics,
+            )
+            _record_candidate_ledger(
+                candidate_ledger,
+                config=execution_config,
+                day=day,
+                ticker=ticker,
+                decision="REJECT",
+                reason="insufficient_cash_secured_capacity",
+                support=item.support_summary,
+                candidate=scaled_candidate,
+                diagnostics=diagnostics,
+                selected_for_backtest=False,
+                selection_stage="capital",
+                rank_within_day=item.rank_within_day,
+                quality_score=item.quality_score,
+                cash_required=scaled_candidate.assignment_cash_required,
+                cash_available_at_decision=round(available_cash_for_assignment, 2),
+            )
+            continue
+
+        portfolio_gate, portfolio_diagnostics = evaluate_portfolio_risk(
+            ticker,
+            scaled_candidate,
+            _portfolio_snapshot(state, marked_equity),
+            execution_config,
+            required=True,
+        )
+        if portfolio_gate is None or portfolio_gate.status == "REJECT":
+            reason = (
+                portfolio_gate.reasons[0]
+                if portfolio_gate and portfolio_gate.reasons
+                else "portfolio_risk_reject"
+            )
+            diagnostics = {
+                "portfolio_gate": asdict(portfolio_gate) if portfolio_gate else None,
+                "portfolio_risk": portfolio_diagnostics,
+            }
+            _reject(
+                events,
+                rejected_reason_counts,
+                day,
+                ticker,
+                reason,
+                support=item.support_summary,
+                diagnostics=diagnostics,
+            )
+            _record_candidate_ledger(
+                candidate_ledger,
+                config=execution_config,
+                day=day,
+                ticker=ticker,
+                decision="REJECT",
+                reason=reason,
+                support=item.support_summary,
+                candidate=scaled_candidate,
+                diagnostics=diagnostics,
+                selected_for_backtest=False,
+                selection_stage="portfolio",
+                rank_within_day=item.rank_within_day,
+                quality_score=item.quality_score,
+                cash_required=scaled_candidate.assignment_cash_required,
+                cash_available_at_decision=round(available_cash_for_assignment, 2),
+            )
+            continue
+
+        opening_diagnostics = {
+            **(
+                _fundamental_context_payload(item.fundamental_context)
+                if item.fundamental_context is not None
+                else {}
+            ),
+            **(
+                {"earnings_gate": asdict(item.candidate_earnings_gate)}
+                if item.candidate_earnings_gate is not None
+                else {}
+            ),
+            **(
+                {
+                    "post_earnings_cooldown_gate": asdict(
+                        item.post_earnings_cooldown_gate
+                    )
+                }
+                if item.post_earnings_cooldown_gate is not None
+                else {}
+            ),
+            "candidate_quality_score": item.quality_score,
+            "rank_within_day": item.rank_within_day,
+            "position_sizing": position_sizing,
+            "portfolio_gate": asdict(portfolio_gate),
+            "portfolio_risk": portfolio_diagnostics,
+        }
+        opened = _open_short_put(
+            state=state,
+            candidate=scaled_candidate,
+            day=day,
+            ticker=ticker,
+            contracts=quantity,
+            option_fee_per_contract=option_fee_per_contract,
+            execution_model=execution_model,
+            support_summary=item.support_summary,
+            trades=trades,
+            events=events,
+            diagnostics=opening_diagnostics,
+        )
+        if opened:
+            opened_count += 1
+            _record_candidate_ledger(
+                candidate_ledger,
+                config=execution_config,
+                day=day,
+                ticker=ticker,
+                decision="OPENED",
+                reason="opened_short_put",
+                support=item.support_summary,
+                candidate=scaled_candidate,
+                diagnostics=opening_diagnostics,
+                selected_for_backtest=True,
+                selection_stage="executed",
+                rank_within_day=item.rank_within_day,
+                quality_score=item.quality_score,
+                cash_required=scaled_candidate.assignment_cash_required,
+                cash_available_at_decision=round(available_cash_for_assignment, 2),
+            )
+        else:
+            _reject(
+                events,
+                rejected_reason_counts,
+                day,
+                ticker,
+                "no_executable_entry_fill",
+                support=item.support_summary,
+                diagnostics=opening_diagnostics,
+            )
+            _record_candidate_ledger(
+                candidate_ledger,
+                config=execution_config,
+                day=day,
+                ticker=ticker,
+                decision="REJECT",
+                reason="no_executable_entry_fill",
+                support=item.support_summary,
+                candidate=scaled_candidate,
+                diagnostics=opening_diagnostics,
+                selected_for_backtest=False,
+                selection_stage="execution",
+                rank_within_day=item.rank_within_day,
+                quality_score=item.quality_score,
+                cash_required=scaled_candidate.assignment_cash_required,
+                cash_available_at_decision=round(available_cash_for_assignment, 2),
+            )
+    return opened_count
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _has_open_short_put(state: BacktestState, ticker: str) -> bool:
     return any(position.ticker == ticker for position in state.open_short_puts)
 
@@ -2474,6 +3846,155 @@ def _reject(
     )
 
 
+def _candidate_ledger_config(config: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(config.get("candidate_ledger") or {})
+    return {
+        "schema_version": "candidate_ledger.v2",
+        "enabled": bool(cfg.get("enabled", True)),
+        "include_rejections": bool(cfg.get("include_rejections", True)),
+        "include_skips": bool(cfg.get("include_skips", False)),
+    }
+
+
+def _candidate_quality_filter_config(config: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict((config.get("candidate_ledger") or {}).get("quality_filter") or {})
+    max_spread = (
+        cfg["max_spread_pct_of_mid"]
+        if "max_spread_pct_of_mid" in cfg
+        else 0.30
+    )
+    return {
+        "require_auto_trade": bool(cfg.get("require_auto_trade", True)),
+        "delta_abs_min": float(cfg.get("delta_abs_min", 0.05)),
+        "delta_abs_max": float(cfg.get("delta_abs_max", 0.30)),
+        "min_weekly_return_on_strike_pct": float(
+            cfg.get("min_weekly_return_on_strike_pct", 0.10)
+        ),
+        "max_spread_pct_of_mid": (
+            None
+            if max_spread is None
+            else float(max_spread)
+        ),
+    }
+
+
+def _candidate_quality_score(
+    candidate: CspCandidate | None,
+    support: dict[str, Any] | None,
+) -> float:
+    if candidate is None:
+        return 0.0
+    zone = (support or {}).get("selected_zone") or {}
+    support_score = float(zone.get("score") or 0.0)
+    premium_score = min(max(candidate.weekly_return_on_strike_pct, 0.0), 2.0) * 5.0
+    option = candidate.option
+    spread = option.spread_pct_of_mid
+    spread_penalty = (spread * 50.0) if spread is not None else 10.0
+    delta_penalty = abs(abs(candidate.delta) - 0.20) * 25.0
+    liquidity_score = 0.0
+    if option.open_interest is not None:
+        liquidity_score += min(max(option.open_interest, 0) / 100.0, 5.0)
+    if option.volume is not None:
+        liquidity_score += min(max(option.volume, 0) / 100.0, 5.0)
+    return round(
+        max(
+            0.0,
+            support_score + premium_score + liquidity_score - spread_penalty - delta_penalty,
+        ),
+        6,
+    )
+
+
+def _record_candidate_ledger(
+    rows: list[dict[str, Any]],
+    *,
+    config: dict[str, Any],
+    day: date,
+    ticker: str,
+    decision: str,
+    reason: str,
+    support: dict[str, Any] | None = None,
+    candidate: CspCandidate | None = None,
+    diagnostics: dict[str, Any] | None = None,
+    selected_for_backtest: bool | None = None,
+    selection_stage: str | None = None,
+    rank_within_day: int | None = None,
+    quality_score: float | None = None,
+    cash_required: float | None = None,
+    cash_available_at_decision: float | None = None,
+) -> None:
+    ledger_cfg = _candidate_ledger_config(config)
+    if not ledger_cfg["enabled"]:
+        return
+    normalized_decision = decision.upper()
+    if normalized_decision == "REJECT" and not ledger_cfg["include_rejections"]:
+        return
+    if normalized_decision == "SKIP" and not ledger_cfg["include_skips"]:
+        return
+    support = support or {}
+    zone = support.get("selected_zone") or {}
+    option = candidate.option if candidate is not None else None
+    rows.append(
+        {
+            "schema_version": ledger_cfg["schema_version"],
+            "date": day.isoformat(),
+            "ticker": ticker,
+            "phase": "csp",
+            "decision": normalized_decision,
+            "reason": reason,
+            "candidate_present": candidate is not None,
+            "auto_trade": candidate.auto_trade if candidate is not None else None,
+            "selected_for_backtest": selected_for_backtest,
+            "selection_stage": selection_stage,
+            "rank_within_day": rank_within_day,
+            "quality_score": (
+                quality_score
+                if quality_score is not None
+                else _candidate_quality_score(candidate, support)
+            ),
+            "current_price": support.get("current_price"),
+            "atr14": support.get("atr14"),
+            "support_tradable": support.get("tradable"),
+            "trend_passed": support.get("trend_passed"),
+            "support_preconditions_passed": support.get("preconditions_passed"),
+            "support_precondition_metrics": support.get("precondition_metrics"),
+            "support_context_metrics": support.get("context_metrics"),
+            "support_method": zone.get("method"),
+            "support_score": zone.get("score"),
+            "support_bottom": zone.get("bottom"),
+            "support_top": zone.get("top"),
+            "support_zone_rank": support.get("support_zone_rank"),
+            "support_zones_considered": support.get("support_zones_considered"),
+            "csp_regime_override": support.get("csp_regime_override"),
+            "option_symbol": option.symbol if option is not None else None,
+            "expiration": option.expiration.isoformat() if option is not None else None,
+            "dte": option.dte if option is not None else None,
+            "strike": option.strike if option is not None else None,
+            "bid": option.bid if option is not None else None,
+            "ask": option.ask if option is not None else None,
+            "mid": round(option.mid, 6) if option is not None else None,
+            "spread_pct_of_mid": (
+                round(option.spread_pct_of_mid, 6)
+                if option is not None and option.spread_pct_of_mid is not None
+                else None
+            ),
+            "delta": candidate.delta if candidate is not None else None,
+            "delta_bucket": candidate.delta_bucket if candidate is not None else None,
+            "weekly_return_on_strike_pct": (
+                candidate.weekly_return_on_strike_pct
+                if candidate is not None
+                else None
+            ),
+            "assignment_cash_required": (
+                candidate.assignment_cash_required if candidate is not None else None
+            ),
+            "cash_required": cash_required,
+            "cash_available_at_decision": cash_available_at_decision,
+            "diagnostics": diagnostics,
+        }
+    )
+
+
 def _primary_rejection_reason(summary: dict[str, int]) -> str:
     if not summary:
         return "no_csp_candidate"
@@ -2502,6 +4023,9 @@ def _close_trade(
     underlying_close: float,
     realized_option_pnl: float,
     realized_stock_pnl: float | None = None,
+    close_price: float | None = None,
+    close_fees: float | None = None,
+    close_reason: str | None = None,
 ) -> None:
     for trade in trades:
         if trade["trade_id"] != trade_id:
@@ -2512,6 +4036,12 @@ def _close_trade(
         trade["realized_option_pnl"] = round(realized_option_pnl, 2)
         if realized_stock_pnl is not None:
             trade["realized_stock_pnl"] = round(realized_stock_pnl, 2)
+        if close_price is not None:
+            trade["close_price"] = round(close_price, 6)
+        if close_fees is not None:
+            trade["close_fees"] = round(close_fees, 2)
+        if close_reason is not None:
+            trade["close_reason"] = close_reason
         return
 
 
@@ -2605,14 +4135,371 @@ def _assignment_recovery_notes(assigned_share_values: list[int]) -> list[str]:
     return notes
 
 
+def _parse_iso_date(value: Any) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _summarize_candidate_ledger(
+    rows: list[dict[str, Any]],
+    *,
+    start_date: date | None,
+    end_date: date | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    csp_rows = [row for row in rows if row.get("phase") == "csp"]
+    decision_counts = Counter(str(row.get("decision")) for row in csp_rows)
+    reason_counts = Counter(str(row.get("reason")) for row in csp_rows if row.get("reason"))
+    selection_stage_counts = Counter(
+        str(row.get("selection_stage"))
+        for row in csp_rows
+        if row.get("selection_stage")
+    )
+    binding_filter_counts = Counter(
+        str(row.get("reason"))
+        for row in csp_rows
+        if row.get("decision") in {"REJECT", "WATCH"} and row.get("reason")
+    )
+    mechanical_candidates = [
+        row
+        for row in csp_rows
+        if bool(row.get("candidate_present"))
+        and (
+            row.get("decision") in {"OPENED", "CANDIDATE"}
+            or row.get("selection_stage")
+            in {"sizing", "capital", "portfolio", "execution", "capacity"}
+        )
+    ]
+    auto_trade_candidates = [
+        row for row in mechanical_candidates if bool(row.get("auto_trade"))
+    ]
+    quality_filter = _candidate_quality_filter_config(config)
+    quality_candidates = [
+        row
+        for row in mechanical_candidates
+        if _is_quality_candidate(row, quality_filter)
+    ]
+    opened = [row for row in csp_rows if row.get("decision") == "OPENED"]
+    selected = [row for row in csp_rows if row.get("selected_for_backtest") is True]
+    candidate_dates = {
+        row.get("date") for row in mechanical_candidates if row.get("date")
+    }
+    auto_candidate_dates = {
+        row.get("date") for row in auto_trade_candidates if row.get("date")
+    }
+    scan_dates = {row.get("date") for row in csp_rows if row.get("date")}
+    daily_candidate_counts = Counter(
+        row.get("date") for row in mechanical_candidates if row.get("date")
+    )
+    daily_candidate_tickers: dict[str, set[str]] = defaultdict(set)
+    daily_candidate_ticker_expirations: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    daily_quality_candidate_counts: Counter[str] = Counter()
+    daily_quality_candidate_tickers: dict[str, set[str]] = defaultdict(set)
+    week_candidate_counts: Counter[str] = Counter()
+    week_candidate_tickers: dict[str, set[str]] = defaultdict(set)
+    for row in mechanical_candidates:
+        row_date = _parse_iso_date(row.get("date"))
+        if row_date is None:
+            continue
+        row_date_text = row_date.isoformat()
+        ticker = str(row.get("ticker") or "")
+        expiration = str(row.get("expiration") or "")
+        if ticker:
+            daily_candidate_tickers[row_date_text].add(ticker)
+        if ticker and expiration:
+            daily_candidate_ticker_expirations[row_date_text].add((ticker, expiration))
+        week_key = _iso_week_key(row_date)
+        week_candidate_counts[week_key] += 1
+        if ticker:
+            week_candidate_tickers[week_key].add(ticker)
+    for row in quality_candidates:
+        row_date = _parse_iso_date(row.get("date"))
+        if row_date is None:
+            continue
+        row_date_text = row_date.isoformat()
+        ticker = str(row.get("ticker") or "")
+        daily_quality_candidate_counts[row_date_text] += 1
+        if ticker:
+            daily_quality_candidate_tickers[row_date_text].add(ticker)
+    daily_counts = [daily_candidate_counts.get(day, 0) for day in scan_dates]
+    daily_unique_ticker_counts = [
+        len(daily_candidate_tickers.get(str(day), set())) for day in scan_dates
+    ]
+    daily_unique_ticker_expiration_counts = [
+        len(daily_candidate_ticker_expirations.get(str(day), set())) for day in scan_dates
+    ]
+    daily_quality_counts = [
+        daily_quality_candidate_counts.get(day, 0) for day in scan_dates
+    ]
+    daily_unique_quality_ticker_counts = [
+        len(daily_quality_candidate_tickers.get(str(day), set())) for day in scan_dates
+    ]
+    daily_quality_pass_rates = [
+        daily_quality_candidate_counts.get(day, 0) / daily_candidate_counts.get(day, 0) * 100.0
+        for day in scan_dates
+        if daily_candidate_counts.get(day, 0) > 0
+    ]
+    week_counts = list(week_candidate_counts.values())
+    weeks = _period_weeks(start_date, end_date)
+
+    def per_week(count: int) -> float | None:
+        return round(count / weeks, 4) if weeks else None
+
+    def pct_days_at_least(threshold: int) -> float | None:
+        if not daily_counts:
+            return None
+        return round(
+            sum(1 for count in daily_counts if count >= threshold)
+            / len(daily_counts)
+            * 100.0,
+            4,
+        )
+
+    def pct_weeks_at_least(threshold: int) -> float | None:
+        if not week_counts:
+            return None
+        return round(
+            sum(1 for count in week_counts if count >= threshold)
+            / len(week_counts)
+            * 100.0,
+            4,
+        )
+
+    return {
+        "schema_version": "candidate_ledger.v2",
+        "rows": len(csp_rows),
+        "decision_counts": dict(decision_counts.most_common()),
+        "reason_counts": dict(reason_counts.most_common()),
+        "selection_stage_counts": dict(selection_stage_counts.most_common()),
+        "binding_filter_counts": dict(binding_filter_counts.most_common()),
+        "top_binding_filters": [
+            {"reason": reason, "count": count}
+            for reason, count in binding_filter_counts.most_common(15)
+        ],
+        "mechanical_candidate_count": len(mechanical_candidates),
+        "mechanical_auto_trade_candidate_count": len(auto_trade_candidates),
+        "quality_candidate_filter": quality_filter,
+        "quality_candidate_count": len(quality_candidates),
+        "quality_candidate_pass_rate_pct": (
+            round(len(quality_candidates) / len(mechanical_candidates) * 100.0, 4)
+            if mechanical_candidates
+            else None
+        ),
+        "average_daily_quality_candidate_pass_rate_pct": (
+            round(sum(daily_quality_pass_rates) / len(daily_quality_pass_rates), 4)
+            if daily_quality_pass_rates
+            else None
+        ),
+        "quality_candidate_days": sum(1 for count in daily_quality_counts if count > 0),
+        "median_quality_candidates_per_day": _median(daily_quality_counts),
+        "average_quality_candidates_per_day": (
+            round(sum(daily_quality_counts) / len(daily_quality_counts), 4)
+            if daily_quality_counts
+            else None
+        ),
+        "median_unique_quality_candidate_tickers_per_day": _median(
+            daily_unique_quality_ticker_counts
+        ),
+        "average_unique_quality_candidate_tickers_per_day": (
+            round(
+                sum(daily_unique_quality_ticker_counts)
+                / len(daily_unique_quality_ticker_counts),
+                4,
+            )
+            if daily_unique_quality_ticker_counts
+            else None
+        ),
+        "pct_days_with_3plus_quality_candidates": (
+            round(
+                sum(1 for count in daily_quality_counts if count >= 3)
+                / len(daily_quality_counts)
+                * 100.0,
+                4,
+            )
+            if daily_quality_counts
+            else None
+        ),
+        "pct_days_with_5plus_quality_candidates": (
+            round(
+                sum(1 for count in daily_quality_counts if count >= 5)
+                / len(daily_quality_counts)
+                * 100.0,
+                4,
+            )
+            if daily_quality_counts
+            else None
+        ),
+        "pct_days_with_3plus_unique_quality_tickers": (
+            round(
+                sum(1 for count in daily_unique_quality_ticker_counts if count >= 3)
+                / len(daily_unique_quality_ticker_counts)
+                * 100.0,
+                4,
+            )
+            if daily_unique_quality_ticker_counts
+            else None
+        ),
+        "pct_days_with_5plus_unique_quality_tickers": (
+            round(
+                sum(1 for count in daily_unique_quality_ticker_counts if count >= 5)
+                / len(daily_unique_quality_ticker_counts)
+                * 100.0,
+                4,
+            )
+            if daily_unique_quality_ticker_counts
+            else None
+        ),
+        "watch_only_candidate_count": decision_counts.get("WATCH", 0),
+        "opened_from_candidate_count": len(opened),
+        "selected_for_backtest_count": len(selected),
+        "candidate_days": len(candidate_dates),
+        "auto_trade_candidate_days": len(auto_candidate_dates),
+        "scan_days": len(scan_dates),
+        "starvation_days": sum(1 for count in daily_counts if count == 0),
+        "median_candidates_per_day": _median(daily_counts),
+        "average_candidates_per_day": (
+            round(sum(daily_counts) / len(daily_counts), 4)
+            if daily_counts
+            else None
+        ),
+        "median_unique_candidate_tickers_per_day": _median(daily_unique_ticker_counts),
+        "average_unique_candidate_tickers_per_day": (
+            round(sum(daily_unique_ticker_counts) / len(daily_unique_ticker_counts), 4)
+            if daily_unique_ticker_counts
+            else None
+        ),
+        "average_unique_candidate_ticker_expirations_per_day": (
+            round(
+                sum(daily_unique_ticker_expiration_counts)
+                / len(daily_unique_ticker_expiration_counts),
+                4,
+            )
+            if daily_unique_ticker_expiration_counts
+            else None
+        ),
+        "pct_days_with_3plus_candidates": pct_days_at_least(3),
+        "pct_days_with_5plus_candidates": pct_days_at_least(5),
+        "pct_days_with_3plus_unique_tickers": (
+            round(
+                sum(1 for count in daily_unique_ticker_counts if count >= 3)
+                / len(daily_unique_ticker_counts)
+                * 100.0,
+                4,
+            )
+            if daily_unique_ticker_counts
+            else None
+        ),
+        "pct_days_with_5plus_unique_tickers": (
+            round(
+                sum(1 for count in daily_unique_ticker_counts if count >= 5)
+                / len(daily_unique_ticker_counts)
+                * 100.0,
+                4,
+            )
+            if daily_unique_ticker_counts
+            else None
+        ),
+        "pct_weeks_with_15plus_candidates": pct_weeks_at_least(15),
+        "average_unique_candidate_tickers_per_week": (
+            round(
+                sum(len(tickers) for tickers in week_candidate_tickers.values())
+                / len(week_candidate_tickers),
+                4,
+            )
+            if week_candidate_tickers
+            else None
+        ),
+        "mechanical_candidates_per_week": per_week(len(mechanical_candidates)),
+        "mechanical_auto_trade_candidates_per_week": per_week(
+            len(auto_trade_candidates)
+        ),
+        "opened_from_candidate_per_week": per_week(len(opened)),
+        "candidate_to_trade_ratio_pct": (
+            round(len(opened) / len(mechanical_candidates) * 100.0, 4)
+            if mechanical_candidates
+            else None
+        ),
+        "auto_candidate_to_trade_ratio_pct": (
+            round(len(opened) / len(auto_trade_candidates) * 100.0, 4)
+            if auto_trade_candidates
+            else None
+        ),
+    }
+
+
+def _is_quality_candidate(row: dict[str, Any], quality_filter: dict[str, Any]) -> bool:
+    if not bool(row.get("candidate_present")):
+        return False
+    if quality_filter["require_auto_trade"] and not bool(row.get("auto_trade")):
+        return False
+    delta = _optional_float(row.get("delta"))
+    if delta is None:
+        return False
+    abs_delta = abs(delta)
+    if abs_delta < quality_filter["delta_abs_min"]:
+        return False
+    if abs_delta > quality_filter["delta_abs_max"]:
+        return False
+    weekly_return = _optional_float(row.get("weekly_return_on_strike_pct"))
+    if weekly_return is None:
+        return False
+    if weekly_return < quality_filter["min_weekly_return_on_strike_pct"]:
+        return False
+    max_spread = quality_filter["max_spread_pct_of_mid"]
+    if max_spread is not None:
+        spread = _optional_float(row.get("spread_pct_of_mid"))
+        if spread is None or spread > max_spread:
+            return False
+    return True
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed
+
+
+def _iso_week_key(day: date) -> str:
+    year, week, _weekday = day.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _median(values: list[int]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[mid])
+    return round((ordered[mid - 1] + ordered[mid]) / 2.0, 4)
+
+
+def _period_weeks(start_date: date | None, end_date: date | None) -> float | None:
+    if start_date is None or end_date is None or end_date < start_date:
+        return None
+    return max((end_date - start_date).days + 1, 1) / 7.0
+
+
 def _summarize_backtest(
     *,
+    config: dict[str, Any],
     state: BacktestState,
     equity_curve: list[dict[str, Any]],
     trades: list[dict[str, Any]],
     events: list[dict[str, Any]],
     rejected_reason_counts: Counter[str],
     data_issues: list[dict[str, Any]],
+    support_stats: dict[str, Any],
+    market_regime_stats: dict[str, Any],
+    candidate_ledger: list[dict[str, Any]],
 ) -> dict[str, Any]:
     ending_equity = state.equity
     starting_equity = state.starting_equity
@@ -2640,6 +4527,21 @@ def _summarize_backtest(
         float(row["capital_utilization_pct"])
         for row in equity_curve
         if row.get("capital_utilization_pct") is not None
+    ]
+    reserved_utilization_values = [
+        float(row["reserved_assignment_cash_pct"])
+        for row in equity_curve
+        if row.get("reserved_assignment_cash_pct") is not None
+    ]
+    assigned_stock_utilization_values = [
+        float(row["assigned_stock_utilization_pct"])
+        for row in equity_curve
+        if row.get("assigned_stock_utilization_pct") is not None
+    ]
+    cash_pct_values = [
+        float(row["cash_pct"])
+        for row in equity_curve
+        if row.get("cash_pct") is not None
     ]
     entry_spreads = [
         float(trade["entry_spread_pct_of_mid"])
@@ -2679,6 +4581,29 @@ def _summarize_backtest(
         for item in assignment_diagnostics
         if item.get("first_cc_opened_date") is not None
     )
+    csp_assignment_cash_values = [
+        float(trade.get("assignment_cash_required") or 0.0)
+        for trade in csp_trades
+        if float(trade.get("assignment_cash_required") or 0.0) > 0
+    ]
+    csp_contract_counts = []
+    for trade in csp_trades:
+        try:
+            contracts = int(float(trade.get("contracts") or 0))
+        except (TypeError, ValueError):
+            contracts = 0
+        if contracts > 0:
+            csp_contract_counts.append(contracts)
+    candidate_ledger_summary = _summarize_candidate_ledger(
+        candidate_ledger,
+        start_date=_parse_iso_date(equity_curve[0]["date"]) if equity_curve else None,
+        end_date=_parse_iso_date(equity_curve[-1]["date"]) if equity_curve else None,
+        config=config,
+    )
+    support_diagnostics = _finalize_support_stats(support_stats)
+    support_attempts = int(support_diagnostics.get("attempts") or 0)
+    scan_days = int(candidate_ledger_summary.get("scan_days") or 0)
+    data_issue_count = len(data_issues)
     return {
         "starting_equity": round(starting_equity, 2),
         "ending_equity": round(ending_equity, 2),
@@ -2711,9 +4636,65 @@ def _summarize_backtest(
         "opened_short_puts": len(csp_trades),
         "expired_worthless": csp_status_counts.get("EXPIRED_WORTHLESS", 0),
         "assigned": csp_status_counts.get("ASSIGNED", 0),
+        "closed_short_puts": (
+            csp_status_counts.get("CLOSED_PROFIT_TARGET", 0)
+            + csp_status_counts.get("CLOSED_MANAGE_DTE", 0)
+        ),
+        "csp_profit_target_closes": csp_status_counts.get("CLOSED_PROFIT_TARGET", 0),
+        "csp_manage_dte_closes": csp_status_counts.get("CLOSED_MANAGE_DTE", 0),
+        "csp_expired_worthless_rate_pct": (
+            round(
+                csp_status_counts.get("EXPIRED_WORTHLESS", 0)
+                / len(csp_trades)
+                * 100.0,
+                4,
+            )
+            if csp_trades
+            else None
+        ),
+        "csp_assignment_rate_pct": (
+            round(
+                csp_status_counts.get("ASSIGNED", 0)
+                / len(csp_trades)
+                * 100.0,
+                4,
+            )
+            if csp_trades
+            else None
+        ),
+        "csp_realized_option_pnl_per_trade": (
+            round(csp_realized_option_pnl / len(csp_trades), 2)
+            if csp_trades
+            else None
+        ),
+        "average_csp_assignment_cash_required": (
+            round(sum(csp_assignment_cash_values) / len(csp_assignment_cash_values), 2)
+            if csp_assignment_cash_values
+            else None
+        ),
+        "max_csp_assignment_cash_required": (
+            round(max(csp_assignment_cash_values), 2)
+            if csp_assignment_cash_values
+            else None
+        ),
+        "average_csp_contracts_per_trade": (
+            round(sum(csp_contract_counts) / len(csp_contract_counts), 4)
+            if csp_contract_counts
+            else None
+        ),
+        "max_csp_contracts_per_trade": max(csp_contract_counts) if csp_contract_counts else None,
         "opened_covered_calls": len(cc_trades),
         "expired_covered_calls": cc_status_counts.get("EXPIRED_WORTHLESS", 0),
         "called_away": cc_status_counts.get("CALLED_AWAY", 0),
+        "closed_covered_calls": (
+            cc_status_counts.get("CALL_CLOSED_PROFIT_TARGET", 0)
+            + cc_status_counts.get("CALL_CLOSED_MANAGE_DTE", 0)
+        ),
+        "cc_profit_target_closes": cc_status_counts.get(
+            "CALL_CLOSED_PROFIT_TARGET",
+            0,
+        ),
+        "cc_manage_dte_closes": cc_status_counts.get("CALL_CLOSED_MANAGE_DTE", 0),
         "open_short_puts": len(state.open_short_puts),
         "open_short_calls": len(state.open_short_calls),
         "long_stock_positions": sum(1 for stock in state.stocks.values() if stock.shares > 0),
@@ -2742,8 +4723,23 @@ def _summarize_backtest(
         "cc_trade_status_counts": dict(sorted(cc_status_counts.items())),
         "event_counts": dict(sorted(event_counts.items())),
         "rejected_reason_counts": dict(rejected_reason_counts.most_common()),
-        "data_issue_count": len(data_issues),
+        "candidate_ledger_diagnostics": candidate_ledger_summary,
+        "support_diagnostics": support_diagnostics,
+        "market_regime_diagnostics": _finalize_market_regime_stats(
+            market_regime_stats
+        ),
+        "data_issue_count": data_issue_count,
         "data_issue_counts": dict(sorted(data_issue_counts.items())),
+        "data_issues_per_100_scan_days": (
+            round(data_issue_count / scan_days * 100.0, 4)
+            if scan_days
+            else None
+        ),
+        "data_issue_rate_pct_of_support_attempts": (
+            round(data_issue_count / support_attempts * 100.0, 4)
+            if support_attempts
+            else None
+        ),
         "price_space_break_category_counts": dict(
             sorted(price_space_break_category_counts.items())
         ),
@@ -2755,8 +4751,58 @@ def _summarize_backtest(
             if utilization_values
             else 0.0
         ),
+        "average_daily_capital_utilization_pct": (
+            round(sum(utilization_values) / len(utilization_values), 4)
+            if utilization_values
+            else 0.0
+        ),
         "max_capital_utilization_pct": (
             round(max(utilization_values), 4) if utilization_values else 0.0
+        ),
+        "max_daily_capital_utilization_pct": (
+            round(max(utilization_values), 4) if utilization_values else 0.0
+        ),
+        "average_csp_reserved_utilization_pct": (
+            round(sum(reserved_utilization_values) / len(reserved_utilization_values), 4)
+            if reserved_utilization_values
+            else 0.0
+        ),
+        "max_csp_reserved_utilization_pct": (
+            round(max(reserved_utilization_values), 4)
+            if reserved_utilization_values
+            else 0.0
+        ),
+        "average_assigned_stock_utilization_pct": (
+            round(
+                sum(assigned_stock_utilization_values)
+                / len(assigned_stock_utilization_values),
+                4,
+            )
+            if assigned_stock_utilization_values
+            else 0.0
+        ),
+        "max_assigned_stock_utilization_pct": (
+            round(max(assigned_stock_utilization_values), 4)
+            if assigned_stock_utilization_values
+            else 0.0
+        ),
+        "average_cash_pct": (
+            round(sum(cash_pct_values) / len(cash_pct_values), 4)
+            if cash_pct_values
+            else 0.0
+        ),
+        "min_cash_pct": round(min(cash_pct_values), 4) if cash_pct_values else 0.0,
+        "max_cash_pct": round(max(cash_pct_values), 4) if cash_pct_values else 0.0,
+        "cash_idle_days": sum(1 for row in equity_curve if row.get("cash_idle")),
+        "days_above_50pct_cash": sum(
+            1
+            for row in equity_curve
+            if row.get("cash_pct") is not None and float(row["cash_pct"]) > 50.0
+        ),
+        "days_below_25pct_capital_utilization": sum(
+            1
+            for value in utilization_values
+            if value < 25.0
         ),
         "average_entry_spread_pct_of_mid": (
             round(sum(entry_spreads) / len(entry_spreads), 6)
@@ -2863,6 +4909,15 @@ def _render_report(result: dict[str, Any]) -> str:
         f"- Execution fill policy: {summary.get('execution_fill_policy', 'unknown')}",
         f"- Avg entry spread pct of mid: {summary.get('average_entry_spread_pct_of_mid')}",
         f"- Avg entry fill discount pct of mid: {summary.get('average_entry_fill_discount_pct_of_mid')}",
+        f"- Avg daily capital utilization: {summary.get('average_daily_capital_utilization_pct')}%",
+        f"- Max daily capital utilization: {summary.get('max_daily_capital_utilization_pct')}%",
+        f"- Average cash pct: {summary.get('average_cash_pct')}%",
+        f"- Cash idle days: {summary.get('cash_idle_days')}",
+        f"- Days above 50% cash: {summary.get('days_above_50pct_cash')}",
+        f"- Mechanical CSP candidates: {summary.get('candidate_ledger_diagnostics', {}).get('mechanical_candidate_count')}",
+        f"- Mechanical AUTO candidates: {summary.get('candidate_ledger_diagnostics', {}).get('mechanical_auto_trade_candidate_count')}",
+        f"- Days with 3+ candidates: {summary.get('candidate_ledger_diagnostics', {}).get('pct_days_with_3plus_candidates')}%",
+        f"- Starvation days: {summary.get('candidate_ledger_diagnostics', {}).get('starvation_days')}",
         "",
         "## Assumptions",
         "",

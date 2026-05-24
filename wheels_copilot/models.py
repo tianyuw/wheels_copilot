@@ -59,12 +59,16 @@ class SupportAnalysis:
     atr14: float | None
     current_price: float
     min_score_to_trade: float
+    preconditions_passed: bool = True
+    precondition_metrics: dict[str, Any] = field(default_factory=dict)
+    context_metrics: dict[str, Any] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
 
     @property
     def tradable(self) -> bool:
         return (
             self.trend.passed
+            and self.preconditions_passed
             and self.selected_zone is not None
             and self.selected_zone.score >= self.min_score_to_trade
         )
@@ -140,6 +144,7 @@ class FundamentalSnapshot:
     quarterly_net_income: list[float] = field(default_factory=list)
     annual_net_income: list[float] = field(default_factory=list)
     next_earnings_date: date | None = None
+    previous_earnings_date: date | None = None
     recent_move_pct: float | None = None
     provenance: dict[str, FundamentalFieldProvenance] = field(default_factory=dict)
 
